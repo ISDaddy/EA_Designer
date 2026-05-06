@@ -1,0 +1,54 @@
+# ==========================================
+# EA Designer Configuration
+# ==========================================
+# You can configure the ports used by the application by pointing Docker Compose to a config file.
+# We have provided a 'config.env' file. To use it, start the application with the following command:
+#
+#   docker compose --env-file config.env up -d --build
+#
+# If you need to change a port, simply edit the 'config.env' file before running the command.
+# Alternatively, you can override ports directly via the command line:
+#   APP_FRONTEND_PORT=8080 APP_BACKEND_PORT=5000 docker compose up -d
+# ==========================================
+
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: eadesigner
+    ports:
+      - "${APP_DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: eadesigner
+      POSTGRES_HOST: db
+      PORT: ${APP_BACKEND_PORT:-4001}
+    ports:
+      - "${APP_BACKEND_PORT:-4001}:${APP_BACKEND_PORT:-4001}"
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_BACKEND_PORT: ${APP_BACKEND_PORT:-4001}
+    ports:
+      - "${APP_FRONTEND_PORT:-80}:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
