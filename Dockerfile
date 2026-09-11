@@ -1,4 +1,4 @@
-FROM node:22-alpine as build
+FROM node:22-alpine AS build
 ARG VITE_BACKEND_PORT
 ENV VITE_BACKEND_PORT=$VITE_BACKEND_PORT
 WORKDIR /app

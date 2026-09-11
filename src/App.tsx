@@ -16,7 +16,9 @@ import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '4001';
-const API_URL = `http://localhost:${BACKEND_PORT}/api/state`;
+// Use the host the app was loaded from (not a hardcoded "localhost") so this also works
+// when the app is accessed via a LAN IP or a real domain, not just from the server itself.
+const API_URL = `http://${window.location.hostname}:${BACKEND_PORT}/api/state`;
 
 // Enterprise Architecture styled Custom Node
 const EASystemNode = ({ data }: { data: SystemNodeData }) => {
@@ -87,9 +89,19 @@ type SystemNodeData = {
   isHighlighted?: boolean;
 };
 
-type SystemNode = Node<SystemNodeData, 'eaSystem'> | Node<{}, 'junction'>;
+type SystemNode = Node<SystemNodeData, 'eaSystem'> | Node<Record<string, never>, 'junction'>;
 type IntegrationEdgeData = { dataObjectIds: string[] };
 type IntegrationEdge = Edge<IntegrationEdgeData>;
+
+// `nodes.filter(n => n.type === 'eaSystem')` doesn't narrow the array's element type (only a type
+// predicate does), so call sites used to fall back to `as any` to reach `.data.label`. This guard
+// lets them narrow properly instead.
+const isEaSystemNode = (n: Node | null | undefined): n is Node<SystemNodeData, 'eaSystem'> =>
+  !!n && n.type === 'eaSystem';
+
+type RawSystemRow = { id: string; label: string; x: number; y: number; layout_positions?: Record<string, { x: number; y: number }> };
+type RawDataObjectRow = { id: string; name: string; master_system_id: string; aliases?: Record<string, string> };
+type RawEdgeRow = { id: string; source: string; target: string; data_object_ids: string[] };
 
 type DataObject = {
   id: string;
@@ -116,7 +128,7 @@ export default function App() {
       .then(res => res.json())
       .then(data => {
         if (data.systems) {
-          setNodes(data.systems.map((s: any) => ({
+          setNodes(data.systems.map((s: RawSystemRow) => ({
             id: s.id,
             type: 'eaSystem',
             position: { x: s.x, y: s.y },
@@ -124,7 +136,7 @@ export default function App() {
           })));
         }
         if (data.dataObjects) {
-          setDataObjects(data.dataObjects.map((o: any) => ({
+          setDataObjects(data.dataObjects.map((o: RawDataObjectRow) => ({
             id: o.id,
             name: o.name,
             masterSystemId: o.master_system_id,
@@ -132,7 +144,7 @@ export default function App() {
           })));
         }
         if (data.edges) {
-          setEdges(data.edges.map((e: any) => ({
+          setEdges(data.edges.map((e: RawEdgeRow) => ({
             id: e.id,
             source: e.source,
             target: e.target,
@@ -141,9 +153,13 @@ export default function App() {
             style: { stroke: '#b1b1b7', strokeWidth: 2 },
           })));
         }
+        // Only now is it safe to let the auto-save effect run. Marking this true
+        // unconditionally (e.g. from a .finally()) would let a failed load - such as the
+        // frontend starting before the backend/DB is ready - immediately auto-save empty
+        // arrays and wipe out any existing data.
+        setIsLoaded(true);
       })
-      .catch(err => console.error('Failed to load state', err))
-      .finally(() => setIsLoaded(true));
+      .catch(err => console.error('Failed to load state - auto-save stays disabled to avoid overwriting existing data', err));
   }, [setNodes, setEdges]);
 
   const saveToDB = useCallback(async () => {
@@ -188,7 +204,7 @@ export default function App() {
 
   const addSystem = () => {
     if (!newSystemName) return;
-    if (nodes.some(n => n.type === 'eaSystem' && (n.data as any).label.toLowerCase() === newSystemName.trim().toLowerCase())) {
+    if (nodes.some(n => isEaSystemNode(n) && n.data.label.toLowerCase() === newSystemName.trim().toLowerCase())) {
       alert('A system with this name already exists.');
       return;
     }
@@ -217,7 +233,7 @@ export default function App() {
     }
 
     const masterName = newObjectMaster.trim();
-    let masterNode = nodes.find(n => n.type === 'eaSystem' && (n.data as any).label.toLowerCase() === masterName.toLowerCase());
+    let masterNode = nodes.find(n => isEaSystemNode(n) && n.data.label.toLowerCase() === masterName.toLowerCase());
     
     // Create master system if it doesn't exist
     if (!masterNode) {
@@ -255,8 +271,8 @@ export default function App() {
     const dx = tX - sX;
     const dy = tY - sY;
 
-    let sPos = Position.Right;
-    let tPos = Position.Left;
+    let sPos: Position;
+    let tPos: Position;
 
     if (Math.abs(dx) > Math.abs(dy)) {
       sPos = dx > 0 ? Position.Right : Position.Left;
@@ -280,7 +296,7 @@ export default function App() {
     // Find or create object
     if (pendingEdgeObject.trim()) {
       const objName = pendingEdgeObject.trim();
-      let existingObj = dataObjects.find(o => o.name.toLowerCase() === objName.toLowerCase());
+      const existingObj = dataObjects.find(o => o.name.toLowerCase() === objName.toLowerCase());
       if (existingObj) {
         objectId = existingObj.id;
       } else {
@@ -428,6 +444,11 @@ export default function App() {
     return obj.aliases?.[sysId] || obj.name;
   }, [dataObjects]);
 
+  const getSystemLabel = useCallback((sysId: string | null | undefined) => {
+    const node = nodes.find(n => n.id === sysId);
+    return isEaSystemNode(node) ? node.data.label : undefined;
+  }, [nodes]);
+
   const { processedNodes, processedEdges } = useMemo(() => {
     let finalNodes: Node[] = [...nodes.filter(n => n.type !== 'junction')]; // Base system nodes
     let finalEdges: Edge[] = [];
@@ -437,47 +458,58 @@ export default function App() {
     if (selectedNodeId) {
       const selectedNode = finalNodes.find(n => n.id === selectedNodeId);
       if (selectedNode) {
-        const incomingGroups: Record<string, IntegrationEdge[]> = {};
-        const outgoingGroups: Record<string, IntegrationEdge[]> = {};
+        // For a given direction, every remote system must contribute exactly one line into/out of
+        // the selected node - otherwise a remote with several differently-aliased flows ends up
+        // drawn as both a direct edge AND a junction spoke occupying the same path. So we first
+        // bucket edges by remote system (one line per remote), then group remotes that share an
+        // identical combined local label - only those groups are genuine fan-in/fan-out and need
+        // a junction; a lone remote is always drawn as a single edge.
+        const addJunctions = (isIncoming: boolean) => {
+          const relevantEdges = edges.filter(e => isIncoming ? e.target === selectedNodeId : e.source === selectedNodeId);
 
-        // Group edges connected to selected node by their local alias
-        edges.forEach(e => {
-          if (e.target === selectedNodeId) {
-            const localLabel = e.data?.dataObjectIds?.map(id => getAlias(id, selectedNodeId)).join(', ') || 'Unknown';
-            if (!incomingGroups[localLabel]) incomingGroups[localLabel] = [];
-            incomingGroups[localLabel].push(e);
-          } else if (e.source === selectedNodeId) {
-            const localLabel = e.data?.dataObjectIds?.map(id => getAlias(id, selectedNodeId)).join(', ') || 'Unknown';
-            if (!outgoingGroups[localLabel]) outgoingGroups[localLabel] = [];
-            outgoingGroups[localLabel].push(e);
-          }
-        });
+          const byRemote = new Map<string, IntegrationEdge[]>();
+          relevantEdges.forEach(e => {
+            const remoteId = isIncoming ? e.source : e.target;
+            if (!byRemote.has(remoteId)) byRemote.set(remoteId, []);
+            byRemote.get(remoteId)!.push(e);
+          });
 
-        const addJunctions = (groups: Record<string, IntegrationEdge[]>, isIncoming: boolean) => {
-          Object.entries(groups).forEach(([localLabel, groupEdges], index) => {
-            // Check if we can bypass the junction (1:1 connection and identical labels)
-            if (groupEdges.length === 1) {
-              const e = groupEdges[0];
-              const remoteLabel = e.data?.dataObjectIds?.map(id => getAlias(id, isIncoming ? e.source : e.target)).join(', ') || '';
-              if (localLabel === remoteLabel) {
-                // Bypass junction creation. It will be drawn as a standard edge.
-                return;
-              }
+          const remoteLocalLabel = new Map<string, string>();
+          byRemote.forEach((es, remoteId) => {
+            const objIds = new Set<string>();
+            es.forEach(e => e.data?.dataObjectIds?.forEach(id => objIds.add(id)));
+            remoteLocalLabel.set(remoteId, Array.from(objIds).map(id => getAlias(id, selectedNodeId)).join(', ') || 'Unknown');
+          });
+
+          const labelGroups = new Map<string, string[]>();
+          remoteLocalLabel.forEach((label, remoteId) => {
+            if (!labelGroups.has(label)) labelGroups.set(label, []);
+            labelGroups.get(label)!.push(remoteId);
+          });
+
+          Array.from(labelGroups.entries()).forEach(([localLabel, remoteIds], index) => {
+            const groupEdges = remoteIds.flatMap(rid => byRemote.get(rid)!);
+
+            // A junction only earns its keep when it declutters a genuine fan-in/fan-out of
+            // multiple remote systems. A single remote is always a plain 1:1 link - even if its
+            // aliases differ from the selected node's naming - and is drawn as a normal
+            // (possibly consolidated) edge in the standard-edges pass below.
+            if (remoteIds.length === 1) {
+              return;
             }
 
             const juncId = `junc-${isIncoming ? 'in' : 'out'}-${localLabel.replace(/\s/g, '-')}-${index}`;
-            
+
             groupEdges.forEach(e => hiddenOriginalEdges.add(e.id));
 
-            // Calculate midpoint for junction
+            // Calculate midpoint for junction (one point per remote system, not per raw edge)
             let sumX = 0, sumY = 0, count = 0;
             if (selectedNode) {
               sumX += selectedNode.position.x + ((selectedNode.measured?.width || 150) / 2);
               sumY += selectedNode.position.y + ((selectedNode.measured?.height || 60) / 2);
               count++;
             }
-            groupEdges.forEach(e => {
-              const remoteId = isIncoming ? e.source : e.target;
+            remoteIds.forEach(remoteId => {
               const remoteNode = finalNodes.find(n => n.id === remoteId);
               if (remoteNode) {
                 sumX += remoteNode.position.x + ((remoteNode.measured?.width || 150) / 2);
@@ -487,7 +519,7 @@ export default function App() {
             });
             let juncX = count > 0 ? sumX / count : 0;
             let juncY = count > 0 ? sumY / count : 0;
-            
+
             // Adjust to center the 16x16 junction node and offset by index slightly
             juncX = juncX - 8 + (index * 20);
             juncY = juncY - 8 + (index * 20);
@@ -528,19 +560,24 @@ export default function App() {
                 targetHandle: bestMain.targetHandle,
                 label: localLabel,
               });
-              groupEdges.forEach((e, i) => {
-                const remoteNode = finalNodes.find(n => n.id === e.source);
+              // One sub-edge per remote system (not per raw edge), so a remote with several
+              // data objects flowing under this label still gets a single spoke into the junction.
+              remoteIds.forEach((remoteId, i) => {
+                const remoteNode = finalNodes.find(n => n.id === remoteId);
                 const bestSub = remoteNode ? getClosestHandles(remoteNode, juncNode) : { sourceHandle: undefined, targetHandle: undefined };
-                const remoteLabel = e.data?.dataObjectIds?.map(id => getAlias(id, e.source)).join(', ') || '';
+                const remoteEdges = byRemote.get(remoteId)!;
+                const remoteObjIds = new Set<string>();
+                remoteEdges.forEach(e => e.data?.dataObjectIds?.forEach(id => remoteObjIds.add(id)));
+                const remoteLabel = Array.from(remoteObjIds).map(id => getAlias(id, remoteId)).join(', ');
                 finalEdges.push({
                   ...baseEdgeStyle,
                   id: `${juncId}-sub-${i}`,
-                  source: e.source,
+                  source: remoteId,
                   target: juncId,
                   sourceHandle: bestSub.sourceHandle,
                   targetHandle: bestSub.targetHandle,
                   label: remoteLabel,
-                  data: e.data
+                  data: { dataObjectIds: Array.from(remoteObjIds) }
                 });
               });
             } else {
@@ -554,27 +591,30 @@ export default function App() {
                 targetHandle: bestMain.targetHandle,
                 label: localLabel,
               });
-              groupEdges.forEach((e, i) => {
-                const remoteNode = finalNodes.find(n => n.id === e.target);
+              remoteIds.forEach((remoteId, i) => {
+                const remoteNode = finalNodes.find(n => n.id === remoteId);
                 const bestSub = remoteNode ? getClosestHandles(juncNode, remoteNode) : { sourceHandle: undefined, targetHandle: undefined };
-                const remoteLabel = e.data?.dataObjectIds?.map(id => getAlias(id, e.target)).join(', ') || '';
+                const remoteEdges = byRemote.get(remoteId)!;
+                const remoteObjIds = new Set<string>();
+                remoteEdges.forEach(e => e.data?.dataObjectIds?.forEach(id => remoteObjIds.add(id)));
+                const remoteLabel = Array.from(remoteObjIds).map(id => getAlias(id, remoteId)).join(', ');
                 finalEdges.push({
                   ...baseEdgeStyle,
                   id: `${juncId}-sub-${i}`,
                   source: juncId,
-                  target: e.target,
+                  target: remoteId,
                   sourceHandle: bestSub.sourceHandle,
                   targetHandle: bestSub.targetHandle,
                   label: remoteLabel,
-                  data: e.data
+                  data: { dataObjectIds: Array.from(remoteObjIds) }
                 });
               });
             }
           });
         };
 
-        addJunctions(incomingGroups, true);
-        addJunctions(outgoingGroups, false);
+        addJunctions(true);
+        addJunctions(false);
       }
     }
 
@@ -660,7 +700,7 @@ export default function App() {
     // 3. Apply Global Filters and Selection Filtering
     
     // If a node is selected, we ONLY want to see end-to-end flows of objects that belong to this system.
-    let allowedObjectIds = new Set<string>();
+    const allowedObjectIds = new Set<string>();
     let isFilteringBySelection = false;
 
     if (selectedNodeId) {
@@ -711,10 +751,10 @@ export default function App() {
 
     // Apply context-specific positions and highlighting
     finalNodes = finalNodes.map(n => {
-      if (n.type === 'junction') return n;
-      
+      if (!isEaSystemNode(n)) return n;
+
       const contextKey = selectedNodeId || 'global';
-      const layoutPositions = (n.data as any).layoutPositions || {};
+      const layoutPositions = n.data.layoutPositions || {};
       
       let position = n.position;
       if (contextKey !== 'global' && layoutPositions[contextKey]) {
@@ -756,8 +796,8 @@ export default function App() {
         const contextKey = selectedNodeId || 'global';
         updatedNodes = updatedNodes.map(n => {
           const change = positionChanges.find(c => c.id === n.id);
-          if (change && change.position) {
-            const layoutPositions = { ...((n.data as any).layoutPositions || {}) };
+          if (change && change.position && isEaSystemNode(n)) {
+            const layoutPositions = { ...(n.data.layoutPositions || {}) };
             layoutPositions[contextKey] = change.position;
             
             return {
@@ -885,7 +925,7 @@ export default function App() {
             onChange={(e) => setNewObjectMaster(e.target.value)}
           >
             <option value="" disabled>Master System</option>
-            {nodes.filter(n => n.type === 'eaSystem').map(n => <option key={n.id} value={(n.data as any).label}>{(n.data as any).label}</option>)}
+            {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
           </select>
           <button className="bg-blue-500 px-3 py-1 rounded hover:bg-blue-600" onClick={addObject}>Add Object</button>
         </div>
@@ -900,7 +940,7 @@ export default function App() {
             list="filter-systems-list"
           />
           <datalist id="filter-systems-list">
-            {nodes.filter(n => n.type === 'eaSystem').map(n => <option key={n.id} value={n.id}>{(n.data as any).label}</option>)}
+            {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
           </datalist>
 
           <input
@@ -1014,7 +1054,7 @@ export default function App() {
                   <input 
                   type="text" 
                   className="w-full px-2 py-1 border border-slate-300 bg-white shadow-inner rounded focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none"
-                  value={(nodes.find(n => n.id === selectedNodeId && n.type === 'eaSystem')?.data as any)?.label || ''}
+                  value={getSystemLabel(selectedNodeId) || ''}
                   onChange={(e) => renameSystem(selectedNodeId, e.target.value)}
                 />
               </div>
@@ -1099,7 +1139,7 @@ export default function App() {
                     }}
                   >
                     <option value="" disabled>-- Select a System --</option>
-                    {nodes.filter(n => n.type === 'eaSystem').map(n => <option key={n.id} value={n.id}>{(n.data as any)?.label}</option>)}
+                    {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
                   </select>
                 </div>
 
@@ -1110,10 +1150,10 @@ export default function App() {
                   ) : (
                     <div className="flex flex-col gap-2">
                       {Object.entries(obj.aliases || {}).map(([sysId, alias]) => {
-                        const sysName = (nodes.find(n => n.id === sysId && n.type === 'eaSystem')?.data as any)?.label || 'Unknown System';
+                        const sysName = getSystemLabel(sysId) || 'Unknown System';
                         return (
                           <div key={sysId} className="flex flex-col gap-1 bg-white border p-2 rounded">
-                            <span className="text-xs font-bold text-slate-600">{sysName as string}</span>
+                            <span className="text-xs font-bold text-slate-600">{sysName}</span>
                             <input 
                               type="text" 
                               className="w-full px-1 py-0.5 border border-slate-300 bg-white shadow-inner rounded text-xs focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none"
@@ -1175,7 +1215,7 @@ export default function App() {
                     </div>
                     {obj.masterSystemId && (
                        <span className="text-[10px] text-slate-500 truncate">
-                         Master: {(nodes.find(n => n.id === obj.masterSystemId && n.type === 'eaSystem')?.data as any)?.label || 'Unknown'}
+                         Master: {getSystemLabel(obj.masterSystemId) || 'Unknown'}
                        </span>
                     )}
                   </div>

@@ -1,73 +1,40 @@
-# React + TypeScript + Vite
+# EA Designer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A visual designer for mapping enterprise systems and the data flowing between them. Add systems (ArchiMate-styled application components), define data objects with a master system and per-system aliases, and draw integrations between systems - the canvas auto-declutters multi-system fan-in/fan-out into junction nodes and flags data objects with more than one apparent master in red.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Frontend**: React 19 + TypeScript + Vite, using [`@xyflow/react`](https://reactflow.dev/) for the canvas and Tailwind CSS v4 for styling.
+- **Backend**: Express + `pg`, exposing a simple `GET/POST /api/state` full-state sync endpoint.
+- **Database**: PostgreSQL 15, auto-migrated on backend startup.
 
-## React Compiler
+## Running with Docker
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The whole stack (frontend, backend, Postgres) is defined in `docker-compose.yml`. Port numbers are read from `config.env`:
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+docker compose --env-file config.env up -d --build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+- Frontend: http://localhost:80 (or `APP_FRONTEND_PORT` from `config.env`)
+- Backend API: http://localhost:4001/api/state (or `APP_BACKEND_PORT`)
+- Postgres: localhost:5432 (or `APP_DB_PORT`)
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+To change a port, edit `config.env` before running the command above (the frontend bakes `APP_BACKEND_PORT` into its build, so a port change needs a rebuild - `--build` handles that). You can also override ports directly on the command line:
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+APP_FRONTEND_PORT=8080 APP_BACKEND_PORT=5000 docker compose up -d
 ```
+
+The app stores state in the Postgres volume (`pgdata`), so data survives `docker compose down` / `up` cycles; use `docker compose down -v` to also wipe the database.
+
+## Local development (frontend only)
+
+```bash
+npm install
+npm run dev      # Vite dev server with HMR
+npm run build    # type-check (tsc -b) + production build
+npm run lint      # ESLint
+```
+
+The frontend expects a backend reachable at `http://<the host it was loaded from>:<VITE_BACKEND_PORT>` (default `4001`); run the backend separately (`cd server && npm install && node index.js`) with a Postgres instance available, or just use Docker Compose for the full stack.
