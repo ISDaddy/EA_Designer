@@ -14,31 +14,72 @@ import {
 } from '@xyflow/react';
 import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import { Component, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
+import { useTheme } from './theme/useTheme';
+import { SettingsView } from './theme/SettingsView';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '4001';
 // Use the host the app was loaded from (not a hardcoded "localhost") so this also works
 // when the app is accessed via a LAN IP or a real domain, not just from the server itself.
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}/api`;
 
-// Enterprise Architecture styled Custom Node
+// Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
+// style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
+// than color, so the node itself branches on the current style rather than just swapping a palette.
 const EASystemNode = ({ data }: { data: SystemNodeData }) => {
+  const { style } = useTheme();
+  const isM3 = style === 'm3';
+
   return (
-    <div className={`relative bg-[#d3e3f1] border-2 rounded shadow-md min-w-[150px] min-h-[60px] flex items-center justify-center p-3 group hover:shadow-lg transition-shadow ${data.isHighlighted ? 'border-yellow-400 shadow-yellow-200 ring-2 ring-yellow-400' : 'border-[#5b8cbe]'}`}>
-      {/* ArchiMate Application Component icon hint (two small boxes on top-left) */}
-      <div className="absolute top-1 left-1 flex flex-col gap-0.5">
-        <div className="w-2 h-1 border border-[#5b8cbe]"></div>
-        <div className="w-2 h-1 border border-[#5b8cbe]"></div>
-      </div>
-
-      <div className="absolute top-1 left-2.5 w-3 h-2.5 border border-[#5b8cbe]"></div>
-
-      {data.criticality === 'critical' && (
-        <div className="absolute -top-2 -right-2 w-4 h-4 rounded-full bg-red-500 border-2 border-white" title="Critical system" />
+    <div
+      className={`relative min-w-[160px] min-h-[64px] flex items-center justify-center p-3 group transition-all duration-200 ${
+        isM3
+          ? 'rounded-[var(--radius-node)] border-[1.5px] hover:-translate-y-0.5'
+          : 'rounded-[var(--radius-node)] border-2'
+      }`}
+      style={{
+        background: 'var(--node-bg)',
+        borderColor: data.isHighlighted ? 'var(--selection)' : 'var(--node-border)',
+        color: 'var(--node-text)',
+        boxShadow: data.isHighlighted
+          ? `0 0 0 3px var(--selection-glow), var(--shadow-md)`
+          : 'var(--shadow-sm)',
+      }}
+      onMouseEnter={e => { e.currentTarget.style.boxShadow = data.isHighlighted ? `0 0 0 3px var(--selection-glow), var(--shadow-lg)` : 'var(--shadow-lg)'; }}
+      onMouseLeave={e => { e.currentTarget.style.boxShadow = data.isHighlighted ? `0 0 0 3px var(--selection-glow), var(--shadow-md)` : 'var(--shadow-sm)'; }}
+    >
+      {isM3 ? (
+        <div
+          className="absolute top-2 left-2 w-6 h-6 rounded-full flex items-center justify-center"
+          style={{ background: 'var(--node-border)', opacity: 0.18 }}
+        >
+          <Component size={13} style={{ color: 'var(--node-text)', opacity: 1 }} />
+        </div>
+      ) : (
+        <>
+          {/* ArchiMate Application Component icon hint (two small boxes on top-left) */}
+          <div className="absolute top-1 left-1 flex flex-col gap-0.5">
+            <div className="w-2 h-1 border" style={{ borderColor: 'var(--node-border)' }}></div>
+            <div className="w-2 h-1 border" style={{ borderColor: 'var(--node-border)' }}></div>
+          </div>
+          <div className="absolute top-1 left-2.5 w-3 h-2.5 border" style={{ borderColor: 'var(--node-border)' }}></div>
+        </>
       )}
 
-      <div className="font-bold text-[#1f497d] text-center mt-2 whitespace-pre-wrap">{data.label}</div>
+      {data.criticality === 'critical' && (
+        <div
+          className={isM3 ? 'absolute -top-1.5 -right-1.5 w-3.5 h-3.5 rounded-full' : 'absolute -top-2 -right-2 w-4 h-4 rounded-full border-2'}
+          style={{ background: 'var(--critical-dot)', borderColor: isM3 ? undefined : 'var(--bg-surface)', boxShadow: isM3 ? '0 0 0 2px var(--bg-surface)' : undefined }}
+          title="Critical system"
+        />
+      )}
+
+      <div className={`font-bold text-center whitespace-pre-wrap px-1 ${isM3 ? 'mt-1 text-[15px]' : 'mt-2'}`}>{data.label}</div>
       {data.status && data.status !== 'active' && (
-        <div className="absolute bottom-1 right-1 text-[9px] font-bold uppercase text-slate-500 bg-white/70 px-1 rounded">
+        <div
+          className={isM3 ? 'absolute bottom-1.5 right-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-full' : 'absolute bottom-1 right-1 text-[9px] font-bold uppercase px-1 rounded'}
+          style={{ color: 'var(--node-text)', background: isM3 ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.7)' }}
+        >
           {data.status}
         </div>
       )}
@@ -47,7 +88,7 @@ const EASystemNode = ({ data }: { data: SystemNodeData }) => {
       {[Position.Top, Position.Bottom, Position.Left, Position.Right].map(pos =>
         [50, 25, 75, 10, 90, 40, 60].map(pct => {
           const isVertical = pos === Position.Top || pos === Position.Bottom;
-          const style = isVertical ? { left: `${pct}%` } : { top: `${pct}%` };
+          const posStyle = isVertical ? { left: `${pct}%` } : { top: `${pct}%` };
           // The center handle (50) is visible, the others are invisible grid anchors
           const isCenter = pct === 50;
           return (
@@ -56,15 +97,15 @@ const EASystemNode = ({ data }: { data: SystemNodeData }) => {
                 type="target"
                 position={pos}
                 id={`t-${pos}-${pct}`}
-                style={{...style, zIndex: 0}}
+                style={{...posStyle, zIndex: 0}}
                 className="opacity-0 w-1 h-1 absolute pointer-events-none"
               />
               <Handle
                 type="source"
                 position={pos}
                 id={`s-${pos}-${pct}`}
-                style={{...style, zIndex: 1}}
-                className={isCenter ? "w-2 h-2 bg-[#5b8cbe] border-2 border-white rounded-full opacity-50 group-hover:opacity-100 transition-opacity" : "opacity-0 w-1 h-1"}
+                style={{...posStyle, zIndex: 1, background: isCenter ? 'var(--node-border)' : undefined, borderColor: isCenter ? 'var(--bg-surface)' : undefined}}
+                className={isCenter ? "w-2 h-2 border-2 rounded-full opacity-50 group-hover:opacity-100 transition-opacity" : "opacity-0 w-1 h-1"}
               />
             </React.Fragment>
           );
@@ -75,7 +116,7 @@ const EASystemNode = ({ data }: { data: SystemNodeData }) => {
 };
 
 const JunctionNode = () => (
-  <div className="bg-slate-400 rounded-full w-3 h-3 shadow border-2 border-white relative">
+  <div className="rounded-full w-3 h-3 shadow border-2 relative" style={{ background: 'var(--junction-color)', borderColor: 'var(--bg-surface)' }}>
     <Handle type="target" position={Position.Top} className="opacity-0 absolute inset-0 w-full h-full pointer-events-none" id={`t-${Position.Top}-50`} style={{ top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }} />
     <Handle type="source" position={Position.Top} className="opacity-0 absolute inset-0 w-full h-full" id={`s-${Position.Top}-50`} style={{ top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }} />
     <Handle type="target" position={Position.Bottom} className="opacity-0 absolute inset-0 w-full h-full pointer-events-none" id={`t-${Position.Bottom}-50`} style={{ top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }} />
@@ -149,20 +190,36 @@ type DataObject = {
 
 const STATUS_LABELS: Record<SystemStatus, string> = { planned: 'Planned', active: 'Active', deprecated: 'Deprecated', retired: 'Retired' };
 const STATUS_BADGE_STYLES: Record<string, string> = {
-  planned: 'bg-blue-100 text-blue-800',
-  active: 'bg-green-100 text-green-800',
-  deprecated: 'bg-amber-100 text-amber-800',
-  retired: 'bg-slate-200 text-slate-600',
+  planned: 'bg-[var(--info-container)] text-[var(--on-info-container)]',
+  active: 'bg-[var(--success-container)] text-[var(--on-success-container)]',
+  deprecated: 'bg-[var(--warning-container)] text-[var(--on-warning-container)]',
+  retired: 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]',
 };
 const CRITICALITY_LABELS: Record<Criticality, string> = { low: 'Low', medium: 'Medium', high: 'High', critical: 'Critical' };
 const CRITICALITY_BADGE_STYLES: Record<string, string> = {
-  low: 'bg-slate-100 text-slate-600',
-  medium: 'bg-blue-100 text-blue-800',
-  high: 'bg-orange-100 text-orange-800',
-  critical: 'bg-red-100 text-red-800',
+  low: 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]',
+  medium: 'bg-[var(--info-container)] text-[var(--on-info-container)]',
+  high: 'bg-[var(--warning-container)] text-[var(--on-warning-container)]',
+  critical: 'bg-[var(--danger-container)] text-[var(--on-danger-container)]',
+};
+const CLASSIFICATION_LABELS: Record<DataObjectClassification, string> = { public: 'Public', internal: 'Internal', confidential: 'Confidential', restricted: 'Restricted' };
+const CLASSIFICATION_BADGE_STYLES: Record<string, string> = {
+  public: 'bg-[var(--success-container)] text-[var(--on-success-container)]',
+  internal: 'bg-[var(--info-container)] text-[var(--on-info-container)]',
+  confidential: 'bg-[var(--warning-container)] text-[var(--on-warning-container)]',
+  restricted: 'bg-[var(--danger-container)] text-[var(--on-danger-container)]',
 };
 
-const inputClass = 'w-full px-2 py-1 border border-slate-300 bg-white shadow-inner rounded text-sm focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none';
+// Shared building-block classes so every panel/button/input picks up the active theme's tokens
+// (colors, radii, shadows) uniformly instead of each call site hardcoding its own palette.
+const inputClass = 'w-full px-2.5 py-1.5 border rounded-[var(--radius-input)] bg-[var(--bg-input)] text-[var(--text-primary)] border-[var(--border)] shadow-sm text-sm placeholder:text-[var(--text-muted)] focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] outline-none transition-colors';
+const buttonPrimaryClass = 'inline-flex items-center gap-1.5 px-4 py-1.5 rounded-[var(--radius-button)] bg-[var(--primary)] text-[var(--on-primary)] text-sm font-semibold shadow-[var(--shadow-sm)] hover:bg-[var(--primary-hover)] transition-colors disabled:opacity-40';
+const buttonDangerClass = 'inline-flex items-center gap-1.5 px-4 py-2 rounded-[var(--radius-button)] bg-[var(--danger)] text-[var(--on-danger)] text-sm font-semibold shadow-[var(--shadow-sm)] hover:bg-[var(--danger-hover)] transition-colors';
+const buttonSecondaryClass = 'inline-flex items-center gap-1.5 px-4 py-1.5 rounded-[var(--radius-button)] border border-[var(--border)] bg-[var(--bg-surface)] text-[var(--text-primary)] text-sm font-medium hover:bg-[var(--bg-surface-alt)] transition-colors disabled:opacity-40';
+const cardClass = 'bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-[var(--radius-card)] shadow-[var(--shadow-sm)]';
+const panelHeadingClass = 'font-bold text-lg border-b border-[var(--border-subtle)] pb-2 text-[var(--text-primary)]';
+const labelClass = 'block text-xs font-bold mb-1 text-[var(--text-secondary)]';
+const listItemCardClass = 'bg-[var(--bg-surface)] p-2 rounded-[var(--radius-input)] border border-[var(--border-subtle)] shadow-[var(--shadow-sm)]';
 
 // A filterable, paginated table over the systems the backend holds - the practical way to browse
 // a landscape of hundreds or thousands of systems, since rendering that many boxes on one canvas
@@ -172,7 +229,13 @@ type InventoryRow = {
   business_capability: string; description: string;
 };
 
-function InventoryView({ onSelectSystem }: { onSelectSystem: (id: string) => void }) {
+function InventoryView({ onSelectSystem, dataObjects, getSystemLabel, onSelectObject }: {
+  onSelectSystem: (id: string) => void;
+  dataObjects: DataObject[];
+  getSystemLabel: (id: string | null | undefined) => string | undefined;
+  onSelectObject: (id: string) => void;
+}) {
+  const [subView, setSubView] = useState<'systems' | 'objects'>('systems');
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [total, setTotal] = useState(0);
   const [search, setSearch] = useState('');
@@ -180,7 +243,17 @@ function InventoryView({ onSelectSystem }: { onSelectSystem: (id: string) => voi
   const [criticalityFilter, setCriticalityFilter] = useState('');
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [objectSearch, setObjectSearch] = useState('');
   const pageSize = 25;
+
+  const filteredObjects = useMemo(() => {
+    if (!objectSearch) return dataObjects;
+    const search = objectSearch.toLowerCase();
+    return dataObjects.filter(obj => {
+      if (obj.name.toLowerCase().includes(search)) return true;
+      return Object.values(obj.aliases || {}).some(alias => alias.toLowerCase().includes(search));
+    });
+  }, [dataObjects, objectSearch]);
 
   // Reset to page 0 whenever a filter changes. Done during render (React's recommended pattern
   // for resetting derived state - see "Adjusting state when a prop changes") rather than in an
@@ -216,74 +289,160 @@ function InventoryView({ onSelectSystem }: { onSelectSystem: (id: string) => voi
   const to = Math.min(total, (page + 1) * pageSize);
 
   return (
-    <div className="flex-1 overflow-y-auto p-6 bg-slate-50">
+    <div className="flex-1 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
       <div className="max-w-6xl mx-auto">
-        <h2 className="text-lg font-bold mb-4 text-slate-800">System Inventory</h2>
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>
+            {subView === 'systems' ? 'System Inventory' : 'Data Object Inventory'}
+          </h2>
+          <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
+            <button
+              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+              style={subView === 'systems' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => setSubView('systems')}
+            >
+              Systems
+            </button>
+            <button
+              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+              style={subView === 'objects' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => setSubView('objects')}
+            >
+              Data Objects
+            </button>
+          </div>
+        </div>
+
+        {subView === 'objects' ? (
+          <>
+            <div className="relative mb-4">
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+              <input
+                className={`${inputClass} pl-9 w-64`}
+                placeholder="Search by name or alias..."
+                value={objectSearch}
+                onChange={e => setObjectSearch(e.target.value)}
+              />
+            </div>
+
+            <div className={`${cardClass} overflow-x-auto`}>
+              <table className="w-full text-sm">
+                <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
+                  <tr>
+                    <th className="px-4 py-2.5">Data Object</th>
+                    <th className="px-4 py-2.5">Master System</th>
+                    <th className="px-4 py-2.5">Classification</th>
+                    <th className="px-4 py-2.5">Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredObjects.slice(0, 200).map(obj => (
+                    <tr
+                      key={obj.id}
+                      className="border-t cursor-pointer transition-colors"
+                      style={{ borderColor: 'var(--border-subtle)' }}
+                      onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                      onClick={() => onSelectObject(obj.id)}
+                    >
+                      <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{obj.name}</td>
+                      <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{getSystemLabel(obj.masterSystemId) || '—'}</td>
+                      <td className="px-4 py-2">
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CLASSIFICATION_BADGE_STYLES[obj.classification || 'internal']}`}>
+                          {CLASSIFICATION_LABELS[obj.classification || 'internal']}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }}>{obj.description || '—'}</td>
+                    </tr>
+                  ))}
+                  {filteredObjects.length === 0 && (
+                    <tr><td colSpan={4} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No data objects match this search.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
+              {`Showing ${Math.min(filteredObjects.length, 200)} of ${filteredObjects.length}`}
+            </div>
+          </>
+        ) : (
+        <>
         <div className="flex gap-2 mb-4 flex-wrap">
-          <input
-            className="px-3 py-1.5 border border-slate-300 rounded shadow-sm w-64"
-            placeholder="Search by name, owner, capability..."
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-          />
-          <select className="px-3 py-1.5 border border-slate-300 rounded shadow-sm" value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+          <div className="relative">
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+            <input
+              className={`${inputClass} pl-9 w-64`}
+              placeholder="Search by name, owner, capability..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+            />
+          </div>
+          <select className={`${inputClass} w-auto`} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
             <option value="">All statuses</option>
             {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
-          <select className="px-3 py-1.5 border border-slate-300 rounded shadow-sm" value={criticalityFilter} onChange={e => setCriticalityFilter(e.target.value)}>
+          <select className={`${inputClass} w-auto`} value={criticalityFilter} onChange={e => setCriticalityFilter(e.target.value)}>
             <option value="">All criticalities</option>
             {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
         </div>
 
-        <div className="bg-white rounded shadow border border-slate-200 overflow-x-auto">
+        <div className={`${cardClass} overflow-x-auto`}>
           <table className="w-full text-sm">
-            <thead className="bg-slate-100 text-left text-xs uppercase text-slate-500">
+            <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
               <tr>
-                <th className="px-4 py-2">System</th>
-                <th className="px-4 py-2">Owner</th>
-                <th className="px-4 py-2">Status</th>
-                <th className="px-4 py-2">Criticality</th>
-                <th className="px-4 py-2">Business Capability</th>
+                <th className="px-4 py-2.5">System</th>
+                <th className="px-4 py-2.5">Owner</th>
+                <th className="px-4 py-2.5">Status</th>
+                <th className="px-4 py-2.5">Criticality</th>
+                <th className="px-4 py-2.5">Business Capability</th>
               </tr>
             </thead>
             <tbody>
               {rows.map(r => (
-                <tr key={r.id} className="border-t border-slate-100 hover:bg-blue-50 cursor-pointer" onClick={() => onSelectSystem(r.id)}>
-                  <td className="px-4 py-2 font-bold text-slate-800">{r.label}</td>
-                  <td className="px-4 py-2 text-slate-600">{r.owner || '—'}</td>
+                <tr
+                  key={r.id}
+                  className="border-t cursor-pointer transition-colors"
+                  style={{ borderColor: 'var(--border-subtle)' }}
+                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                  onClick={() => onSelectSystem(r.id)}
+                >
+                  <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{r.label}</td>
+                  <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.owner || '—'}</td>
                   <td className="px-4 py-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${STATUS_BADGE_STYLES[r.status] || 'bg-slate-100 text-slate-600'}`}>
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${STATUS_BADGE_STYLES[r.status] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
                       {STATUS_LABELS[r.status as SystemStatus] || r.status}
                     </span>
                   </td>
                   <td className="px-4 py-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CRITICALITY_BADGE_STYLES[r.criticality] || 'bg-slate-100 text-slate-600'}`}>
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CRITICALITY_BADGE_STYLES[r.criticality] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
                       {CRITICALITY_LABELS[r.criticality as Criticality] || r.criticality}
                     </span>
                   </td>
-                  <td className="px-4 py-2 text-slate-600">{r.business_capability || '—'}</td>
+                  <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.business_capability || '—'}</td>
                 </tr>
               ))}
               {rows.length === 0 && !loading && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-slate-400">No systems match these filters.</td></tr>
+                <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No systems match these filters.</td></tr>
               )}
             </tbody>
           </table>
         </div>
 
-        <div className="flex items-center justify-between mt-3 text-sm text-slate-600">
+        <div className="flex items-center justify-between mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
           <span>{loading ? 'Loading...' : `Showing ${from}-${to} of ${total}`}</span>
           <div className="flex gap-2">
             <button
-              className="px-3 py-1 rounded border border-slate-300 bg-white disabled:opacity-40"
+              className={buttonSecondaryClass}
               disabled={page === 0}
               onClick={() => setPage(p => Math.max(0, p - 1))}
             >
               Previous
             </button>
             <button
-              className="px-3 py-1 rounded border border-slate-300 bg-white disabled:opacity-40"
+              className={buttonSecondaryClass}
               disabled={to >= total}
               onClick={() => setPage(p => p + 1)}
             >
@@ -291,16 +450,19 @@ function InventoryView({ onSelectSystem }: { onSelectSystem: (id: string) => voi
             </button>
           </div>
         </div>
+        </>
+        )}
       </div>
     </div>
   );
 }
 
 export default function App() {
+  const { tokens } = useTheme();
   const [nodes, setNodes] = useNodesState<SystemNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<IntegrationEdge>([]);
   const [dataObjects, setDataObjects] = useState<DataObject[]>([]);
-  const [view, setView] = useState<'canvas' | 'inventory'>('canvas');
+  const [view, setView] = useState<'canvas' | 'inventory' | 'settings'>('canvas');
 
   const [newSystemName, setNewSystemName] = useState('');
   const [newObjectName, setNewObjectName] = useState('');
@@ -349,12 +511,15 @@ export default function App() {
               integrationPattern: e.integration_pattern || '',
               frequency: e.frequency || '',
             },
-            markerEnd: { type: MarkerType.ArrowClosed, color: '#b1b1b7' },
-            style: { stroke: '#b1b1b7', strokeWidth: 2 },
+            markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
+            style: { stroke: tokens.edgeColor, strokeWidth: 2 },
           })));
         }
       })
       .catch(err => console.error('Failed to load state', err));
+    // Runs once on mount; the memo below recomputes real edge colors from the current theme on
+    // every render regardless, so `tokens` doesn't need to be a dependency here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setNodes, setEdges]);
 
   // ---------------------------------------------------------------------------
@@ -416,7 +581,6 @@ export default function App() {
   const [filterObjectId, setFilterObjectId] = useState<string>('');
 
   // UI state for massive lists
-  const [sidebarObjectSearch, setSidebarObjectSearch] = useState('');
   const [connectionObjectSearch, setConnectionObjectSearch] = useState('');
 
   const addSystem = useCallback(() => {
@@ -564,8 +728,8 @@ export default function App() {
       targetHandle: finalTargetHandle,
       id: `edge-${Date.now()}`,
       data: { dataObjectIds: objectId ? [objectId] : [], description: '', integrationPattern: '', frequency: '' },
-      markerEnd: { type: MarkerType.ArrowClosed, color: '#b1b1b7' },
-      style: { stroke: '#b1b1b7', strokeWidth: 2 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
+      style: { stroke: tokens.edgeColor, strokeWidth: 2 },
     };
 
     setEdges((eds) => addEdge(newEdge, eds));
@@ -579,7 +743,7 @@ export default function App() {
     // Optionally open the right sidebar for this edge
     setSelectedEdgeId(newEdge.id);
     setSelectedNodeId(null);
-  }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, apiPost]);
+  }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, apiPost, tokens.edgeColor]);
 
   const toggleObjectOnEdge = useCallback((edgeId: string, objectId: string) => {
     setEdges((eds) =>
@@ -700,6 +864,13 @@ export default function App() {
     setSelectedNodeId(sysId);
     setSelectedEdgeId(null);
     setSelectedObjectIdSidebar(null);
+    setView('canvas');
+  }, []);
+
+  const handleInventoryObjectSelect = useCallback((objId: string) => {
+    setSelectedObjectIdSidebar(objId);
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
     setView('canvas');
   }, []);
 
@@ -827,13 +998,13 @@ export default function App() {
 
             // Base color logic
             const hasConflict = groupEdges.some(e => e.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
-            const color = hasConflict ? 'red' : '#b1b1b7';
+            const color = hasConflict ? tokens.edgeConflictColor : tokens.edgeColor;
             const strokeWidth = hasConflict ? 3 : 2;
             const baseEdgeStyle = {
               type: 'smoothstep',
               style: { stroke: color, strokeWidth },
               labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
-              labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
+              labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
               labelBgPadding: [6, 3] as [number, number],
               labelBgBorderRadius: 4,
               markerEnd: { type: MarkerType.ArrowClosed, color },
@@ -924,7 +1095,7 @@ export default function App() {
     pairwiseEdges.forEach((group, pairKey) => {
       const e = group[0];
       const hasConflict = group.some(ge => ge.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
-      const color = hasConflict ? 'red' : '#b1b1b7';
+      const color = hasConflict ? tokens.edgeConflictColor : tokens.edgeColor;
       const strokeWidth = hasConflict ? 3 : 2;
 
       const sNode = finalNodes.find(n => n.id === e.source);
@@ -947,7 +1118,7 @@ export default function App() {
           type: 'smoothstep',
           style: { stroke: color, strokeWidth },
           labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
-          labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
+          labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
           labelBgPadding: [6, 3] as [number, number],
           labelBgBorderRadius: 4,
           markerEnd: { type: MarkerType.ArrowClosed, color },
@@ -978,7 +1149,7 @@ export default function App() {
           type: 'smoothstep',
           style: { stroke: color, strokeWidth },
           labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
-          labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
+          labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
           labelBgPadding: [6, 3] as [number, number],
           labelBgBorderRadius: 4,
           markerEnd,
@@ -1064,7 +1235,7 @@ export default function App() {
     }) as SystemNode[];
 
     return { processedNodes: finalNodes, processedEdges: finalEdges as IntegrationEdge[] };
-  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getAlias, getClosestHandles]);
+  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getAlias, getClosestHandles, tokens]);
 
   const selectedEdge = edges.find(e => e.id === selectedEdgeId);
   const selectedSystemNode = nodes.find(n => n.id === selectedNodeId);
@@ -1158,10 +1329,13 @@ export default function App() {
   }, [selectedNodeId, dataObjects, edges]);
 
   return (
-    <div className="w-full h-screen flex flex-col font-sans relative">
+    <div className="w-full h-screen flex flex-col relative" style={{ fontFamily: 'var(--font-sans)' }}>
       {/* Subtle save banner */}
       {(pendingSaves > 0 || saveSuccess) && (
-        <div className="absolute bottom-4 right-4 z-50 bg-slate-800/80 text-white/70 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none transition-opacity">
+        <div
+          className="absolute bottom-4 right-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none transition-opacity shadow-[var(--shadow-md)]"
+          style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)', opacity: 0.9 }}
+        >
           {pendingSaves > 0 ? 'Syncing...' : 'Saved'}
         </div>
       )}
@@ -1169,14 +1343,24 @@ export default function App() {
       {/* Pending Edge Modal */}
       {pendingEdge && (
         <div className="absolute inset-0 z-[100] bg-black/40 flex items-center justify-center backdrop-blur-sm">
-          <div className="bg-white p-6 rounded shadow-xl w-96 flex flex-col gap-4">
-            <h3 className="font-bold text-lg">Assign Data Object to Flow</h3>
-            <p className="text-sm text-slate-600">
+          <div className={`${cardClass} p-6 w-96 flex flex-col gap-4`}>
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-lg" style={{ color: 'var(--text-primary)' }}>Assign Data Object to Flow</h3>
+              <button
+                className="p-1 rounded-full transition-colors"
+                style={{ color: 'var(--text-muted)' }}
+                onClick={() => { setPendingEdge(null); setPendingEdgeObject(''); }}
+                aria-label="Close"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
               What object is flowing in this connection? (You can type an existing object or a new one, or leave blank)
             </p>
             <input
               autoFocus
-              className="px-3 py-2 border border-slate-300 bg-white shadow-inner rounded focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none"
+              className={inputClass}
               placeholder="e.g. User Profile"
               value={pendingEdgeObject}
               onChange={(e) => setPendingEdgeObject(e.target.value)}
@@ -1190,50 +1374,66 @@ export default function App() {
               {objectsInPendingSource.map(o => <option key={o.id} value={o.name} />)}
             </datalist>
             <div className="flex justify-end gap-2 mt-2">
-              <button className="px-4 py-2 bg-slate-200 rounded hover:bg-slate-300" onClick={() => { setPendingEdge(null); setPendingEdgeObject(''); }}>Cancel</button>
-              <button className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700" onClick={confirmPendingEdge}>Save Flow</button>
+              <button className={buttonSecondaryClass} onClick={() => { setPendingEdge(null); setPendingEdgeObject(''); }}>Cancel</button>
+              <button className={buttonPrimaryClass} onClick={confirmPendingEdge}>Save Flow</button>
             </div>
           </div>
         </div>
       )}
 
-      <header className="bg-slate-800 text-white p-4 flex gap-6 items-center flex-wrap shadow-md z-10 relative">
-        <div className="font-bold text-xl flex items-center gap-4">
+      <header
+        className="p-4 flex gap-4 items-center flex-wrap shadow-[var(--shadow-md)] z-20 relative"
+        style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
+      >
+        <div className="font-bold text-xl flex items-center gap-4 tracking-[var(--heading-tracking)]">
           EA Designer
         </div>
 
-        <div className="flex gap-2 items-center bg-slate-700 p-2 rounded">
+        <div
+          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
+          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
+        >
           <input
-            className="px-2 py-1 text-black rounded"
+            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm"
+            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
             value={newSystemName}
             onChange={(e) => setNewSystemName(e.target.value)}
             placeholder="New System Name"
           />
-          <button className="bg-blue-500 px-3 py-1 rounded hover:bg-blue-600" onClick={addSystem}>Add System</button>
+          <button className={buttonPrimaryClass} onClick={addSystem}><Plus size={14} />Add System</button>
         </div>
 
-        <div className="flex gap-2 items-center bg-slate-700 p-2 rounded">
+        <div
+          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
+          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
+        >
           <input
-            className="px-2 py-1 text-black rounded w-32"
+            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
+            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
             value={newObjectName}
             onChange={(e) => setNewObjectName(e.target.value)}
             placeholder="Object Name"
           />
           <select
-            className="px-2 py-1 text-black rounded w-32"
+            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
+            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
             value={newObjectMaster}
             onChange={(e) => setNewObjectMaster(e.target.value)}
           >
             <option value="" disabled>Master System</option>
             {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
           </select>
-          <button className="bg-blue-500 px-3 py-1 rounded hover:bg-blue-600" onClick={addObject}>Add Object</button>
+          <button className={buttonPrimaryClass} onClick={addObject}><Plus size={14} />Add Object</button>
         </div>
 
-        <div className="flex gap-2 items-center bg-slate-700 p-2 rounded">
-          <span className="text-sm">Filter:</span>
+        <div
+          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
+          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
+        >
+          <span className="text-sm pl-1 opacity-80">Filter:</span>
           <input
-            className="px-2 py-1 text-black rounded w-32"
+            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
+            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
             value={filterSystemId}
             onChange={(e) => setFilterSystemId(e.target.value)}
             placeholder="System Filter"
@@ -1244,7 +1444,8 @@ export default function App() {
           </datalist>
 
           <input
-            className="px-2 py-1 text-black rounded w-32"
+            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
+            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
             value={filterObjectId}
             onChange={(e) => setFilterObjectId(e.target.value)}
             placeholder="Object Filter"
@@ -1258,28 +1459,47 @@ export default function App() {
           </datalist>
         </div>
 
-        <div className="flex gap-1 items-center bg-slate-700 p-1 rounded ml-auto">
+        <div
+          className="flex gap-1 items-center p-1 rounded-[var(--radius-card)] ml-auto"
+          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
+        >
           <button
-            className={`px-3 py-1 rounded text-sm ${view === 'canvas' ? 'bg-blue-500' : 'hover:bg-slate-600'}`}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+            style={view === 'canvas' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('canvas')}
           >
-            Canvas
+            <Workflow size={14} />Canvas
           </button>
           <button
-            className={`px-3 py-1 rounded text-sm ${view === 'inventory' ? 'bg-blue-500' : 'hover:bg-slate-600'}`}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+            style={view === 'inventory' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('inventory')}
           >
-            Inventory
+            <Table size={14} />Inventory
+          </button>
+          <button
+            className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+            style={view === 'settings' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
+            onClick={() => setView('settings')}
+          >
+            <SettingsIcon size={14} />Settings
           </button>
         </div>
       </header>
 
       {view === 'inventory' ? (
-        <InventoryView onSelectSystem={handleInventorySelect} />
+        <InventoryView
+          onSelectSystem={handleInventorySelect}
+          dataObjects={dataObjects}
+          getSystemLabel={getSystemLabel}
+          onSelectObject={handleInventoryObjectSelect}
+        />
+      ) : view === 'settings' ? (
+        <SettingsView />
       ) : (
       <div className="flex flex-1 overflow-hidden">
         {/* Canvas */}
-        <div className="flex-1 relative bg-slate-50">
+        <div className="flex-1 relative" style={{ background: 'var(--bg-canvas)' }}>
           <ReactFlow
             nodes={processedNodes}
             edges={processedEdges}
@@ -1307,20 +1527,23 @@ export default function App() {
             fitView
           >
             <Controls />
-            <Background color="#ccc" gap={16} />
+            <Background color={tokens.canvasDotColor} gap={16} />
           </ReactFlow>
         </div>
 
         {/* Right Sidebar */}
-        <div className="w-80 bg-slate-100 p-4 border-l border-slate-300 overflow-y-auto flex flex-col gap-4 shadow-inner z-10 relative">
+        <div
+          className="w-80 p-4 border-l overflow-y-auto flex flex-col gap-4 z-10 relative"
+          style={{ background: 'var(--bg-surface-alt)', borderColor: 'var(--border)' }}
+        >
 
           {selectedEdgeId && selectedEdge ? (
             <>
-              <h2 className="font-bold text-lg border-b pb-2">Connection Data</h2>
+              <h2 className={panelHeadingClass}>Connection Data</h2>
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs font-bold mb-1">Integration Pattern</label>
+                  <label className={labelClass}>Integration Pattern</label>
                   <select
                     className={inputClass}
                     value={selectedEdge.data?.integrationPattern || ''}
@@ -1337,7 +1560,7 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-bold mb-1">Frequency</label>
+                  <label className={labelClass}>Frequency</label>
                   <select
                     className={inputClass}
                     value={selectedEdge.data?.frequency || ''}
@@ -1354,7 +1577,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold mb-1">Description</label>
+                <label className={labelClass}>Description</label>
                 <textarea
                   className={inputClass}
                   rows={2}
@@ -1364,19 +1587,22 @@ export default function App() {
                 />
               </div>
 
-              <div className="text-sm text-slate-600 border-t pt-4">
+              <div className="text-sm border-t pt-4" style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-subtle)' }}>
                 Select which objects are transferred in this integration.
               </div>
 
-              {dataObjects.length === 0 && <p className="text-sm text-slate-500">Add data objects first.</p>}
+              {dataObjects.length === 0 && <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Add data objects first.</p>}
 
-              <input
-                type="text"
-                placeholder="Search objects..."
-                className="w-full px-2 py-1 border border-slate-300 bg-white shadow-inner rounded focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none mb-2"
-                value={connectionObjectSearch}
-                onChange={e => setConnectionObjectSearch(e.target.value)}
-              />
+              <div className="relative">
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+                <input
+                  type="text"
+                  placeholder="Search objects..."
+                  className={`${inputClass} pl-8 mb-2`}
+                  value={connectionObjectSearch}
+                  onChange={e => setConnectionObjectSearch(e.target.value)}
+                />
+              </div>
 
               <div className="flex flex-col gap-2 max-h-[35vh] overflow-y-auto">
                 {dataObjects
@@ -1392,7 +1618,7 @@ export default function App() {
                   .map((obj) => {
                   const isActive = selectedEdge.data?.dataObjectIds?.includes(obj.id);
                   return (
-                    <label key={obj.id} className="flex items-center gap-2 cursor-pointer bg-white p-2 rounded border shadow-sm hover:bg-slate-50">
+                    <label key={obj.id} className={`${listItemCardClass} flex items-center gap-2 cursor-pointer`} style={{ color: 'var(--text-primary)' }}>
                       <input
                         type="checkbox"
                         checked={isActive || false}
@@ -1405,17 +1631,17 @@ export default function App() {
               </div>
 
               <button
-                className="mt-8 bg-red-500 text-white px-3 py-2 rounded hover:bg-red-600"
+                className={`${buttonDangerClass} mt-8`}
                 onClick={deleteSelectedEdge}
               >
-                Delete Connection
+                <Trash2 size={14} />Delete Connection
               </button>
             </>
           ) : selectedNodeId ? (
             <>
-              <h2 className="font-bold text-lg border-b pb-2">System Details</h2>
+              <h2 className={panelHeadingClass}>System Details</h2>
               <div>
-                <label className="block text-xs font-bold mb-1">System Name</label>
+                <label className={labelClass}>System Name</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1426,7 +1652,7 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs font-bold mb-1">Status</label>
+                  <label className={labelClass}>Status</label>
                   <select
                     className={inputClass}
                     value={selectedSystemData?.status || 'active'}
@@ -1436,7 +1662,7 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-bold mb-1">Criticality</label>
+                  <label className={labelClass}>Criticality</label>
                   <select
                     className={inputClass}
                     value={selectedSystemData?.criticality || 'medium'}
@@ -1448,7 +1674,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold mb-1">Owner</label>
+                <label className={labelClass}>Owner</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1459,7 +1685,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold mb-1">Business Capability</label>
+                <label className={labelClass}>Business Capability</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1470,7 +1696,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold mb-1">Tech Stack (comma-separated)</label>
+                <label className={labelClass}>Tech Stack (comma-separated)</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1485,7 +1711,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-bold mb-1">Description</label>
+                <label className={labelClass}>Description</label>
                 <textarea
                   className={inputClass}
                   rows={3}
@@ -1495,32 +1721,33 @@ export default function App() {
                 />
               </div>
 
-              <div className="border-t pt-4">
-                <h3 className="font-bold text-sm mb-2 text-slate-700">Objects in this System</h3>
+              <div className="border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
+                <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>Objects in this System</h3>
                 {objectsInSelectedSystem.length === 0 ? (
-                  <p className="text-xs text-slate-500">No objects associated.</p>
+                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No objects associated.</p>
                 ) : (
                   <div className="flex flex-col gap-1 max-h-[30vh] overflow-y-auto pr-1">
                     {objectsInSelectedSystem.map(obj => {
                       const alias = obj.aliases?.[selectedNodeId] || '';
                       return (
-                        <div key={obj.id} className="text-xs bg-white border px-2 py-1 rounded shadow-sm flex flex-col gap-1">
+                        <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
                           <div className="flex items-center justify-between">
-                            <span className="truncate pr-2 font-bold text-slate-700" title={obj.name}>{obj.name}</span>
+                            <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
                             {obj.masterSystemId === selectedNodeId && (
-                              <span className="bg-blue-100 text-blue-800 text-[10px] px-1.5 py-0.5 rounded-full font-bold">Master</span>
+                              <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
                             )}
                           </div>
                           <div className="flex items-center justify-between gap-2 mt-1">
                             <input
                               type="text"
-                              className="w-full px-1 py-0.5 border border-slate-300 bg-white shadow-inner rounded text-xs placeholder-slate-400 focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none"
+                              className={`${inputClass} px-1.5 py-0.5 text-xs`}
                               placeholder="Alias in this system..."
                               value={alias}
                               onChange={(e) => setSystemAlias(obj.id, selectedNodeId, e.target.value)}
                             />
                             <button
-                              className="text-[10px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded hover:bg-red-200 shrink-0"
+                              className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                              style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 deleteObject(obj.id);
@@ -1537,24 +1764,24 @@ export default function App() {
               </div>
 
               <button
-                className="mt-8 bg-red-500 text-white px-3 py-2 rounded hover:bg-red-600"
+                className={`${buttonDangerClass} mt-8`}
                 onClick={() => {
                   deleteSystem(selectedNodeId);
                   setSelectedNodeId(null);
                 }}
               >
-                Delete System
+                <Trash2 size={14} />Delete System
               </button>
             </>
           ) : selectedObject ? (
             <>
-              <button className="text-blue-600 text-xs text-left mb-2 hover:underline" onClick={() => setSelectedObjectIdSidebar(null)}>
+              <button className="text-xs text-left mb-2 hover:underline" style={{ color: 'var(--primary)' }} onClick={() => setSelectedObjectIdSidebar(null)}>
                 &larr; Back to All Objects
               </button>
-              <h2 className="font-bold text-lg border-b pb-2">Object Details</h2>
+              <h2 className={panelHeadingClass}>Object Details</h2>
 
               <div className="mt-2">
-                <label className="block text-xs font-bold mb-1">Global Name</label>
+                <label className={labelClass}>Global Name</label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1564,7 +1791,7 @@ export default function App() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs font-bold mb-1">Classification</label>
+                <label className={labelClass}>Classification</label>
                 <select
                   className={inputClass}
                   value={selectedObject.classification || 'internal'}
@@ -1578,7 +1805,7 @@ export default function App() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs font-bold mb-1">Description</label>
+                <label className={labelClass}>Description</label>
                 <textarea
                   className={inputClass}
                   rows={2}
@@ -1588,7 +1815,7 @@ export default function App() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs font-bold mb-1">Master System</label>
+                <label className={labelClass}>Master System</label>
                 <select
                   className={inputClass}
                   value={selectedObject.masterSystemId || ''}
@@ -1599,20 +1826,20 @@ export default function App() {
                 </select>
               </div>
 
-              <div className="mt-4 border-t pt-4">
-                <h3 className="font-bold text-sm mb-2 text-slate-700">System Aliases</h3>
+              <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
+                <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>System Aliases</h3>
                 {Object.entries(selectedObject.aliases || {}).length === 0 ? (
-                  <p className="text-xs text-slate-500">No aliases defined.</p>
+                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No aliases defined.</p>
                 ) : (
                   <div className="flex flex-col gap-2">
                     {Object.entries(selectedObject.aliases || {}).map(([sysId, alias]) => {
                       const sysName = getSystemLabel(sysId) || 'Unknown System';
                       return (
-                        <div key={sysId} className="flex flex-col gap-1 bg-white border p-2 rounded">
-                          <span className="text-xs font-bold text-slate-600">{sysName}</span>
+                        <div key={sysId} className={`${listItemCardClass} flex flex-col gap-1`}>
+                          <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{sysName}</span>
                           <input
                             type="text"
-                            className="w-full px-1 py-0.5 border border-slate-300 bg-white shadow-inner rounded text-xs focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none"
+                            className={`${inputClass} px-1.5 py-0.5 text-xs`}
                             value={alias}
                             onChange={(e) => setSystemAlias(selectedObject.id, sysId, e.target.value)}
                           />
@@ -1624,59 +1851,23 @@ export default function App() {
               </div>
 
               <button
-                className="mt-8 bg-red-500 text-white px-3 py-2 rounded hover:bg-red-600"
+                className={`${buttonDangerClass} mt-8`}
                 onClick={() => {
                   deleteObject(selectedObject.id);
                   setSelectedObjectIdSidebar(null);
                 }}
               >
-                Delete Object
+                <Trash2 size={14} />Delete Object
               </button>
             </>
           ) : (
-            <>
-              <h2 className="font-bold text-lg border-b pb-2">All Data Objects</h2>
-              <div className="text-sm text-slate-600 mb-4">
-                Manage global data objects.
-              </div>
-              {dataObjects.length === 0 && <p className="text-sm text-slate-500">No objects added yet.</p>}
-
-              <input
-                type="text"
-                placeholder="Search objects..."
-                className="w-full px-2 py-1 border border-slate-300 bg-white shadow-inner rounded focus:border-blue-400 focus:ring-1 focus:ring-blue-400 outline-none mb-2"
-                value={sidebarObjectSearch}
-                onChange={e => setSidebarObjectSearch(e.target.value)}
-              />
-
-              <div className="flex flex-col gap-2 max-h-[70vh] overflow-y-auto">
-                {dataObjects
-                  .filter(obj => {
-                    if (!sidebarObjectSearch) return true;
-                    const search = sidebarObjectSearch.toLowerCase();
-                    if (obj.name.toLowerCase().includes(search)) return true;
-                    return Object.values(obj.aliases || {}).some(alias => alias.toLowerCase().includes(search));
-                  })
-                  .slice(0, 100) // Render limit for performance
-                  .map((obj) => (
-                  <div
-                    key={obj.id}
-                    className="flex flex-col gap-1 bg-white p-2 rounded border shadow-sm cursor-pointer hover:border-blue-400 transition-colors group"
-                    onClick={() => setSelectedObjectIdSidebar(obj.id)}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="truncate font-bold text-sm group-hover:text-blue-600 transition-colors">{obj.name}</span>
-                      <span className="text-[10px] text-slate-400 shrink-0 group-hover:text-blue-600 transition-colors">Edit &rarr;</span>
-                    </div>
-                    {obj.masterSystemId && (
-                       <span className="text-[10px] text-slate-500 truncate">
-                         Master: {getSystemLabel(obj.masterSystemId) || 'Unknown'}
-                       </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </>
+            <div className="flex flex-col items-center text-center gap-2 mt-12 px-4">
+              <MousePointerClick size={28} style={{ color: 'var(--text-muted)' }} />
+              <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>Nothing selected</p>
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                Click a system or connection on the canvas to view its details, or browse and edit every data object from the <span className="font-semibold">Inventory</span> page.
+              </p>
+            </div>
           )}
 
         </div>

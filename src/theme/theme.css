@@ -1,0 +1,260 @@
+/*
+ * Design tokens for the two supported visual styles - Enterprise Architecture and Material 3
+ * Expressive - each with a light and dark mode. Applied via `data-theme` on <html> (see
+ * ThemeContext), so any element can pick up the current theme through a CSS variable without a
+ * re-render, e.g. `bg-[var(--surface)]`. `:root` holds the ea-light values as the default so the
+ * app still looks right for the first paint before ThemeContext's effect runs.
+ */
+
+:root,
+[data-theme='ea-light'] {
+  --bg-app: #eef1f5;
+  --bg-header: #1e293b;
+  --bg-surface: #ffffff;
+  --bg-surface-alt: #f1f5f9;
+  --bg-canvas: #f8fafc;
+  --bg-input: #ffffff;
+
+  --text-primary: #1e293b;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --on-primary: #ffffff;
+  --text-on-header: #f1f5f9;
+
+  --border: #cbd5e1;
+  --border-subtle: #e2e8f0;
+  --border-strong: #94a3b8;
+
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-container: #dbeafe;
+  --on-primary-container: #1e40af;
+
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --on-danger: #ffffff;
+  --danger-container: #fee2e2;
+  --on-danger-container: #991b1b;
+
+  --success: #16a34a;
+  --success-container: #dcfce7;
+  --on-success-container: #166534;
+
+  --warning: #d97706;
+  --warning-container: #fef3c7;
+  --on-warning-container: #92400e;
+
+  --info: #0284c7;
+  --info-container: #e0f2fe;
+  --on-info-container: #075985;
+
+  --selection: #eab308;
+  --selection-glow: rgba(234, 179, 8, 0.35);
+
+  --radius-button: 6px;
+  --radius-input: 6px;
+  --radius-card: 8px;
+  --radius-node: 6px;
+  --radius-pill: 6px;
+
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 4px 10px rgba(15, 23, 42, 0.1);
+  --shadow-lg: 0 10px 24px rgba(15, 23, 42, 0.16);
+
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --heading-tracking: -0.01em;
+}
+
+[data-theme='ea-dark'] {
+  --bg-app: #0f172a;
+  --bg-header: #0b1220;
+  --bg-surface: #1e293b;
+  --bg-surface-alt: #263548;
+  --bg-canvas: #0f172a;
+  --bg-input: #16213a;
+
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --on-primary: #ffffff;
+  --text-on-header: #e2e8f0;
+
+  --border: #334155;
+  --border-subtle: #1e293b;
+  --border-strong: #475569;
+
+  --primary: #3b82f6;
+  --primary-hover: #60a5fa;
+  --primary-container: #1e3a8a;
+  --on-primary-container: #bfdbfe;
+
+  --danger: #ef4444;
+  --danger-hover: #f87171;
+  --on-danger: #ffffff;
+  --danger-container: #7f1d1d;
+  --on-danger-container: #fecaca;
+
+  --success: #22c55e;
+  --success-container: #14532d;
+  --on-success-container: #bbf7d0;
+
+  --warning: #f59e0b;
+  --warning-container: #78350f;
+  --on-warning-container: #fde68a;
+
+  --info: #38bdf8;
+  --info-container: #075985;
+  --on-info-container: #bae6fd;
+
+  --selection: #fbbf24;
+  --selection-glow: rgba(251, 191, 36, 0.3);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme='m3-light'] {
+  --bg-app: #fef7ff;
+  --bg-header: #6750a4;
+  --bg-surface: #ffffff;
+  --bg-surface-alt: #f3edf7;
+  --bg-canvas: #f7f2fa;
+  --bg-input: #ffffff;
+
+  --text-primary: #1d1b20;
+  --text-secondary: #49454f;
+  --text-muted: #79747e;
+  --on-primary: #ffffff;
+  --text-on-header: #ffffff;
+
+  --border: #cac4d0;
+  --border-subtle: #e7e0ec;
+  --border-strong: #79747e;
+
+  --primary: #6750a4;
+  --primary-hover: #7a64b8;
+  --primary-container: #eaddff;
+  --on-primary-container: #21005d;
+
+  --danger: #b3261e;
+  --danger-hover: #8c1d18;
+  --on-danger: #ffffff;
+  --danger-container: #f9dedc;
+  --on-danger-container: #410e0b;
+
+  --success: #386a20;
+  --success-container: #ddf6c8;
+  --on-success-container: #102000;
+
+  --warning: #7a5900;
+  --warning-container: #ffdf9e;
+  --on-warning-container: #271900;
+
+  --info: #0061a4;
+  --info-container: #d1e4ff;
+  --on-info-container: #001d36;
+
+  --selection: #eab308;
+  --selection-glow: rgba(234, 179, 8, 0.3);
+
+  --radius-button: 9999px;
+  --radius-input: 14px;
+  --radius-card: 20px;
+  --radius-node: 20px;
+  --radius-pill: 9999px;
+
+  --shadow-sm: 0 1px 3px rgba(103, 80, 164, 0.15);
+  --shadow-md: 0 4px 14px rgba(103, 80, 164, 0.18);
+  --shadow-lg: 0 12px 28px rgba(103, 80, 164, 0.24);
+
+  --font-sans: Roboto, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --heading-tracking: 0em;
+}
+
+[data-theme='m3-dark'] {
+  --bg-app: #141218;
+  --bg-header: #4f378b;
+  --bg-surface: #211f26;
+  --bg-surface-alt: #2b2930;
+  --bg-canvas: #141218;
+  --bg-input: #2b2930;
+
+  --text-primary: #e6e0e9;
+  --text-secondary: #cac4d0;
+  --text-muted: #938f99;
+  --text-on-header: #ffffff;
+
+  --border: #49454f;
+  --border-subtle: #36343b;
+  --border-strong: #938f99;
+
+  --primary: #d0bcff;
+  --primary-hover: #e8def8;
+  --on-primary: #381e72;
+  --primary-container: #4f378b;
+  --on-primary-container: #eaddff;
+
+  --danger: #f2b8b5;
+  --danger-hover: #f9dedc;
+  --on-danger: #601410;
+  --danger-container: #8c1d18;
+  --on-danger-container: #f9dedc;
+
+  --success: #9ccc65;
+  --success-container: #2b4b0f;
+  --on-success-container: #ddf6c8;
+
+  --warning: #ffcb6b;
+  --warning-container: #4d3a00;
+  --on-warning-container: #ffdf9e;
+
+  --info: #9fcaff;
+  --info-container: #00497d;
+  --on-info-container: #d1e4ff;
+
+  --selection: #fbbf24;
+  --selection-glow: rgba(251, 191, 36, 0.28);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.55);
+}
+
+html {
+  background: var(--bg-app);
+  color-scheme: light;
+}
+[data-mode='dark'] {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+/* Skin React Flow's built-in zoom controls and attribution to match the active theme instead of
+   the library's baked-in light styling. */
+.react-flow__controls {
+  box-shadow: var(--shadow-md) !important;
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+.react-flow__controls-button {
+  background: var(--bg-surface) !important;
+  border-bottom: 1px solid var(--border-subtle) !important;
+}
+.react-flow__controls-button:hover {
+  background: var(--bg-surface-alt) !important;
+}
+.react-flow__controls-button svg {
+  fill: var(--text-primary) !important;
+}
+.react-flow__attribution {
+  background: transparent !important;
+}
+.react-flow__attribution a {
+  color: var(--text-muted) !important;
+}
