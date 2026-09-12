@@ -1,9 +1,14 @@
 import { Check, Moon, Sun } from 'lucide-react';
 import { useTheme } from './useTheme';
 import { THEME_STYLES } from './tokens';
+import { useAuth } from '../auth/useAuth';
+import { TeamSettings } from '../auth/TeamSettings';
+import { EmailSettings } from '../auth/EmailSettings';
+import { isAdmin } from '../auth/roles';
 
 export function SettingsView() {
   const { style, mode, palette, palettesForStyle, setStyle, setMode, setPalette } = useTheme();
+  const { user } = useAuth();
 
   return (
     <div className="flex-1 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
@@ -108,6 +113,13 @@ export function SettingsView() {
             </div>
           </div>
         </section>
+
+        {isAdmin(user?.role) && (
+          <>
+            <TeamSettings />
+            <EmailSettings />
+          </>
+        )}
       </div>
     </div>
   );

@@ -24,9 +24,12 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   backend:
-    build: 
+    build:
       context: ./server
       dockerfile: Dockerfile
+    env_file:
+      - path: ./secrets.env
+        required: false
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgrespassword

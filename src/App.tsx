@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import {
   ReactFlow,
   Controls,
@@ -14,14 +14,15 @@ import {
 } from '@xyflow/react';
 import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Component, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
+import { Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
 import { useTheme } from './theme/useTheme';
 import { SettingsView } from './theme/SettingsView';
-
-const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '4001';
-// Use the host the app was loaded from (not a hardcoded "localhost") so this also works
-// when the app is accessed via a LAN IP or a real domain, not just from the server itself.
-const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}/api`;
+import { apiFetch } from './api';
+import { useAuth } from './auth/useAuth';
+import { AuthGate } from './auth/AuthGate';
+import { canEdit } from './auth/roles';
+import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass, cardClass, panelHeadingClass, labelClass, listItemCardClass } from './ui';
+import { LogoMark } from './LogoMark';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -164,6 +165,20 @@ type IntegrationEdge = Edge<IntegrationEdgeData>;
 const isEaSystemNode = (n: Node | null | undefined): n is Node<SystemNodeData, 'eaSystem'> =>
   !!n && n.type === 'eaSystem';
 
+// Every data object mastered by, or flowing in/out of, a given system - shared by the canvas
+// sidebar's System Details panel and the Inventory page's own copy of it.
+const objectsForSystem = (systemId: string | null, dataObjects: DataObject[], edges: IntegrationEdge[]): DataObject[] => {
+  if (!systemId) return [];
+  const relatedIds = new Set<string>();
+  dataObjects.forEach(o => { if (o.masterSystemId === systemId) relatedIds.add(o.id); });
+  edges.forEach(e => {
+    if (e.source === systemId || e.target === systemId) {
+      e.data?.dataObjectIds?.forEach(id => relatedIds.add(id));
+    }
+  });
+  return dataObjects.filter(o => relatedIds.has(o.id));
+};
+
 type RawSystemRow = {
   id: string; label: string; x: number; y: number;
   layout_positions?: Record<string, { x: number; y: number }>;
@@ -210,16 +225,46 @@ const CLASSIFICATION_BADGE_STYLES: Record<string, string> = {
   restricted: 'bg-[var(--danger-container)] text-[var(--on-danger-container)]',
 };
 
-// Shared building-block classes so every panel/button/input picks up the active theme's tokens
-// (colors, radii, shadows) uniformly instead of each call site hardcoding its own palette.
-const inputClass = 'w-full px-2.5 py-1.5 border rounded-[var(--radius-input)] bg-[var(--bg-input)] text-[var(--text-primary)] border-[var(--border)] shadow-sm text-sm placeholder:text-[var(--text-muted)] focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] outline-none transition-colors';
-const buttonPrimaryClass = 'inline-flex items-center gap-1.5 px-4 py-1.5 rounded-[var(--radius-button)] bg-[var(--primary)] text-[var(--on-primary)] text-sm font-semibold shadow-[var(--shadow-sm)] hover:bg-[var(--primary-hover)] transition-colors disabled:opacity-40';
-const buttonDangerClass = 'inline-flex items-center gap-1.5 px-4 py-2 rounded-[var(--radius-button)] bg-[var(--danger)] text-[var(--on-danger)] text-sm font-semibold shadow-[var(--shadow-sm)] hover:bg-[var(--danger-hover)] transition-colors';
-const buttonSecondaryClass = 'inline-flex items-center gap-1.5 px-4 py-1.5 rounded-[var(--radius-button)] border border-[var(--border)] bg-[var(--bg-surface)] text-[var(--text-primary)] text-sm font-medium hover:bg-[var(--bg-surface-alt)] transition-colors disabled:opacity-40';
-const cardClass = 'bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-[var(--radius-card)] shadow-[var(--shadow-sm)]';
-const panelHeadingClass = 'font-bold text-lg border-b border-[var(--border-subtle)] pb-2 text-[var(--text-primary)]';
-const labelClass = 'block text-xs font-bold mb-1 text-[var(--text-secondary)]';
-const listItemCardClass = 'bg-[var(--bg-surface)] p-2 rounded-[var(--radius-input)] border border-[var(--border-subtle)] shadow-[var(--shadow-sm)]';
+
+// A small anchored popover - used to tuck one-off creation forms (Add System, Add Object) behind
+// a single button instead of leaving their inputs permanently open in the header, which is what
+// made the toolbar feel cluttered on every page regardless of whether you were using it.
+function Popover({ trigger, children, align = 'left' }: {
+  trigger: (props: { open: boolean; toggle: () => void }) => React.ReactNode;
+  children: (close: () => void) => React.ReactNode;
+  align?: 'left' | 'right';
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    // `Node` (the DOM type) is shadowed in this file by React Flow's own `Node` type import, so
+    // narrow via `HTMLElement` instead of casting to it directly.
+    const onClick = (e: MouseEvent) => { if (ref.current && e.target instanceof HTMLElement && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      {trigger({ open, toggle: () => setOpen(o => !o) })}
+      {open && (
+        <div
+          className={`absolute mt-2 ${align === 'right' ? 'right-0' : 'left-0'} w-72 max-w-[calc(100vw-2rem)] rounded-[var(--radius-card)] shadow-[var(--shadow-lg)] border z-50 p-4`}
+          style={{ background: 'var(--bg-surface)', borderColor: 'var(--border-subtle)' }}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // A filterable, paginated table over the systems the backend holds - the practical way to browse
 // a landscape of hundreds or thousands of systems, since rendering that many boxes on one canvas
@@ -229,11 +274,291 @@ type InventoryRow = {
   business_capability: string; description: string;
 };
 
-function InventoryView({ onSelectSystem, dataObjects, getSystemLabel, onSelectObject }: {
+// The system editor - shown in the canvas sidebar when a node is selected, and reused verbatim by
+// the Inventory page's own details panel so editing a system works identically from either place.
+function SystemDetailsPanel({
+  systemId, data, objectsInSystem, renameSystem, updateSystemField, setSystemAlias, deleteObject, onDelete, readOnly,
+}: {
+  systemId: string;
+  data: SystemNodeData | undefined;
+  objectsInSystem: DataObject[];
+  renameSystem: (sysId: string, newLabel: string) => void;
+  updateSystemField: <K extends keyof SystemNodeData>(sysId: string, field: K, value: SystemNodeData[K], debounceKey?: string) => void;
+  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  deleteObject: (objId: string) => void;
+  onDelete: () => void;
+  readOnly?: boolean;
+}) {
+  return (
+    <>
+      <h2 className={panelHeadingClass}>System Details</h2>
+      <div>
+        <label className={labelClass}>System Name</label>
+        <input
+          type="text"
+          className={inputClass}
+          value={data?.label || ''}
+          disabled={readOnly}
+          onChange={(e) => renameSystem(systemId, e.target.value)}
+        />
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className={labelClass}>Status</label>
+          <select
+            className={inputClass}
+            value={data?.status || 'active'}
+            disabled={readOnly}
+            onChange={(e) => updateSystemField(systemId, 'status', e.target.value as SystemStatus)}
+          >
+            {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className={labelClass}>Criticality</label>
+          <select
+            className={inputClass}
+            value={data?.criticality || 'medium'}
+            disabled={readOnly}
+            onChange={(e) => updateSystemField(systemId, 'criticality', e.target.value as Criticality)}
+          >
+            {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label className={labelClass}>Owner</label>
+        <input
+          type="text"
+          className={inputClass}
+          placeholder="e.g. Finance IT Team"
+          value={data?.owner || ''}
+          disabled={readOnly}
+          onChange={(e) => updateSystemField(systemId, 'owner', e.target.value, `system-owner-${systemId}`)}
+        />
+      </div>
+
+      <div>
+        <label className={labelClass}>Business Capability</label>
+        <input
+          type="text"
+          className={inputClass}
+          placeholder="e.g. Order to Cash"
+          value={data?.businessCapability || ''}
+          disabled={readOnly}
+          onChange={(e) => updateSystemField(systemId, 'businessCapability', e.target.value, `system-capability-${systemId}`)}
+        />
+      </div>
+
+      <div>
+        <label className={labelClass}>Tech Stack (comma-separated)</label>
+        <input
+          type="text"
+          className={inputClass}
+          placeholder="e.g. Java, PostgreSQL, AWS"
+          value={(data?.techStack || []).join(', ')}
+          disabled={readOnly}
+          onChange={(e) => updateSystemField(
+            systemId, 'techStack',
+            e.target.value.split(',').map(s => s.trim()).filter(Boolean),
+            `system-stack-${systemId}`
+          )}
+        />
+      </div>
+
+      <div>
+        <label className={labelClass}>Description</label>
+        <textarea
+          className={inputClass}
+          rows={3}
+          placeholder="What does this system do?"
+          value={data?.description || ''}
+          disabled={readOnly}
+          onChange={(e) => updateSystemField(systemId, 'description', e.target.value, `system-desc-${systemId}`)}
+        />
+      </div>
+
+      <div className="border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
+        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>Objects in this System</h3>
+        {objectsInSystem.length === 0 ? (
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No objects associated.</p>
+        ) : (
+          <div className="flex flex-col gap-1 max-h-[30vh] overflow-y-auto pr-1">
+            {objectsInSystem.map(obj => {
+              const alias = obj.aliases?.[systemId] || '';
+              return (
+                <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
+                  <div className="flex items-center justify-between">
+                    <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
+                    {obj.masterSystemId === systemId && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
+                    )}
+                  </div>
+                  <div className="flex items-center justify-between gap-2 mt-1">
+                    <input
+                      type="text"
+                      className={`${inputClass} px-1.5 py-0.5 text-xs`}
+                      placeholder="Alias in this system..."
+                      value={alias}
+                      disabled={readOnly}
+                      onChange={(e) => setSystemAlias(obj.id, systemId, e.target.value)}
+                    />
+                    {!readOnly && (
+                      <button
+                        className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                        style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteObject(obj.id);
+                        }}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {!readOnly && (
+        <button className={`${buttonDangerClass} mt-8`} onClick={onDelete}>
+          <Trash2 size={14} />Delete System
+        </button>
+      )}
+    </>
+  );
+}
+
+// The data object editor - same idea as SystemDetailsPanel: one implementation shared by the
+// canvas sidebar and the Inventory page.
+function ObjectDetailsPanel({
+  object, systemNodes, getSystemLabel, onBack, renameObjectGlobal, updateObjectField, setSystemAlias, onDelete, readOnly,
+}: {
+  object: DataObject;
+  systemNodes: SystemNode[];
+  getSystemLabel: (id: string | null | undefined) => string | undefined;
+  onBack: () => void;
+  renameObjectGlobal: (objId: string, newName: string) => void;
+  updateObjectField: <K extends keyof DataObject>(objId: string, field: K, value: DataObject[K], debounceKey?: string) => void;
+  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  onDelete: () => void;
+  readOnly?: boolean;
+}) {
+  return (
+    <>
+      <button className="text-xs text-left mb-2 hover:underline" style={{ color: 'var(--primary)' }} onClick={onBack}>
+        &larr; Close
+      </button>
+      <h2 className={panelHeadingClass}>Object Details</h2>
+
+      <div className="mt-2">
+        <label className={labelClass}>Global Name</label>
+        <input
+          type="text"
+          className={inputClass}
+          value={object.name}
+          disabled={readOnly}
+          onChange={(e) => renameObjectGlobal(object.id, e.target.value)}
+        />
+      </div>
+
+      <div className="mt-4">
+        <label className={labelClass}>Classification</label>
+        <select
+          className={inputClass}
+          value={object.classification || 'internal'}
+          disabled={readOnly}
+          onChange={(e) => updateObjectField(object.id, 'classification', e.target.value as DataObjectClassification)}
+        >
+          <option value="public">Public</option>
+          <option value="internal">Internal</option>
+          <option value="confidential">Confidential</option>
+          <option value="restricted">Restricted</option>
+        </select>
+      </div>
+
+      <div className="mt-4">
+        <label className={labelClass}>Description</label>
+        <textarea
+          className={inputClass}
+          rows={2}
+          value={object.description || ''}
+          disabled={readOnly}
+          onChange={(e) => updateObjectField(object.id, 'description', e.target.value, `object-desc-${object.id}`)}
+        />
+      </div>
+
+      <div className="mt-4">
+        <label className={labelClass}>Master System</label>
+        <select
+          className={inputClass}
+          value={object.masterSystemId || ''}
+          disabled={readOnly}
+          onChange={(e) => updateObjectField(object.id, 'masterSystemId', e.target.value)}
+        >
+          <option value="" disabled>-- Select a System --</option>
+          {systemNodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
+        </select>
+      </div>
+
+      <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
+        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>System Aliases</h3>
+        {Object.entries(object.aliases || {}).length === 0 ? (
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No aliases defined.</p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {Object.entries(object.aliases || {}).map(([sysId, alias]) => {
+              const sysName = getSystemLabel(sysId) || 'Unknown System';
+              return (
+                <div key={sysId} className={`${listItemCardClass} flex flex-col gap-1`}>
+                  <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{sysName}</span>
+                  <input
+                    type="text"
+                    className={`${inputClass} px-1.5 py-0.5 text-xs`}
+                    value={alias}
+                    disabled={readOnly}
+                    onChange={(e) => setSystemAlias(object.id, sysId, e.target.value)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {!readOnly && (
+        <button className={`${buttonDangerClass} mt-8`} onClick={onDelete}>
+          <Trash2 size={14} />Delete Object
+        </button>
+      )}
+    </>
+  );
+}
+
+function InventoryView({
+  onSelectSystem, onViewObject, dataObjects, getSystemLabel, nodes, edges,
+  renameSystem, updateSystemField, setSystemAlias, deleteObject, deleteSystem,
+  renameObjectGlobal, updateObjectField, canWrite,
+}: {
   onSelectSystem: (id: string) => void;
+  onViewObject: (id: string) => void;
   dataObjects: DataObject[];
   getSystemLabel: (id: string | null | undefined) => string | undefined;
-  onSelectObject: (id: string) => void;
+  nodes: SystemNode[];
+  edges: IntegrationEdge[];
+  renameSystem: (sysId: string, newLabel: string) => void;
+  updateSystemField: <K extends keyof SystemNodeData>(sysId: string, field: K, value: SystemNodeData[K], debounceKey?: string) => void;
+  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  deleteObject: (objId: string) => void;
+  deleteSystem: (sysId: string) => void;
+  renameObjectGlobal: (objId: string, newName: string) => void;
+  updateObjectField: <K extends keyof DataObject>(objId: string, field: K, value: DataObject[K], debounceKey?: string) => void;
+  canWrite: boolean;
 }) {
   const [subView, setSubView] = useState<'systems' | 'objects'>('systems');
   const [rows, setRows] = useState<InventoryRow[]>([]);
@@ -245,6 +570,22 @@ function InventoryView({ onSelectSystem, dataObjects, getSystemLabel, onSelectOb
   const [loading, setLoading] = useState(false);
   const [objectSearch, setObjectSearch] = useState('');
   const pageSize = 25;
+
+  // The row currently open for editing in the right-hand panel - local to this page, so browsing
+  // Inventory never disturbs the canvas's own selection/focus state.
+  const [editingSystemId, setEditingSystemId] = useState<string | null>(null);
+  const [editingObjectId, setEditingObjectId] = useState<string | null>(null);
+
+  const editSystem = (id: string) => { setEditingSystemId(id); setEditingObjectId(null); };
+  const editObject = (id: string) => { setEditingObjectId(id); setEditingSystemId(null); };
+
+  const editingSystemNode = nodes.find(n => n.id === editingSystemId);
+  const editingSystemData = isEaSystemNode(editingSystemNode) ? editingSystemNode.data : undefined;
+  const objectsInEditingSystem = useMemo(
+    () => objectsForSystem(editingSystemId, dataObjects, edges),
+    [editingSystemId, dataObjects, edges]
+  );
+  const editingObject = editingObjectId ? dataObjects.find(o => o.id === editingObjectId) : undefined;
 
   const filteredObjects = useMemo(() => {
     if (!objectSearch) return dataObjects;
@@ -273,7 +614,7 @@ function InventoryView({ onSelectSystem, dataObjects, getSystemLabel, onSelectOb
       if (statusFilter) params.set('status', statusFilter);
       if (criticalityFilter) params.set('criticality', criticalityFilter);
 
-      fetch(`${API_BASE}/systems?${params.toString()}`)
+      apiFetch(`/systems?${params.toString()}`)
         .then(res => res.json())
         .then(data => {
           setRows(data.systems || []);
@@ -289,176 +630,238 @@ function InventoryView({ onSelectSystem, dataObjects, getSystemLabel, onSelectOb
   const to = Math.min(total, (page + 1) * pageSize);
 
   return (
-    <div className="flex-1 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
-      <div className="max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-          <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>
-            {subView === 'systems' ? 'System Inventory' : 'Data Object Inventory'}
-          </h2>
-          <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
-            <button
-              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
-              style={subView === 'systems' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
-              onClick={() => setSubView('systems')}
-            >
-              Systems
-            </button>
-            <button
-              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
-              style={subView === 'objects' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
-              onClick={() => setSubView('objects')}
-            >
-              Data Objects
-            </button>
+    <div className="flex flex-1 overflow-hidden">
+      <div className="flex-1 min-w-0 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
+        <div className="max-w-6xl mx-auto">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>
+              {subView === 'systems' ? 'System Inventory' : 'Data Object Inventory'}
+            </h2>
+            <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
+              <button
+                className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+                style={subView === 'systems' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+                onClick={() => setSubView('systems')}
+              >
+                Systems
+              </button>
+              <button
+                className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+                style={subView === 'objects' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+                onClick={() => setSubView('objects')}
+              >
+                Data Objects
+              </button>
+            </div>
           </div>
-        </div>
 
-        {subView === 'objects' ? (
+          {subView === 'objects' ? (
+            <>
+              <div className="relative mb-4">
+                <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+                <input
+                  className={`${inputClass} pl-9 w-64`}
+                  placeholder="Search by name or alias..."
+                  value={objectSearch}
+                  onChange={e => setObjectSearch(e.target.value)}
+                />
+              </div>
+
+              <div className={`${cardClass} overflow-x-auto`}>
+                <table className="w-full text-sm">
+                  <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
+                    <tr>
+                      <th className="px-4 py-2.5">Data Object</th>
+                      <th className="px-4 py-2.5">Master System</th>
+                      <th className="px-4 py-2.5">Classification</th>
+                      <th className="px-4 py-2.5">Description</th>
+                      <th className="px-4 py-2.5 w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredObjects.slice(0, 200).map(obj => (
+                      <tr
+                        key={obj.id}
+                        className="border-t cursor-pointer transition-colors"
+                        style={{ borderColor: 'var(--border-subtle)', background: editingObjectId === obj.id ? 'var(--bg-surface-alt)' : 'transparent' }}
+                        onMouseEnter={e => { if (editingObjectId !== obj.id) e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
+                        onMouseLeave={e => { if (editingObjectId !== obj.id) e.currentTarget.style.background = 'transparent'; }}
+                        onClick={() => editObject(obj.id)}
+                      >
+                        <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{obj.name}</td>
+                        <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{getSystemLabel(obj.masterSystemId) || '—'}</td>
+                        <td className="px-4 py-2">
+                          <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CLASSIFICATION_BADGE_STYLES[obj.classification || 'internal']}`}>
+                            {CLASSIFICATION_LABELS[obj.classification || 'internal']}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }}>{obj.description || '—'}</td>
+                        <td className="px-4 py-2">
+                          <button
+                            className="p-1.5 rounded-full transition-colors"
+                            style={{ color: 'var(--text-muted)' }}
+                            title="Show this object's flows on the canvas"
+                            onClick={(e) => { e.stopPropagation(); onViewObject(obj.id); }}
+                          >
+                            <Eye size={15} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {filteredObjects.length === 0 && (
+                      <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No data objects match this search.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
+                {`Showing ${Math.min(filteredObjects.length, 200)} of ${filteredObjects.length}`}
+              </div>
+            </>
+          ) : (
           <>
-            <div className="relative mb-4">
+          <div className="flex gap-2 mb-4 flex-wrap">
+            <div className="relative">
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
               <input
                 className={`${inputClass} pl-9 w-64`}
-                placeholder="Search by name or alias..."
-                value={objectSearch}
-                onChange={e => setObjectSearch(e.target.value)}
+                placeholder="Search by name, owner, capability..."
+                value={search}
+                onChange={e => setSearch(e.target.value)}
               />
             </div>
-
-            <div className={`${cardClass} overflow-x-auto`}>
-              <table className="w-full text-sm">
-                <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
-                  <tr>
-                    <th className="px-4 py-2.5">Data Object</th>
-                    <th className="px-4 py-2.5">Master System</th>
-                    <th className="px-4 py-2.5">Classification</th>
-                    <th className="px-4 py-2.5">Description</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredObjects.slice(0, 200).map(obj => (
-                    <tr
-                      key={obj.id}
-                      className="border-t cursor-pointer transition-colors"
-                      style={{ borderColor: 'var(--border-subtle)' }}
-                      onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
-                      onClick={() => onSelectObject(obj.id)}
-                    >
-                      <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{obj.name}</td>
-                      <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{getSystemLabel(obj.masterSystemId) || '—'}</td>
-                      <td className="px-4 py-2">
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CLASSIFICATION_BADGE_STYLES[obj.classification || 'internal']}`}>
-                          {CLASSIFICATION_LABELS[obj.classification || 'internal']}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }}>{obj.description || '—'}</td>
-                    </tr>
-                  ))}
-                  {filteredObjects.length === 0 && (
-                    <tr><td colSpan={4} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No data objects match this search.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
-              {`Showing ${Math.min(filteredObjects.length, 200)} of ${filteredObjects.length}`}
-            </div>
-          </>
-        ) : (
-        <>
-        <div className="flex gap-2 mb-4 flex-wrap">
-          <div className="relative">
-            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
-            <input
-              className={`${inputClass} pl-9 w-64`}
-              placeholder="Search by name, owner, capability..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-            />
+            <select className={`${inputClass} w-auto`} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+              <option value="">All statuses</option>
+              {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            </select>
+            <select className={`${inputClass} w-auto`} value={criticalityFilter} onChange={e => setCriticalityFilter(e.target.value)}>
+              <option value="">All criticalities</option>
+              {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            </select>
           </div>
-          <select className={`${inputClass} w-auto`} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
-            <option value="">All statuses</option>
-            {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-          </select>
-          <select className={`${inputClass} w-auto`} value={criticalityFilter} onChange={e => setCriticalityFilter(e.target.value)}>
-            <option value="">All criticalities</option>
-            {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-          </select>
-        </div>
 
-        <div className={`${cardClass} overflow-x-auto`}>
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
-              <tr>
-                <th className="px-4 py-2.5">System</th>
-                <th className="px-4 py-2.5">Owner</th>
-                <th className="px-4 py-2.5">Status</th>
-                <th className="px-4 py-2.5">Criticality</th>
-                <th className="px-4 py-2.5">Business Capability</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map(r => (
-                <tr
-                  key={r.id}
-                  className="border-t cursor-pointer transition-colors"
-                  style={{ borderColor: 'var(--border-subtle)' }}
-                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
-                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
-                  onClick={() => onSelectSystem(r.id)}
-                >
-                  <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{r.label}</td>
-                  <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.owner || '—'}</td>
-                  <td className="px-4 py-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${STATUS_BADGE_STYLES[r.status] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
-                      {STATUS_LABELS[r.status as SystemStatus] || r.status}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CRITICALITY_BADGE_STYLES[r.criticality] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
-                      {CRITICALITY_LABELS[r.criticality as Criticality] || r.criticality}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.business_capability || '—'}</td>
+          <div className={`${cardClass} overflow-x-auto`}>
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
+                <tr>
+                  <th className="px-4 py-2.5">System</th>
+                  <th className="px-4 py-2.5">Owner</th>
+                  <th className="px-4 py-2.5">Status</th>
+                  <th className="px-4 py-2.5">Criticality</th>
+                  <th className="px-4 py-2.5">Business Capability</th>
+                  <th className="px-4 py-2.5 w-10"></th>
                 </tr>
-              ))}
-              {rows.length === 0 && !loading && (
-                <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No systems match these filters.</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        <div className="flex items-center justify-between mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
-          <span>{loading ? 'Loading...' : `Showing ${from}-${to} of ${total}`}</span>
-          <div className="flex gap-2">
-            <button
-              className={buttonSecondaryClass}
-              disabled={page === 0}
-              onClick={() => setPage(p => Math.max(0, p - 1))}
-            >
-              Previous
-            </button>
-            <button
-              className={buttonSecondaryClass}
-              disabled={to >= total}
-              onClick={() => setPage(p => p + 1)}
-            >
-              Next
-            </button>
+              </thead>
+              <tbody>
+                {rows.map(r => (
+                  <tr
+                    key={r.id}
+                    className="border-t cursor-pointer transition-colors"
+                    style={{ borderColor: 'var(--border-subtle)', background: editingSystemId === r.id ? 'var(--bg-surface-alt)' : 'transparent' }}
+                    onMouseEnter={e => { if (editingSystemId !== r.id) e.currentTarget.style.background = 'var(--bg-surface-alt)'; }}
+                    onMouseLeave={e => { if (editingSystemId !== r.id) e.currentTarget.style.background = 'transparent'; }}
+                    onClick={() => editSystem(r.id)}
+                  >
+                    <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{r.label}</td>
+                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.owner || '—'}</td>
+                    <td className="px-4 py-2">
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${STATUS_BADGE_STYLES[r.status] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
+                        {STATUS_LABELS[r.status as SystemStatus] || r.status}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2">
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CRITICALITY_BADGE_STYLES[r.criticality] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
+                        {CRITICALITY_LABELS[r.criticality as Criticality] || r.criticality}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.business_capability || '—'}</td>
+                    <td className="px-4 py-2">
+                      <button
+                        className="p-1.5 rounded-full transition-colors"
+                        style={{ color: 'var(--text-muted)' }}
+                        title="Show this system on the canvas"
+                        onClick={(e) => { e.stopPropagation(); onSelectSystem(r.id); }}
+                      >
+                        <Eye size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {rows.length === 0 && !loading && (
+                  <tr><td colSpan={6} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No systems match these filters.</td></tr>
+                )}
+              </tbody>
+            </table>
           </div>
+
+          <div className="flex items-center justify-between mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
+            <span>{loading ? 'Loading...' : `Showing ${from}-${to} of ${total}`}</span>
+            <div className="flex gap-2">
+              <button
+                className={buttonSecondaryClass}
+                disabled={page === 0}
+                onClick={() => setPage(p => Math.max(0, p - 1))}
+              >
+                Previous
+              </button>
+              <button
+                className={buttonSecondaryClass}
+                disabled={to >= total}
+                onClick={() => setPage(p => p + 1)}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+          </>
+          )}
         </div>
-        </>
-        )}
       </div>
+
+      {/* Right-hand editor - mirrors the canvas sidebar so a system or data object can be edited
+          in place without leaving the Inventory page. Only takes up space once something is
+          actually selected, so the page isn't dominated by an empty pane by default. */}
+      {(editingSystemId || editingObject) && (
+        <div
+          className="w-80 p-4 border-l overflow-y-auto flex flex-col gap-4 z-10 relative"
+          style={{ background: 'var(--bg-surface-alt)', borderColor: 'var(--border)' }}
+        >
+          {editingSystemId ? (
+            <SystemDetailsPanel
+              systemId={editingSystemId}
+              data={editingSystemData}
+              objectsInSystem={objectsInEditingSystem}
+              renameSystem={renameSystem}
+              updateSystemField={updateSystemField}
+              setSystemAlias={setSystemAlias}
+              deleteObject={deleteObject}
+              onDelete={() => { deleteSystem(editingSystemId); setEditingSystemId(null); }}
+              readOnly={!canWrite}
+            />
+          ) : editingObject ? (
+            <ObjectDetailsPanel
+              object={editingObject}
+              systemNodes={nodes}
+              getSystemLabel={getSystemLabel}
+              onBack={() => setEditingObjectId(null)}
+              renameObjectGlobal={renameObjectGlobal}
+              updateObjectField={updateObjectField}
+              setSystemAlias={setSystemAlias}
+              onDelete={() => { deleteObject(editingObject.id); setEditingObjectId(null); }}
+              readOnly={!canWrite}
+            />
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }
 
-export default function App() {
+function AppContent() {
   const { tokens } = useTheme();
+  const { user, logout } = useAuth();
+  const canWrite = canEdit(user?.role);
   const [nodes, setNodes] = useNodesState<SystemNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<IntegrationEdge>([]);
   const [dataObjects, setDataObjects] = useState<DataObject[]>([]);
@@ -470,7 +873,7 @@ export default function App() {
 
   // Load from DB on mount
   React.useEffect(() => {
-    fetch(`${API_BASE}/state`)
+    apiFetch(`/state`)
       .then(res => res.json())
       .then(data => {
         if (data.systems) {
@@ -536,7 +939,7 @@ export default function App() {
   const apiRequest = useCallback(async (path: string, options?: RequestInit) => {
     setPendingSaves(p => p + 1);
     try {
-      await fetch(`${API_BASE}${path}`, options);
+      await apiFetch(path, options);
     } catch (err) {
       console.error(`API request failed: ${options?.method || 'GET'} ${path}`, err);
     } finally {
@@ -584,10 +987,10 @@ export default function App() {
   const [connectionObjectSearch, setConnectionObjectSearch] = useState('');
 
   const addSystem = useCallback(() => {
-    if (!newSystemName) return;
+    if (!newSystemName) return false;
     if (nodes.some(n => isEaSystemNode(n) && n.data.label.toLowerCase() === newSystemName.trim().toLowerCase())) {
       alert('A system with this name already exists.');
-      return;
+      return false;
     }
     const position = { x: Math.random() * 400, y: Math.random() * 400 };
     const newNode: SystemNode = {
@@ -611,16 +1014,17 @@ export default function App() {
       id: newNode.id, label: newNode.data.label, x: position.x, y: position.y,
       layoutPositions: newNode.data.layoutPositions,
     });
+    return true;
   }, [newSystemName, nodes, setNodes, apiPost]);
 
   const addObject = useCallback(() => {
     if (!newObjectName || !newObjectMaster) {
       alert('Please provide both an object name and a master system.');
-      return;
+      return false;
     }
     if (dataObjects.some(o => o.name.toLowerCase() === newObjectName.trim().toLowerCase())) {
       alert('A data object with this name already exists.');
-      return;
+      return false;
     }
 
     const masterName = newObjectMaster.trim();
@@ -655,6 +1059,7 @@ export default function App() {
     apiPost('/data-objects', { id: newObject.id, name: newObject.name, masterSystemId: newObject.masterSystemId });
     setNewObjectName('');
     setNewObjectMaster('');
+    return true;
   }, [newObjectName, newObjectMaster, dataObjects, nodes, setNodes, apiPost]);
 
   const onConnect = useCallback(
@@ -867,10 +1272,15 @@ export default function App() {
     setView('canvas');
   }, []);
 
-  const handleInventoryObjectSelect = useCallback((objId: string) => {
-    setSelectedObjectIdSidebar(objId);
+  // The Inventory page's "eye" icon for a data object: objects aren't nodes on the canvas, so
+  // "showing" one means decluttering the graph down to just its flows via the existing object
+  // filter, rather than selecting/focusing a node the way a system's eye icon does.
+  const handleViewObjectInCanvas = useCallback((objId: string) => {
+    setFilterObjectId(objId);
+    setFilterSystemId('');
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
+    setSelectedObjectIdSidebar(null);
     setView('canvas');
   }, []);
 
@@ -1308,25 +1718,10 @@ export default function App() {
     return dataObjects.filter(o => relatedObjects.has(o.id));
   }, [pendingEdge, dataObjects, edges]);
 
-  const objectsInSelectedSystem = useMemo(() => {
-    if (!selectedNodeId) return [];
-
-    const relatedObjects = new Set<string>();
-
-    // Objects where this system is master
-    dataObjects.forEach(o => {
-      if (o.masterSystemId === selectedNodeId) relatedObjects.add(o.id);
-    });
-
-    // Objects flowing in/out of this system
-    edges.forEach(e => {
-      if (e.source === selectedNodeId || e.target === selectedNodeId) {
-        e.data?.dataObjectIds?.forEach(id => relatedObjects.add(id));
-      }
-    });
-
-    return dataObjects.filter(o => relatedObjects.has(o.id));
-  }, [selectedNodeId, dataObjects, edges]);
+  const objectsInSelectedSystem = useMemo(
+    () => objectsForSystem(selectedNodeId, dataObjects, edges),
+    [selectedNodeId, dataObjects, edges]
+  );
 
   return (
     <div className="w-full h-screen flex flex-col relative" style={{ fontFamily: 'var(--font-sans)' }}>
@@ -1382,81 +1777,12 @@ export default function App() {
       )}
 
       <header
-        className="p-4 flex gap-4 items-center flex-wrap shadow-[var(--shadow-md)] z-20 relative"
+        className="px-5 py-3 flex items-center gap-4 shadow-[var(--shadow-md)] z-20 relative"
         style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
       >
-        <div className="font-bold text-xl flex items-center gap-4 tracking-[var(--heading-tracking)]">
+        <div className="flex items-center gap-2 font-bold text-lg tracking-[var(--heading-tracking)]">
+          <LogoMark />
           EA Designer
-        </div>
-
-        <div
-          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
-          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
-        >
-          <input
-            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm"
-            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-            value={newSystemName}
-            onChange={(e) => setNewSystemName(e.target.value)}
-            placeholder="New System Name"
-          />
-          <button className={buttonPrimaryClass} onClick={addSystem}><Plus size={14} />Add System</button>
-        </div>
-
-        <div
-          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
-          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
-        >
-          <input
-            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
-            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-            value={newObjectName}
-            onChange={(e) => setNewObjectName(e.target.value)}
-            placeholder="Object Name"
-          />
-          <select
-            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
-            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-            value={newObjectMaster}
-            onChange={(e) => setNewObjectMaster(e.target.value)}
-          >
-            <option value="" disabled>Master System</option>
-            {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
-          </select>
-          <button className={buttonPrimaryClass} onClick={addObject}><Plus size={14} />Add Object</button>
-        </div>
-
-        <div
-          className="flex gap-2 items-center p-1.5 rounded-[var(--radius-card)]"
-          style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
-        >
-          <span className="text-sm pl-1 opacity-80">Filter:</span>
-          <input
-            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
-            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-            value={filterSystemId}
-            onChange={(e) => setFilterSystemId(e.target.value)}
-            placeholder="System Filter"
-            list="filter-systems-list"
-          />
-          <datalist id="filter-systems-list">
-            {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
-          </datalist>
-
-          <input
-            className="px-2.5 py-1 rounded-[var(--radius-input)] outline-none text-sm w-32"
-            style={{ background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-            value={filterObjectId}
-            onChange={(e) => setFilterObjectId(e.target.value)}
-            placeholder="Object Filter"
-            list="filter-objects-list"
-          />
-          <datalist id="filter-objects-list">
-            {dataObjects.map(o => {
-              const aliasValues = Object.values(o.aliases || {}).join(', ');
-              return <option key={o.id} value={o.id}>{o.name} {aliasValues ? `(${aliasValues})` : ''}</option>;
-            })}
-          </datalist>
         </div>
 
         <div
@@ -1485,14 +1811,147 @@ export default function App() {
             <SettingsIcon size={14} />Settings
           </button>
         </div>
+
+        {user && (
+          <div className="flex items-center gap-2 pl-2 text-sm" style={{ color: 'var(--text-on-header)' }}>
+            <span className="hidden sm:inline opacity-90 truncate max-w-[140px]" title={user.email}>{user.name}</span>
+            <button
+              className="p-1.5 rounded-full transition-colors"
+              style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
+              title="Log out"
+              onClick={() => logout()}
+            >
+              <LogOut size={14} />
+            </button>
+          </div>
+        )}
       </header>
+
+      {/* Canvas-only contextual toolbar - creation and filtering only matter while looking at the
+          diagram, so they no longer clutter every other page. */}
+      {view === 'canvas' && (
+        <div
+          className="px-5 py-2.5 flex items-center gap-2 flex-wrap border-b"
+          style={{ background: 'var(--bg-surface-alt)', borderColor: 'var(--border)' }}
+        >
+          {canWrite && (
+            <>
+              <Popover
+                trigger={({ toggle }) => (
+                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />Add System</button>
+                )}
+              >
+                {(close) => (
+                  <div className="flex flex-col gap-3">
+                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>New System</h3>
+                    <input
+                      autoFocus
+                      className={inputClass}
+                      placeholder="System name"
+                      value={newSystemName}
+                      onChange={(e) => setNewSystemName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' && addSystem()) close(); }}
+                    />
+                    <button className={buttonPrimaryClass} onClick={() => { if (addSystem()) close(); }}>
+                      <Plus size={14} />Add System
+                    </button>
+                  </div>
+                )}
+              </Popover>
+
+              <Popover
+                trigger={({ toggle }) => (
+                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />Add Object</button>
+                )}
+              >
+                {(close) => (
+                  <div className="flex flex-col gap-3">
+                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>New Data Object</h3>
+                    <input
+                      autoFocus
+                      className={inputClass}
+                      placeholder="Object name"
+                      value={newObjectName}
+                      onChange={(e) => setNewObjectName(e.target.value)}
+                    />
+                    <select
+                      className={inputClass}
+                      value={newObjectMaster}
+                      onChange={(e) => setNewObjectMaster(e.target.value)}
+                    >
+                      <option value="" disabled>Master system</option>
+                      {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
+                    </select>
+                    <button className={buttonPrimaryClass} onClick={() => { if (addObject()) close(); }}>
+                      <Plus size={14} />Add Object
+                    </button>
+                  </div>
+                )}
+              </Popover>
+
+              <div className="w-px h-5 mx-1" style={{ background: 'var(--border)' }} />
+            </>
+          )}
+
+          <div className="relative">
+            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+            <input
+              className={`${inputClass} pl-8 w-40`}
+              value={filterSystemId}
+              onChange={(e) => setFilterSystemId(e.target.value)}
+              placeholder="Filter by system"
+              list="filter-systems-list"
+            />
+            <datalist id="filter-systems-list">
+              {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
+            </datalist>
+          </div>
+
+          <div className="relative">
+            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+            <input
+              className={`${inputClass} pl-8 w-40`}
+              value={filterObjectId}
+              onChange={(e) => setFilterObjectId(e.target.value)}
+              placeholder="Filter by object"
+              list="filter-objects-list"
+            />
+            <datalist id="filter-objects-list">
+              {dataObjects.map(o => {
+                const aliasValues = Object.values(o.aliases || {}).join(', ');
+                return <option key={o.id} value={o.id}>{o.name} {aliasValues ? `(${aliasValues})` : ''}</option>;
+              })}
+            </datalist>
+          </div>
+
+          {(filterSystemId || filterObjectId) && (
+            <button
+              className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-[var(--radius-button)] transition-colors"
+              style={{ color: 'var(--text-secondary)' }}
+              onClick={() => { setFilterSystemId(''); setFilterObjectId(''); }}
+            >
+              <X size={12} />Clear filters
+            </button>
+          )}
+        </div>
+      )}
 
       {view === 'inventory' ? (
         <InventoryView
           onSelectSystem={handleInventorySelect}
+          onViewObject={handleViewObjectInCanvas}
           dataObjects={dataObjects}
           getSystemLabel={getSystemLabel}
-          onSelectObject={handleInventoryObjectSelect}
+          nodes={nodes}
+          edges={edges}
+          renameSystem={renameSystem}
+          updateSystemField={updateSystemField}
+          setSystemAlias={setSystemAlias}
+          deleteObject={deleteObject}
+          deleteSystem={deleteSystem}
+          renameObjectGlobal={renameObjectGlobal}
+          updateObjectField={updateObjectField}
+          canWrite={canWrite}
         />
       ) : view === 'settings' ? (
         <SettingsView />
@@ -1524,6 +1983,8 @@ export default function App() {
               setSelectedObjectIdSidebar(null);
             }}
             connectionMode={ConnectionMode.Loose}
+            nodesDraggable={canWrite}
+            nodesConnectable={canWrite}
             fitView
           >
             <Controls />
@@ -1547,6 +2008,7 @@ export default function App() {
                   <select
                     className={inputClass}
                     value={selectedEdge.data?.integrationPattern || ''}
+                    disabled={!canWrite}
                     onChange={(e) => updateEdgeField(selectedEdge.id, 'integrationPattern', e.target.value)}
                   >
                     <option value="">Unspecified</option>
@@ -1564,6 +2026,7 @@ export default function App() {
                   <select
                     className={inputClass}
                     value={selectedEdge.data?.frequency || ''}
+                    disabled={!canWrite}
                     onChange={(e) => updateEdgeField(selectedEdge.id, 'frequency', e.target.value)}
                   >
                     <option value="">Unspecified</option>
@@ -1582,6 +2045,7 @@ export default function App() {
                   className={inputClass}
                   rows={2}
                   value={selectedEdge.data?.description || ''}
+                  disabled={!canWrite}
                   onChange={(e) => updateEdgeField(selectedEdge.id, 'description', e.target.value, `edge-desc-${selectedEdge.id}`)}
                   placeholder="What does this integration do?"
                 />
@@ -1622,6 +2086,7 @@ export default function App() {
                       <input
                         type="checkbox"
                         checked={isActive || false}
+                        disabled={!canWrite}
                         onChange={() => toggleObjectOnEdge(selectedEdge.id, obj.id)}
                       />
                       <span className="truncate" title={obj.name}>{obj.name}</span>
@@ -1630,236 +2095,39 @@ export default function App() {
                 })}
               </div>
 
-              <button
-                className={`${buttonDangerClass} mt-8`}
-                onClick={deleteSelectedEdge}
-              >
-                <Trash2 size={14} />Delete Connection
-              </button>
+              {canWrite && (
+                <button
+                  className={`${buttonDangerClass} mt-8`}
+                  onClick={deleteSelectedEdge}
+                >
+                  <Trash2 size={14} />Delete Connection
+                </button>
+              )}
             </>
           ) : selectedNodeId ? (
-            <>
-              <h2 className={panelHeadingClass}>System Details</h2>
-              <div>
-                <label className={labelClass}>System Name</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  value={getSystemLabel(selectedNodeId) || ''}
-                  onChange={(e) => renameSystem(selectedNodeId, e.target.value)}
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className={labelClass}>Status</label>
-                  <select
-                    className={inputClass}
-                    value={selectedSystemData?.status || 'active'}
-                    onChange={(e) => updateSystemField(selectedNodeId, 'status', e.target.value as SystemStatus)}
-                  >
-                    {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className={labelClass}>Criticality</label>
-                  <select
-                    className={inputClass}
-                    value={selectedSystemData?.criticality || 'medium'}
-                    onChange={(e) => updateSystemField(selectedNodeId, 'criticality', e.target.value as Criticality)}
-                  >
-                    {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className={labelClass}>Owner</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  placeholder="e.g. Finance IT Team"
-                  value={selectedSystemData?.owner || ''}
-                  onChange={(e) => updateSystemField(selectedNodeId, 'owner', e.target.value, `system-owner-${selectedNodeId}`)}
-                />
-              </div>
-
-              <div>
-                <label className={labelClass}>Business Capability</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  placeholder="e.g. Order to Cash"
-                  value={selectedSystemData?.businessCapability || ''}
-                  onChange={(e) => updateSystemField(selectedNodeId, 'businessCapability', e.target.value, `system-capability-${selectedNodeId}`)}
-                />
-              </div>
-
-              <div>
-                <label className={labelClass}>Tech Stack (comma-separated)</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  placeholder="e.g. Java, PostgreSQL, AWS"
-                  value={(selectedSystemData?.techStack || []).join(', ')}
-                  onChange={(e) => updateSystemField(
-                    selectedNodeId, 'techStack',
-                    e.target.value.split(',').map(s => s.trim()).filter(Boolean),
-                    `system-stack-${selectedNodeId}`
-                  )}
-                />
-              </div>
-
-              <div>
-                <label className={labelClass}>Description</label>
-                <textarea
-                  className={inputClass}
-                  rows={3}
-                  placeholder="What does this system do?"
-                  value={selectedSystemData?.description || ''}
-                  onChange={(e) => updateSystemField(selectedNodeId, 'description', e.target.value, `system-desc-${selectedNodeId}`)}
-                />
-              </div>
-
-              <div className="border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
-                <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>Objects in this System</h3>
-                {objectsInSelectedSystem.length === 0 ? (
-                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No objects associated.</p>
-                ) : (
-                  <div className="flex flex-col gap-1 max-h-[30vh] overflow-y-auto pr-1">
-                    {objectsInSelectedSystem.map(obj => {
-                      const alias = obj.aliases?.[selectedNodeId] || '';
-                      return (
-                        <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
-                          <div className="flex items-center justify-between">
-                            <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
-                            {obj.masterSystemId === selectedNodeId && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
-                            )}
-                          </div>
-                          <div className="flex items-center justify-between gap-2 mt-1">
-                            <input
-                              type="text"
-                              className={`${inputClass} px-1.5 py-0.5 text-xs`}
-                              placeholder="Alias in this system..."
-                              value={alias}
-                              onChange={(e) => setSystemAlias(obj.id, selectedNodeId, e.target.value)}
-                            />
-                            <button
-                              className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
-                              style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                deleteObject(obj.id);
-                              }}
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <button
-                className={`${buttonDangerClass} mt-8`}
-                onClick={() => {
-                  deleteSystem(selectedNodeId);
-                  setSelectedNodeId(null);
-                }}
-              >
-                <Trash2 size={14} />Delete System
-              </button>
-            </>
+            <SystemDetailsPanel
+              systemId={selectedNodeId}
+              data={selectedSystemData}
+              objectsInSystem={objectsInSelectedSystem}
+              renameSystem={renameSystem}
+              updateSystemField={updateSystemField}
+              setSystemAlias={setSystemAlias}
+              deleteObject={deleteObject}
+              onDelete={() => { deleteSystem(selectedNodeId); setSelectedNodeId(null); }}
+              readOnly={!canWrite}
+            />
           ) : selectedObject ? (
-            <>
-              <button className="text-xs text-left mb-2 hover:underline" style={{ color: 'var(--primary)' }} onClick={() => setSelectedObjectIdSidebar(null)}>
-                &larr; Back to All Objects
-              </button>
-              <h2 className={panelHeadingClass}>Object Details</h2>
-
-              <div className="mt-2">
-                <label className={labelClass}>Global Name</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  value={selectedObject.name}
-                  onChange={(e) => renameObjectGlobal(selectedObject.id, e.target.value)}
-                />
-              </div>
-
-              <div className="mt-4">
-                <label className={labelClass}>Classification</label>
-                <select
-                  className={inputClass}
-                  value={selectedObject.classification || 'internal'}
-                  onChange={(e) => updateObjectField(selectedObject.id, 'classification', e.target.value as DataObjectClassification)}
-                >
-                  <option value="public">Public</option>
-                  <option value="internal">Internal</option>
-                  <option value="confidential">Confidential</option>
-                  <option value="restricted">Restricted</option>
-                </select>
-              </div>
-
-              <div className="mt-4">
-                <label className={labelClass}>Description</label>
-                <textarea
-                  className={inputClass}
-                  rows={2}
-                  value={selectedObject.description || ''}
-                  onChange={(e) => updateObjectField(selectedObject.id, 'description', e.target.value, `object-desc-${selectedObject.id}`)}
-                />
-              </div>
-
-              <div className="mt-4">
-                <label className={labelClass}>Master System</label>
-                <select
-                  className={inputClass}
-                  value={selectedObject.masterSystemId || ''}
-                  onChange={(e) => updateObjectField(selectedObject.id, 'masterSystemId', e.target.value)}
-                >
-                  <option value="" disabled>-- Select a System --</option>
-                  {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
-                </select>
-              </div>
-
-              <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
-                <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>System Aliases</h3>
-                {Object.entries(selectedObject.aliases || {}).length === 0 ? (
-                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No aliases defined.</p>
-                ) : (
-                  <div className="flex flex-col gap-2">
-                    {Object.entries(selectedObject.aliases || {}).map(([sysId, alias]) => {
-                      const sysName = getSystemLabel(sysId) || 'Unknown System';
-                      return (
-                        <div key={sysId} className={`${listItemCardClass} flex flex-col gap-1`}>
-                          <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{sysName}</span>
-                          <input
-                            type="text"
-                            className={`${inputClass} px-1.5 py-0.5 text-xs`}
-                            value={alias}
-                            onChange={(e) => setSystemAlias(selectedObject.id, sysId, e.target.value)}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <button
-                className={`${buttonDangerClass} mt-8`}
-                onClick={() => {
-                  deleteObject(selectedObject.id);
-                  setSelectedObjectIdSidebar(null);
-                }}
-              >
-                <Trash2 size={14} />Delete Object
-              </button>
-            </>
+            <ObjectDetailsPanel
+              object={selectedObject}
+              systemNodes={nodes}
+              getSystemLabel={getSystemLabel}
+              onBack={() => setSelectedObjectIdSidebar(null)}
+              renameObjectGlobal={renameObjectGlobal}
+              updateObjectField={updateObjectField}
+              setSystemAlias={setSystemAlias}
+              onDelete={() => { deleteObject(selectedObject.id); setSelectedObjectIdSidebar(null); }}
+              readOnly={!canWrite}
+            />
           ) : (
             <div className="flex flex-col items-center text-center gap-2 mt-12 px-4">
               <MousePointerClick size={28} style={{ color: 'var(--text-muted)' }} />
@@ -1874,5 +2142,13 @@ export default function App() {
       </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthGate>
+      <AppContent />
+    </AuthGate>
   );
 }
