@@ -59,6 +59,58 @@ async function initDB() {
       data_object_ids JSONB DEFAULT '[]'
     );
 
+    -- Admin-maintainable reference lists (Inventory page) that an edge's individual object flows
+    -- can tag themselves with, e.g. for eventually driving edge styling by integration
+    -- type/software rather than by master-conflict status alone.
+    CREATE TABLE IF NOT EXISTS integration_types (
+      id VARCHAR(255) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS integration_software (
+      id VARCHAR(255) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL
+    );
+
+    -- A named label (e.g. "Nightly Boomi Sync") plus an optional machine-readable "schedule"
+    -- (JSONB - see ScheduleDef in App.tsx: cron expression, simple interval, or daily/weekly at a
+    -- time) that the Schedule page uses to compute actual next-run times. A label with no
+    -- schedule (e.g. "Real-time", "Manual") is still valid - it just contributes no computed runs.
+    CREATE TABLE IF NOT EXISTS integration_frequencies (
+      id VARCHAR(255) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      schedule JSONB DEFAULT '{"kind":"none"}'
+    );
+
+    -- A planned or unplanned window where a system is unavailable - the Schedule page cross-
+    -- references these against computed run times to flag which integrations they'd impact.
+    CREATE TABLE IF NOT EXISTS system_downtimes (
+      id VARCHAR(255) PRIMARY KEY,
+      system_id VARCHAR(255) REFERENCES systems(id) ON DELETE CASCADE,
+      starts_at TIMESTAMPTZ NOT NULL,
+      ends_at TIMESTAMPTZ NOT NULL,
+      reason TEXT DEFAULT ''
+    );
+
+    -- How each individual data object moves over a given edge - one row per (edge, object) pair,
+    -- not per edge, because a single connection carrying several objects can integrate each one
+    -- differently (different pattern, frequency, type, software). The pattern is further split
+    -- into a source-side and target-side value, since even one object's flow can be read from its
+    -- source system over one protocol and delivered into its target system over another. "at_risk"
+    -- flags a flow whose business impact is high enough that an interrupted schedule/connection
+    -- should be called out on the Schedule page rather than blending in with routine traffic.
+    CREATE TABLE IF NOT EXISTS edge_object_details (
+      edge_id VARCHAR(255) REFERENCES edges(id) ON DELETE CASCADE,
+      data_object_id VARCHAR(255) REFERENCES data_objects(id) ON DELETE CASCADE,
+      source_pattern VARCHAR(50) DEFAULT '',
+      target_pattern VARCHAR(50) DEFAULT '',
+      frequency_ids JSONB DEFAULT '[]',
+      integration_type_ids JSONB DEFAULT '[]',
+      integration_software_ids JSONB DEFAULT '[]',
+      at_risk BOOLEAN DEFAULT false,
+      PRIMARY KEY (edge_id, data_object_id)
+    );
+
     CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(255) PRIMARY KEY,
       email VARCHAR(255) UNIQUE NOT NULL,
@@ -136,6 +188,12 @@ async function initDB() {
   await addColumnIfMissing('edges', "description TEXT DEFAULT ''");
   await addColumnIfMissing('edges', "integration_pattern VARCHAR(50) DEFAULT ''");
   await addColumnIfMissing('edges', "frequency VARCHAR(50) DEFAULT ''");
+  await addColumnIfMissing('edges', "integration_type_ids JSONB DEFAULT '[]'");
+  await addColumnIfMissing('edges', "integration_software_ids JSONB DEFAULT '[]'");
+
+  await addColumnIfMissing('edge_object_details', "frequency_ids JSONB DEFAULT '[]'");
+  await addColumnIfMissing('edge_object_details', "at_risk BOOLEAN DEFAULT false");
+  await addColumnIfMissing('integration_frequencies', `schedule JSONB DEFAULT '{"kind":"none"}'`);
 
   // Indexes matter once a landscape has hundreds/thousands of systems - without them, every
   // filter-by-system, filter-by-object, or master-system lookup becomes a full table scan.
@@ -146,7 +204,41 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_systems_label ON systems(label);
     CREATE INDEX IF NOT EXISTS idx_systems_status ON systems(status);
     CREATE INDEX IF NOT EXISTS idx_systems_criticality ON systems(criticality);
+    CREATE INDEX IF NOT EXISTS idx_system_downtimes_system ON system_downtimes(system_id);
   `);
+
+  // Seed the reference lists with sensible starting values on first run only - if an admin
+  // has since deleted all entries, that's a deliberate choice and shouldn't be undone on restart.
+  const seedIfEmpty = async (table, rows) => {
+    const { rows: countRows } = await pool.query(`SELECT COUNT(*) FROM ${table}`);
+    if (parseInt(countRows[0].count, 10) > 0) return;
+    for (const row of rows) {
+      const columns = Object.keys(row);
+      const placeholders = columns.map((_, i) => `$${i + 1}`);
+      const values = columns.map(c => (typeof row[c] === 'object' && row[c] !== null) ? JSON.stringify(row[c]) : row[c]);
+      await pool.query(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
+    }
+  };
+
+  await seedIfEmpty('integration_types', [
+    { id: 'itype-manual', name: 'Manual' },
+    { id: 'itype-api', name: 'API Integration' },
+    { id: 'itype-file', name: 'File-based Integration' },
+  ]);
+
+  await seedIfEmpty('integration_software', [
+    { id: 'isw-middleware', name: 'Middleware' },
+    { id: 'isw-p2p', name: 'P2P' },
+    { id: 'isw-other', name: 'Other' },
+  ]);
+
+  await seedIfEmpty('integration_frequencies', [
+    { id: 'ifreq-realtime', name: 'Real-time', schedule: { kind: 'none' } },
+    { id: 'ifreq-hourly', name: 'Batch - Hourly', schedule: { kind: 'interval', everyMinutes: 60 } },
+    { id: 'ifreq-daily', name: 'Batch - Daily', schedule: { kind: 'daily', time: '02:00' } },
+    { id: 'ifreq-weekly', name: 'Batch - Weekly', schedule: { kind: 'weekly', time: '02:00', daysOfWeek: [0] } },
+    { id: 'ifreq-manual', name: 'Manual / Ad-hoc', schedule: { kind: 'none' } },
+  ]);
 }
 
 initDB().then(loadSmtpConfig).catch(console.error);
@@ -309,8 +401,25 @@ const EDGE_COLUMNS = {
   target: 'target',
   dataObjectIds: 'data_object_ids',
   description: 'description',
-  integrationPattern: 'integration_pattern',
-  frequency: 'frequency',
+};
+
+const REFERENCE_LIST_COLUMNS = { name: 'name' };
+const FREQUENCY_LIST_COLUMNS = { name: 'name', schedule: 'schedule' };
+
+const EDGE_OBJECT_DETAIL_COLUMNS = {
+  sourcePattern: 'source_pattern',
+  targetPattern: 'target_pattern',
+  frequencyIds: 'frequency_ids',
+  integrationTypeIds: 'integration_type_ids',
+  integrationSoftwareIds: 'integration_software_ids',
+  atRisk: 'at_risk',
+};
+
+const SYSTEM_DOWNTIME_COLUMNS = {
+  systemId: 'system_id',
+  startsAt: 'starts_at',
+  endsAt: 'ends_at',
+  reason: 'reason',
 };
 
 // ---------------------------------------------------------------------------
@@ -591,11 +700,21 @@ app.get('/api/state', requireAuth, async (req, res) => {
     const systemsRes = await pool.query('SELECT * FROM systems ORDER BY label');
     const objectsRes = await pool.query('SELECT * FROM data_objects ORDER BY name');
     const edgesRes = await pool.query('SELECT * FROM edges');
+    const integrationTypesRes = await pool.query('SELECT * FROM integration_types ORDER BY name');
+    const integrationSoftwareRes = await pool.query('SELECT * FROM integration_software ORDER BY name');
+    const integrationFrequenciesRes = await pool.query('SELECT * FROM integration_frequencies ORDER BY name');
+    const edgeObjectDetailsRes = await pool.query('SELECT * FROM edge_object_details');
+    const systemDowntimesRes = await pool.query('SELECT * FROM system_downtimes ORDER BY starts_at');
 
     res.json({
       systems: systemsRes.rows,
       dataObjects: objectsRes.rows,
-      edges: edgesRes.rows
+      edges: edgesRes.rows,
+      integrationTypes: integrationTypesRes.rows,
+      integrationSoftware: integrationSoftwareRes.rows,
+      integrationFrequencies: integrationFrequenciesRes.rows,
+      edgeObjectDetails: edgeObjectDetailsRes.rows,
+      systemDowntimes: systemDowntimesRes.rows,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -793,9 +912,9 @@ app.post('/api/edges', requireAuth, requireRole('admin', 'editor'), async (req, 
   try {
     const e = req.body;
     await pool.query(
-      `INSERT INTO edges (id, source, target, data_object_ids, description, integration_pattern, frequency)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [e.id, e.source, e.target, JSON.stringify(e.dataObjectIds || []), e.description || '', e.integrationPattern || '', e.frequency || '']
+      `INSERT INTO edges (id, source, target, data_object_ids, description)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [e.id, e.source, e.target, JSON.stringify(e.dataObjectIds || []), e.description || '']
     );
     res.status(201).json({ success: true });
   } catch (err) {
@@ -818,6 +937,147 @@ app.patch('/api/edges/:id', requireAuth, requireRole('admin', 'editor'), async (
 app.delete('/api/edges/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
   try {
     await pool.query('DELETE FROM edges WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// How one specific data object moves over one specific edge - upserted lazily the first time any
+// of its fields is set, since most (edge, object) pairs never get more than the defaults.
+app.patch('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    const { edgeId, objectId } = req.params;
+    await pool.query(
+      `INSERT INTO edge_object_details (edge_id, data_object_id) VALUES ($1, $2)
+       ON CONFLICT (edge_id, data_object_id) DO NOTHING`,
+      [edgeId, objectId]
+    );
+    const { sets, values } = buildUpdate('edge_object_details', EDGE_OBJECT_DETAIL_COLUMNS, req.body);
+    if (sets.length > 0) {
+      values.push(edgeId, objectId);
+      await pool.query(
+        `UPDATE edge_object_details SET ${sets.join(', ')} WHERE edge_id = $${values.length - 1} AND data_object_id = $${values.length}`,
+        values
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2',
+      [req.params.edgeId, req.params.objectId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Reference lists (Integration Types, Software, Frequencies) - admin-maintainable tags that an
+// integration's object flows can carry one or more of. All three share the same {id, name} base
+// shape (frequencies add a `schedule` column - see FREQUENCY_LIST_COLUMNS), so one route factory
+// serves all three; `columns` says which extra fields beyond id/name a given list accepts.
+// ---------------------------------------------------------------------------
+function registerReferenceListRoutes(path, table, idPrefix, columns = REFERENCE_LIST_COLUMNS) {
+  app.get(`/api/${path}`, requireAuth, async (req, res) => {
+    try {
+      const rows = await pool.query(`SELECT * FROM ${table} ORDER BY name`);
+      res.json({ items: rows.rows });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(`/api/${path}`, requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+    try {
+      const id = req.body.id || `${idPrefix}-${Date.now()}`;
+      await pool.query(`INSERT INTO ${table} (id, name) VALUES ($1, $2)`, [id, req.body.name]);
+      const { sets, values } = buildUpdate(table, columns, req.body);
+      if (sets.length > 0) {
+        values.push(id);
+        await pool.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
+      }
+      res.status(201).json({ success: true, id });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.patch(`/api/${path}/:id`, requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+    try {
+      const { sets, values } = buildUpdate(table, columns, req.body);
+      if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
+      values.push(req.params.id);
+      await pool.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete(`/api/${path}/:id`, requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+    try {
+      await pool.query(`DELETE FROM ${table} WHERE id = $1`, [req.params.id]);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+}
+
+registerReferenceListRoutes('integration-types', 'integration_types', 'itype');
+registerReferenceListRoutes('integration-software', 'integration_software', 'isw');
+registerReferenceListRoutes('integration-frequencies', 'integration_frequencies', 'ifreq', FREQUENCY_LIST_COLUMNS);
+
+// ---------------------------------------------------------------------------
+// System downtimes - planned or unplanned windows a system is unavailable, cross-referenced on
+// the Schedule page against computed run times to flag impacted integrations.
+// ---------------------------------------------------------------------------
+app.get('/api/system-downtimes', requireAuth, async (req, res) => {
+  try {
+    const rows = await pool.query('SELECT * FROM system_downtimes ORDER BY starts_at');
+    res.json({ downtimes: rows.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/system-downtimes', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    const d = req.body;
+    const id = d.id || `downtime-${Date.now()}`;
+    await pool.query(
+      `INSERT INTO system_downtimes (id, system_id, starts_at, ends_at, reason) VALUES ($1, $2, $3, $4, $5)`,
+      [id, d.systemId, d.startsAt, d.endsAt, d.reason || '']
+    );
+    res.status(201).json({ success: true, id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    const { sets, values } = buildUpdate('system_downtimes', SYSTEM_DOWNTIME_COLUMNS, req.body);
+    if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
+    values.push(req.params.id);
+    await pool.query(`UPDATE system_downtimes SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM system_downtimes WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

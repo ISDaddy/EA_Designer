@@ -14,7 +14,7 @@ import {
 } from '@xyflow/react';
 import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
+import { AlertTriangle, Calendar, Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
 import { useTheme } from './theme/useTheme';
 import { SettingsView } from './theme/SettingsView';
 import { apiFetch } from './api';
@@ -23,6 +23,7 @@ import { AuthGate } from './auth/AuthGate';
 import { canEdit } from './auth/roles';
 import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass, cardClass, panelHeadingClass, labelClass, listItemCardClass } from './ui';
 import { LogoMark } from './LogoMark';
+import { computeNextOccurrences, describeSchedule, DAY_NAMES, type ScheduleDef } from './schedule';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -154,10 +155,36 @@ type SystemNode = Node<SystemNodeData, 'eaSystem'> | Node<Record<string, never>,
 type IntegrationEdgeData = {
   dataObjectIds: string[];
   description?: string;
-  integrationPattern?: string;
-  frequency?: string;
 };
 type IntegrationEdge = Edge<IntegrationEdgeData>;
+
+// An admin-maintainable tag (Inventory page) that an integration can carry one or more of -
+// shared shape for both the Integration Type list (Manual, API Integration, ...) and the
+// Integration Software list (Middleware, P2P, ...). Integration Frequencies additionally carry a
+// `schedule` - see ScheduleDef in schedule.ts - so the Schedule page can compute real run times
+// instead of the name being just a display label.
+type ReferenceListItem = { id: string; name: string; schedule?: ScheduleDef };
+type ReferenceListId = 'integration-types' | 'integration-software' | 'integration-frequencies';
+
+// How a single data object moves over a single connection - one of these per (edge, object)
+// pair, not per edge, since a connection carrying several objects can integrate each one
+// differently (see the comment by INTEGRATION_PATTERN_OPTIONS above for why the pattern is
+// further split into a source-side and target-side value). `atRisk` flags a flow whose business
+// impact is high enough that an interrupted schedule/connection should be called out on the
+// Schedule page rather than blending in with routine traffic.
+type EdgeObjectDetail = {
+  sourcePattern?: string;
+  targetPattern?: string;
+  frequencyIds?: string[];
+  integrationTypeIds?: string[];
+  integrationSoftwareIds?: string[];
+  atRisk?: boolean;
+};
+const edgeObjectDetailKey = (edgeId: string, objectId: string) => `${edgeId}::${objectId}`;
+
+// A planned or unplanned window where a system is unavailable - the Schedule page cross-
+// references these against computed run times to flag which integrations they'd impact.
+type SystemDowntime = { id: string; systemId: string; startsAt: string; endsAt: string; reason?: string };
 
 // `nodes.filter(n => n.type === 'eaSystem')` doesn't narrow the array's element type (only a type
 // predicate does), so call sites used to fall back to `as any` to reach `.data.label`. This guard
@@ -191,7 +218,15 @@ type RawDataObjectRow = {
 };
 type RawEdgeRow = {
   id: string; source: string; target: string; data_object_ids: string[];
-  description?: string; integration_pattern?: string; frequency?: string;
+  description?: string;
+};
+type RawEdgeObjectDetailRow = {
+  edge_id: string; data_object_id: string;
+  source_pattern?: string; target_pattern?: string; frequency_ids?: string[];
+  integration_type_ids?: string[]; integration_software_ids?: string[]; at_risk?: boolean;
+};
+type RawSystemDowntimeRow = {
+  id: string; system_id: string; starts_at: string; ends_at: string; reason?: string;
 };
 
 type DataObject = {
@@ -202,6 +237,79 @@ type DataObject = {
   description?: string;
   classification?: DataObjectClassification;
 };
+
+// One concrete future run of one object's flow over one connection, expanded from that flow's
+// assigned frequencies - the Schedule page's whole reason for existing (see schedule.ts for how
+// a frequency's structured `schedule` becomes actual timestamps).
+type ScheduledRun = {
+  key: string;
+  time: Date;
+  objectName: string;
+  edgeId: string;
+  sourceSystemId: string;
+  targetSystemId: string;
+  sourceLabel: string;
+  targetLabel: string;
+  frequencyLabel: string;
+  atRisk: boolean;
+  impactedDowntimes: SystemDowntime[];
+};
+
+const SCHEDULE_WINDOW_DAYS = 30;
+const MAX_OCCURRENCES_PER_FLOW = 30;
+
+function computeScheduledRuns(
+  edges: IntegrationEdge[],
+  dataObjects: DataObject[],
+  edgeObjectDetails: Record<string, EdgeObjectDetail>,
+  integrationFrequencies: ReferenceListItem[],
+  systemDowntimes: SystemDowntime[],
+  getSystemLabel: (id: string | null | undefined) => string | undefined,
+): ScheduledRun[] {
+  const now = new Date();
+  const horizonEnd = new Date(now.getTime() + SCHEDULE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  const results: ScheduledRun[] = [];
+
+  edges.forEach(edge => {
+    const objIds = edge.data?.dataObjectIds || [];
+    objIds.forEach(objId => {
+      const detail = edgeObjectDetails[edgeObjectDetailKey(edge.id, objId)];
+      if (!detail?.frequencyIds?.length) return;
+      const obj = dataObjects.find(o => o.id === objId);
+      if (!obj) return;
+
+      detail.frequencyIds.forEach(freqId => {
+        const freq = integrationFrequencies.find(f => f.id === freqId);
+        if (!freq?.schedule || freq.schedule.kind === 'none') return;
+
+        const occurrences = computeNextOccurrences(freq.schedule, now, MAX_OCCURRENCES_PER_FLOW)
+          .filter(d => d <= horizonEnd);
+
+        occurrences.forEach((time, i) => {
+          const impactedDowntimes = systemDowntimes.filter(dt =>
+            (dt.systemId === edge.source || dt.systemId === edge.target) &&
+            time >= new Date(dt.startsAt) && time <= new Date(dt.endsAt)
+          );
+          results.push({
+            key: `${edge.id}-${objId}-${freqId}-${i}`,
+            time,
+            objectName: obj.name,
+            edgeId: edge.id,
+            sourceSystemId: edge.source,
+            targetSystemId: edge.target,
+            sourceLabel: getSystemLabel(edge.source) || edge.source,
+            targetLabel: getSystemLabel(edge.target) || edge.target,
+            frequencyLabel: freq.name,
+            atRisk: !!detail.atRisk,
+            impactedDowntimes,
+          });
+        });
+      });
+    });
+  });
+
+  return results.sort((a, b) => a.time.getTime() - b.time.getTime());
+}
 
 const STATUS_LABELS: Record<SystemStatus, string> = { planned: 'Planned', active: 'Active', deprecated: 'Deprecated', retired: 'Retired' };
 const STATUS_BADGE_STYLES: Record<string, string> = {
@@ -224,6 +332,20 @@ const CLASSIFICATION_BADGE_STYLES: Record<string, string> = {
   confidential: 'bg-[var(--warning-container)] text-[var(--on-warning-container)]',
   restricted: 'bg-[var(--danger-container)] text-[var(--on-danger-container)]',
 };
+
+// The mechanics of how a single data object moves over a connection - kept per (edge, object)
+// rather than per edge, because a connection carrying several objects can integrate each one
+// differently. The pattern is further split per leg: the same object's flow can, for instance,
+// be read from its source system over REST but delivered into its target system via SOAP.
+const INTEGRATION_PATTERN_OPTIONS: [string, string][] = [
+  ['rest-api', 'REST API'],
+  ['soap-api', 'SOAP API'],
+  ['message-queue', 'Message Queue / Kafka'],
+  ['file-transfer', 'File Transfer (SFTP/etc.)'],
+  ['database', 'Direct Database'],
+  ['manual', 'Manual'],
+  ['other', 'Other'],
+];
 
 
 // A small anchored popover - used to tuck one-off creation forms (Add System, Add Object) behind
@@ -386,41 +508,72 @@ function SystemDetailsPanel({
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No objects associated.</p>
         ) : (
           <div className="flex flex-col gap-1 max-h-[30vh] overflow-y-auto pr-1">
-            {objectsInSystem.map(obj => {
-              const alias = obj.aliases?.[systemId] || '';
-              return (
-                <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
-                  <div className="flex items-center justify-between">
-                    <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
-                    {obj.masterSystemId === systemId && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
-                    )}
+            {(() => {
+              const renderObjectRow = (obj: DataObject) => {
+                const alias = obj.aliases?.[systemId] || '';
+                return (
+                  <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
+                    <div className="flex items-center justify-between">
+                      <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
+                      {obj.masterSystemId === systemId && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
+                      )}
+                    </div>
+                    <div className="flex items-center justify-between gap-2 mt-1">
+                      <input
+                        type="text"
+                        className={`${inputClass} px-1.5 py-0.5 text-xs`}
+                        placeholder="Alias in this system..."
+                        value={alias}
+                        disabled={readOnly}
+                        onChange={(e) => setSystemAlias(obj.id, systemId, e.target.value)}
+                      />
+                      {!readOnly && (
+                        <button
+                          className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                          style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteObject(obj.id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex items-center justify-between gap-2 mt-1">
-                    <input
-                      type="text"
-                      className={`${inputClass} px-1.5 py-0.5 text-xs`}
-                      placeholder="Alias in this system..."
-                      value={alias}
-                      disabled={readOnly}
-                      onChange={(e) => setSystemAlias(obj.id, systemId, e.target.value)}
-                    />
-                    {!readOnly && (
-                      <button
-                        className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
-                        style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteObject(obj.id);
-                        }}
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+                );
+              };
+
+              const rendered = new Set<string>();
+              const items: React.ReactElement[] = [];
+              for (const obj of objectsInSystem) {
+                if (rendered.has(obj.id)) continue;
+                const alias = obj.aliases?.[systemId]?.trim();
+                const groupMembers = alias
+                  ? objectsInSystem.filter(o => (o.aliases?.[systemId]?.trim()) === alias)
+                  : [obj];
+                groupMembers.forEach(o => rendered.add(o.id));
+
+                if (groupMembers.length > 1) {
+                  items.push(
+                    <div key={`group-${alias}`} className="rounded-[var(--radius-input)] border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                      <div className="flex items-center gap-1.5 px-2 py-1" style={{ background: 'var(--bg-surface-alt)' }}>
+                        <span className="text-[10px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>Record type</span>
+                        <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{alias}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold ml-auto" style={{ background: 'var(--bg-surface)', color: 'var(--text-muted)' }}>{groupMembers.length}</span>
+                      </div>
+                      <div className="flex flex-col gap-1 p-1">
+                        {groupMembers.map(o => renderObjectRow(o))}
+                      </div>
+                    </div>
+                  );
+                } else {
+                  items.push(renderObjectRow(obj));
+                }
+              }
+              return items;
+            })()}
           </div>
         )}
       </div>
@@ -540,10 +693,314 @@ function ObjectDetailsPanel({
   );
 }
 
+// One admin-maintainable {id, name} list (Integration Types or Integration Software), rendered
+// as a card with inline rename/delete per row and an add-new row at the bottom. Used twice from
+// ReferenceListsPanel - one instance per list - since both lists share the exact same shape.
+function ReferenceListCard({
+  title, blurb, items, list, onAdd, onRename, onDelete, canWrite,
+}: {
+  title: string;
+  blurb: string;
+  items: ReferenceListItem[];
+  list: ReferenceListId;
+  onAdd: (list: ReferenceListId, name: string) => void;
+  onRename: (list: ReferenceListId, id: string, name: string) => void;
+  onDelete: (list: ReferenceListId, id: string) => void;
+  canWrite: boolean;
+}) {
+  const [newName, setNewName] = useState('');
+
+  const submitAdd = () => {
+    if (!newName.trim()) return;
+    onAdd(list, newName);
+    setNewName('');
+  };
+
+  return (
+    <div className={`${cardClass} p-4 flex-1 min-w-[260px]`}>
+      <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{title}</h3>
+      <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>{blurb}</p>
+
+      <div className="flex flex-col gap-1.5">
+        {items.map(item => (
+          <div key={item.id} className={`${listItemCardClass} flex items-center gap-2 px-2 py-1`}>
+            <input
+              type="text"
+              className={`${inputClass} px-1.5 py-1 text-sm`}
+              value={item.name}
+              disabled={!canWrite}
+              onChange={(e) => onRename(list, item.id, e.target.value)}
+            />
+            {canWrite && (
+              <button
+                className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+                onClick={() => onDelete(list, item.id)}
+              >
+                Delete
+              </button>
+            )}
+          </div>
+        ))}
+        {items.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No entries yet.</p>}
+      </div>
+
+      {canWrite && (
+        <div className="flex items-center gap-2 mt-3 pt-3 border-t" style={{ borderColor: 'var(--border-subtle)' }}>
+          <input
+            type="text"
+            className={`${inputClass} text-sm`}
+            placeholder="Add new..."
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitAdd(); }}
+          />
+          <button className={buttonSecondaryClass} onClick={submitAdd}>
+            <Plus size={14} />Add
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One row of the Integration Frequencies list - a name plus a structured schedule editor (none /
+// cron / every-N-minutes / daily / weekly) so the Schedule page can compute real run times from
+// it, not just display the name as a label.
+function FrequencyRow({
+  item, onRename, onDelete, onUpdateSchedule, canWrite,
+}: {
+  item: ReferenceListItem;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string) => void;
+  onUpdateSchedule: (id: string, schedule: ScheduleDef) => void;
+  canWrite: boolean;
+}) {
+  const schedule: ScheduleDef = item.schedule || { kind: 'none' };
+  const dayToggleClass = "w-6 h-6 text-[10px] font-bold rounded-full border transition-colors";
+
+  return (
+    <div className={`${listItemCardClass} flex flex-col gap-1.5 px-2 py-1.5`}>
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          className={`${inputClass} px-1.5 py-1 text-sm`}
+          value={item.name}
+          disabled={!canWrite}
+          onChange={(e) => onRename(item.id, e.target.value)}
+        />
+        {canWrite && (
+          <button
+            className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+            style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+            onClick={() => onDelete(item.id)}
+          >
+            Delete
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <select
+          className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
+          value={schedule.kind}
+          disabled={!canWrite}
+          onChange={(e) => {
+            const kind = e.target.value as ScheduleDef['kind'];
+            const next: ScheduleDef =
+              kind === 'cron' ? { kind: 'cron', expression: '0 * * * *' } :
+              kind === 'interval' ? { kind: 'interval', everyMinutes: 60 } :
+              kind === 'daily' ? { kind: 'daily', time: '02:00' } :
+              kind === 'weekly' ? { kind: 'weekly', time: '02:00', daysOfWeek: [0] } :
+              { kind: 'none' };
+            onUpdateSchedule(item.id, next);
+          }}
+        >
+          <option value="none">No schedule (label only)</option>
+          <option value="cron">Cron expression</option>
+          <option value="interval">Every N minutes</option>
+          <option value="daily">Daily at time</option>
+          <option value="weekly">Weekly at time</option>
+        </select>
+
+        {schedule.kind === 'cron' && (
+          <input
+            type="text"
+            className={`${inputClass} px-1.5 py-1 text-xs w-32`}
+            placeholder="0 * * * *"
+            value={schedule.expression}
+            disabled={!canWrite}
+            onChange={(e) => onUpdateSchedule(item.id, { kind: 'cron', expression: e.target.value })}
+          />
+        )}
+
+        {schedule.kind === 'interval' && (
+          <div className="flex items-center gap-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
+            <span>Every</span>
+            <input
+              type="number"
+              min={1}
+              className={`${inputClass} px-1.5 py-1 text-xs w-16`}
+              value={schedule.everyMinutes}
+              disabled={!canWrite}
+              onChange={(e) => onUpdateSchedule(item.id, { kind: 'interval', everyMinutes: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+            />
+            <span>min</span>
+          </div>
+        )}
+
+        {schedule.kind === 'daily' && (
+          <input
+            type="time"
+            className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
+            value={schedule.time}
+            disabled={!canWrite}
+            onChange={(e) => onUpdateSchedule(item.id, { kind: 'daily', time: e.target.value })}
+          />
+        )}
+
+        {schedule.kind === 'weekly' && (
+          <>
+            <input
+              type="time"
+              className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
+              value={schedule.time}
+              disabled={!canWrite}
+              onChange={(e) => onUpdateSchedule(item.id, { kind: 'weekly', time: e.target.value, daysOfWeek: schedule.daysOfWeek })}
+            />
+            <div className="flex gap-0.5">
+              {DAY_NAMES.map((d, i) => {
+                const active = schedule.daysOfWeek.includes(i);
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    disabled={!canWrite}
+                    className={dayToggleClass}
+                    style={active
+                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
+                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
+                    title={d}
+                    onClick={() => {
+                      const days = active ? schedule.daysOfWeek.filter(x => x !== i) : [...schedule.daysOfWeek, i];
+                      onUpdateSchedule(item.id, { kind: 'weekly', time: schedule.time, daysOfWeek: days });
+                    }}
+                  >
+                    {d[0]}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+      <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{describeSchedule(schedule)}</span>
+    </div>
+  );
+}
+
+function FrequencyListCard({
+  items, onAdd, onRename, onDelete, onUpdateSchedule, canWrite,
+}: {
+  items: ReferenceListItem[];
+  onAdd: (name: string) => void;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string) => void;
+  onUpdateSchedule: (id: string, schedule: ScheduleDef) => void;
+  canWrite: boolean;
+}) {
+  const [newName, setNewName] = useState('');
+
+  const submitAdd = () => {
+    if (!newName.trim()) return;
+    onAdd(newName);
+    setNewName('');
+  };
+
+  return (
+    <div className={`${cardClass} p-4 flex-1 min-w-[340px]`}>
+      <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>Integration Frequencies</h3>
+      <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+        How often it runs - a named cadence, a specific cron expression, or a tool's own schedule (a Boomi process, a MuleSoft trigger). An object's flow can have more than one, and the schedule drives the Schedule page.
+      </p>
+
+      <div className="flex flex-col gap-1.5">
+        {items.map(item => (
+          <FrequencyRow key={item.id} item={item} onRename={onRename} onDelete={onDelete} onUpdateSchedule={onUpdateSchedule} canWrite={canWrite} />
+        ))}
+        {items.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No entries yet.</p>}
+      </div>
+
+      {canWrite && (
+        <div className="flex items-center gap-2 mt-3 pt-3 border-t" style={{ borderColor: 'var(--border-subtle)' }}>
+          <input
+            type="text"
+            className={`${inputClass} text-sm`}
+            placeholder="Add new..."
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitAdd(); }}
+          />
+          <button className={buttonSecondaryClass} onClick={submitAdd}>
+            <Plus size={14} />Add
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReferenceListsPanel({
+  integrationTypes, integrationSoftwareList, integrationFrequencies, onAdd, onRename, onDelete, onUpdateFrequencySchedule, canWrite,
+}: {
+  integrationTypes: ReferenceListItem[];
+  integrationSoftwareList: ReferenceListItem[];
+  integrationFrequencies: ReferenceListItem[];
+  onAdd: (list: ReferenceListId, name: string) => void;
+  onRename: (list: ReferenceListId, id: string, name: string) => void;
+  onDelete: (list: ReferenceListId, id: string) => void;
+  onUpdateFrequencySchedule: (id: string, schedule: ScheduleDef) => void;
+  canWrite: boolean;
+}) {
+  return (
+    <div className="flex gap-4 flex-wrap items-start">
+      <ReferenceListCard
+        title="Integration Types"
+        blurb="How the integration happens - manual, API, file-based, etc. Assignable per connection."
+        items={integrationTypes}
+        list="integration-types"
+        onAdd={onAdd}
+        onRename={onRename}
+        onDelete={onDelete}
+        canWrite={canWrite}
+      />
+      <ReferenceListCard
+        title="Integration Software"
+        blurb="What carries the integration - middleware, direct P2P, or a named product. Assignable per connection."
+        items={integrationSoftwareList}
+        list="integration-software"
+        onAdd={onAdd}
+        onRename={onRename}
+        onDelete={onDelete}
+        canWrite={canWrite}
+      />
+      <FrequencyListCard
+        items={integrationFrequencies}
+        onAdd={(name) => onAdd('integration-frequencies', name)}
+        onRename={(id, name) => onRename('integration-frequencies', id, name)}
+        onDelete={(id) => onDelete('integration-frequencies', id)}
+        onUpdateSchedule={onUpdateFrequencySchedule}
+        canWrite={canWrite}
+      />
+    </div>
+  );
+}
+
 function InventoryView({
   onSelectSystem, onViewObject, dataObjects, getSystemLabel, nodes, edges,
   renameSystem, updateSystemField, setSystemAlias, deleteObject, deleteSystem,
   renameObjectGlobal, updateObjectField, canWrite,
+  integrationTypes, integrationSoftwareList, integrationFrequencies, onAddReferenceItem, onRenameReferenceItem, onDeleteReferenceItem, onUpdateFrequencySchedule,
 }: {
   onSelectSystem: (id: string) => void;
   onViewObject: (id: string) => void;
@@ -559,8 +1016,15 @@ function InventoryView({
   renameObjectGlobal: (objId: string, newName: string) => void;
   updateObjectField: <K extends keyof DataObject>(objId: string, field: K, value: DataObject[K], debounceKey?: string) => void;
   canWrite: boolean;
+  integrationTypes: ReferenceListItem[];
+  integrationSoftwareList: ReferenceListItem[];
+  integrationFrequencies: ReferenceListItem[];
+  onAddReferenceItem: (list: ReferenceListId, name: string) => void;
+  onRenameReferenceItem: (list: ReferenceListId, id: string, name: string) => void;
+  onDeleteReferenceItem: (list: ReferenceListId, id: string) => void;
+  onUpdateFrequencySchedule: (id: string, schedule: ScheduleDef) => void;
 }) {
-  const [subView, setSubView] = useState<'systems' | 'objects'>('systems');
+  const [subView, setSubView] = useState<'systems' | 'objects' | 'lists'>('systems');
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [total, setTotal] = useState(0);
   const [search, setSearch] = useState('');
@@ -635,7 +1099,7 @@ function InventoryView({
         <div className="max-w-6xl mx-auto">
           <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
             <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>
-              {subView === 'systems' ? 'System Inventory' : 'Data Object Inventory'}
+              {subView === 'systems' ? 'System Inventory' : subView === 'objects' ? 'Data Object Inventory' : 'Integration Reference Lists'}
             </h2>
             <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
               <button
@@ -652,10 +1116,28 @@ function InventoryView({
               >
                 Data Objects
               </button>
+              <button
+                className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+                style={subView === 'lists' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+                onClick={() => setSubView('lists')}
+              >
+                Integration Lists
+              </button>
             </div>
           </div>
 
-          {subView === 'objects' ? (
+          {subView === 'lists' ? (
+            <ReferenceListsPanel
+              integrationTypes={integrationTypes}
+              integrationSoftwareList={integrationSoftwareList}
+              integrationFrequencies={integrationFrequencies}
+              onAdd={onAddReferenceItem}
+              onRename={onRenameReferenceItem}
+              onDelete={onDeleteReferenceItem}
+              onUpdateFrequencySchedule={onUpdateFrequencySchedule}
+              canWrite={canWrite}
+            />
+          ) : subView === 'objects' ? (
             <>
               <div className="relative mb-4">
                 <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
@@ -858,6 +1340,253 @@ function InventoryView({
   );
 }
 
+// A run's most severe flag decides its color everywhere it appears - impacted-by-downtime beats
+// at-risk (an at-risk flow with no active downtime is a latent concern; one that's actually
+// colliding with a downtime is the thing to act on right now).
+const runSeverityStyle = (run: ScheduledRun): { background: string; color: string } =>
+  run.impactedDowntimes.length > 0
+    ? { background: 'var(--danger-container)', color: 'var(--on-danger-container)' }
+    : run.atRisk
+      ? { background: 'var(--warning-container)', color: 'var(--on-warning-container)' }
+      : { background: 'var(--bg-surface-alt)', color: 'var(--text-secondary)' };
+
+function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
+  const visible = runs.slice(0, 200);
+  return (
+    <div className={`${cardClass} overflow-x-auto`}>
+      <table className="w-full text-sm">
+        <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
+          <tr>
+            <th className="px-4 py-2.5">When</th>
+            <th className="px-4 py-2.5">Object</th>
+            <th className="px-4 py-2.5">Flow</th>
+            <th className="px-4 py-2.5">Frequency</th>
+            <th className="px-4 py-2.5">Flags</th>
+          </tr>
+        </thead>
+        <tbody>
+          {visible.map(run => {
+            const severity = runSeverityStyle(run);
+            return (
+              <tr
+                key={run.key}
+                className="border-t"
+                style={{ borderColor: 'var(--border-subtle)', background: run.impactedDowntimes.length > 0 ? severity.background : undefined }}
+              >
+                <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>{run.time.toLocaleString()}</td>
+                <td className="px-4 py-2 font-semibold" style={{ color: 'var(--text-primary)' }}>{run.objectName}</td>
+                <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{run.sourceLabel} → {run.targetLabel}</td>
+                <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{run.frequencyLabel}</td>
+                <td className="px-4 py-2">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {run.atRisk && (
+                      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'var(--warning-container)', color: 'var(--on-warning-container)' }}>
+                        <AlertTriangle size={10} />At risk
+                      </span>
+                    )}
+                    {run.impactedDowntimes.map(dt => (
+                      <span key={dt.id} className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}>
+                        <AlertTriangle size={10} />Impacted{dt.reason ? `: ${dt.reason}` : ''}
+                      </span>
+                    ))}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+          {visible.length === 0 && (
+            <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>
+              No scheduled runs in the next {SCHEDULE_WINDOW_DAYS} days. Assign a frequency with a schedule to a connection&apos;s object to see it here.
+            </td></tr>
+          )}
+        </tbody>
+      </table>
+      {runs.length > visible.length && (
+        <div className="px-4 py-2 text-xs" style={{ color: 'var(--text-muted)' }}>Showing the first {visible.length} of {runs.length} runs in the next {SCHEDULE_WINDOW_DAYS} days.</div>
+      )}
+    </div>
+  );
+}
+
+function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
+  const days = useMemo(() => {
+    const result: { date: Date; key: string }[] = [];
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(start);
+      d.setDate(d.getDate() + i);
+      result.push({ date: d, key: d.toISOString().slice(0, 10) });
+    }
+    return result;
+  }, []);
+
+  const runsByDay = useMemo(() => {
+    const map: Record<string, ScheduledRun[]> = {};
+    runs.forEach(run => {
+      const key = run.time.toISOString().slice(0, 10);
+      (map[key] ||= []).push(run);
+    });
+    return map;
+  }, [runs]);
+
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+      {days.map(({ date, key }) => {
+        const dayRuns = runsByDay[key] || [];
+        const hasImpact = dayRuns.some(r => r.impactedDowntimes.length > 0);
+        return (
+          <div
+            key={key}
+            className={`${cardClass} p-2 flex flex-col gap-1 min-h-[130px]`}
+            style={hasImpact ? { borderColor: 'var(--danger)', borderWidth: 2 } : undefined}
+          >
+            <div className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>
+              {date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}
+            </div>
+            <div className="flex flex-col gap-1 overflow-y-auto max-h-40">
+              {dayRuns.slice(0, 8).map(run => (
+                <div
+                  key={run.key}
+                  className="text-[10px] px-1.5 py-1 rounded-[var(--radius-input)] truncate"
+                  style={runSeverityStyle(run)}
+                  title={`${run.objectName}: ${run.sourceLabel} → ${run.targetLabel} (${run.frequencyLabel})`}
+                >
+                  {run.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} {run.objectName}
+                </div>
+              ))}
+              {dayRuns.length > 8 && (
+                <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>+{dayRuns.length - 8} more</span>
+              )}
+              {dayRuns.length === 0 && <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>—</span>}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ScheduleView({
+  nodes, edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes,
+  getSystemLabel, canWrite, onAddDowntime, onDeleteDowntime,
+}: {
+  nodes: SystemNode[];
+  edges: IntegrationEdge[];
+  dataObjects: DataObject[];
+  edgeObjectDetails: Record<string, EdgeObjectDetail>;
+  integrationFrequencies: ReferenceListItem[];
+  systemDowntimes: SystemDowntime[];
+  getSystemLabel: (id: string | null | undefined) => string | undefined;
+  canWrite: boolean;
+  onAddDowntime: (systemId: string, startsAt: string, endsAt: string, reason: string) => void;
+  onDeleteDowntime: (id: string) => void;
+}) {
+  const [subView, setSubView] = useState<'runs' | 'calendar'>('runs');
+  const [dtSystemId, setDtSystemId] = useState('');
+  const [dtStart, setDtStart] = useState('');
+  const [dtEnd, setDtEnd] = useState('');
+  const [dtReason, setDtReason] = useState('');
+
+  const runs = useMemo(
+    () => computeScheduledRuns(edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes, getSystemLabel),
+    [edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes, getSystemLabel]
+  );
+
+  const systemOptions = nodes.filter(isEaSystemNode);
+
+  const submitDowntime = () => {
+    if (!dtSystemId || !dtStart || !dtEnd) return;
+    onAddDowntime(dtSystemId, new Date(dtStart).toISOString(), new Date(dtEnd).toISOString(), dtReason);
+    setDtStart('');
+    setDtEnd('');
+    setDtReason('');
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
+      <div className="max-w-6xl mx-auto flex flex-col gap-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>Integration Schedule</h2>
+          <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
+            <button
+              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+              style={subView === 'runs' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => setSubView('runs')}
+            >
+              Upcoming Runs
+            </button>
+            <button
+              className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
+              style={subView === 'calendar' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => setSubView('calendar')}
+            >
+              Calendar
+            </button>
+          </div>
+        </div>
+
+        <div className={`${cardClass} p-4`}>
+          <h3 className="font-bold text-sm mb-1" style={{ color: 'var(--text-primary)' }}>Planned Downtimes</h3>
+          <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>Mark a system unavailable for a window - runs below that fall inside it are flagged as impacted.</p>
+
+          <div className="flex flex-col gap-1.5 mb-3">
+            {systemDowntimes.map(dt => (
+              <div key={dt.id} className={`${listItemCardClass} flex items-center justify-between gap-2 px-2 py-1.5 text-sm`}>
+                <div className="flex flex-col min-w-0">
+                  <span className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>{getSystemLabel(dt.systemId) || dt.systemId}</span>
+                  <span className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
+                    {new Date(dt.startsAt).toLocaleString()} — {new Date(dt.endsAt).toLocaleString()}{dt.reason ? ` · ${dt.reason}` : ''}
+                  </span>
+                </div>
+                {canWrite && (
+                  <button
+                    className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                    style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+                    onClick={() => onDeleteDowntime(dt.id)}
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+            ))}
+            {systemDowntimes.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No planned downtimes.</p>}
+          </div>
+
+          {canWrite && (
+            <div className="flex flex-wrap items-end gap-2">
+              <div>
+                <label className={labelClass}>System</label>
+                <select className={`${inputClass} w-40`} value={dtSystemId} onChange={(e) => setDtSystemId(e.target.value)}>
+                  <option value="">Select...</option>
+                  {systemOptions.map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelClass}>Starts</label>
+                <input type="datetime-local" className={`${inputClass} w-auto`} value={dtStart} onChange={(e) => setDtStart(e.target.value)} />
+              </div>
+              <div>
+                <label className={labelClass}>Ends</label>
+                <input type="datetime-local" className={`${inputClass} w-auto`} value={dtEnd} onChange={(e) => setDtEnd(e.target.value)} />
+              </div>
+              <div className="flex-1 min-w-[140px]">
+                <label className={labelClass}>Reason</label>
+                <input type="text" className={inputClass} placeholder="e.g. Planned maintenance" value={dtReason} onChange={(e) => setDtReason(e.target.value)} />
+              </div>
+              <button className={buttonSecondaryClass} onClick={submitDowntime}>
+                <Plus size={14} />Add Downtime
+              </button>
+            </div>
+          )}
+        </div>
+
+        {subView === 'runs' ? <UpcomingRunsList runs={runs} /> : <ScheduleCalendar runs={runs} />}
+      </div>
+    </div>
+  );
+}
+
 function AppContent() {
   const { tokens } = useTheme();
   const { user, logout } = useAuth();
@@ -865,7 +1594,12 @@ function AppContent() {
   const [nodes, setNodes] = useNodesState<SystemNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<IntegrationEdge>([]);
   const [dataObjects, setDataObjects] = useState<DataObject[]>([]);
-  const [view, setView] = useState<'canvas' | 'inventory' | 'settings'>('canvas');
+  const [integrationTypes, setIntegrationTypes] = useState<ReferenceListItem[]>([]);
+  const [integrationSoftwareList, setIntegrationSoftwareList] = useState<ReferenceListItem[]>([]);
+  const [integrationFrequencies, setIntegrationFrequencies] = useState<ReferenceListItem[]>([]);
+  const [edgeObjectDetails, setEdgeObjectDetails] = useState<Record<string, EdgeObjectDetail>>({});
+  const [systemDowntimes, setSystemDowntimes] = useState<SystemDowntime[]>([]);
+  const [view, setView] = useState<'canvas' | 'inventory' | 'schedule' | 'settings'>('canvas');
 
   const [newSystemName, setNewSystemName] = useState('');
   const [newObjectName, setNewObjectName] = useState('');
@@ -911,11 +1645,35 @@ function AppContent() {
             data: {
               dataObjectIds: e.data_object_ids,
               description: e.description || '',
-              integrationPattern: e.integration_pattern || '',
-              frequency: e.frequency || '',
             },
             markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
             style: { stroke: tokens.edgeColor, strokeWidth: 2 },
+          })));
+        }
+        if (data.integrationTypes) setIntegrationTypes(data.integrationTypes);
+        if (data.integrationSoftware) setIntegrationSoftwareList(data.integrationSoftware);
+        if (data.integrationFrequencies) setIntegrationFrequencies(data.integrationFrequencies);
+        if (data.edgeObjectDetails) {
+          const map: Record<string, EdgeObjectDetail> = {};
+          data.edgeObjectDetails.forEach((d: RawEdgeObjectDetailRow) => {
+            map[edgeObjectDetailKey(d.edge_id, d.data_object_id)] = {
+              sourcePattern: d.source_pattern || '',
+              targetPattern: d.target_pattern || '',
+              frequencyIds: d.frequency_ids || [],
+              integrationTypeIds: d.integration_type_ids || [],
+              integrationSoftwareIds: d.integration_software_ids || [],
+              atRisk: d.at_risk || false,
+            };
+          });
+          setEdgeObjectDetails(map);
+        }
+        if (data.systemDowntimes) {
+          setSystemDowntimes(data.systemDowntimes.map((d: RawSystemDowntimeRow) => ({
+            id: d.id,
+            systemId: d.system_id,
+            startsAt: d.starts_at,
+            endsAt: d.ends_at,
+            reason: d.reason || '',
           })));
         }
       })
@@ -974,11 +1732,47 @@ function AppContent() {
     }, delay);
   }, []);
 
-  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  // Which connection is open in the sidebar, identified by the two real systems it runs between
+  // rather than by one visual edge id - a system pair can be backed by several raw edge rows
+  // (each carrying its own subset of objects) that the canvas renders as a single consolidated
+  // line, and a focused system's junction view renders a spoke per remote using a synthetic
+  // junction-node id on one end. Keying selection by the resolved real system pair (see
+  // resolveEdgePair) lets both of those visual forms open the same, complete connection panel.
+  const [selectedEdgePair, setSelectedEdgePair] = useState<[string, string] | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedObjectIdSidebar, setSelectedObjectIdSidebar] = useState<string | null>(null);
   const [pendingEdge, setPendingEdge] = useState<Connection | null>(null);
   const [pendingEdgeObject, setPendingEdgeObject] = useState<string>('');
+
+  // A junction node's id (see JunctionNode/'junc-' ids below) isn't a real system - it's a visual
+  // hub standing in for whichever system is currently focused (selectedNodeId). Substituting it
+  // back lets a click on any rendered edge - plain, consolidated, or a junction spoke - resolve to
+  // the two genuine systems it connects. The junction's own aggregate "main" edge (hub <-> focused
+  // system) resolves to the focused system on both ends and is rejected as ambiguous.
+  const resolveEdgePair = useCallback((edge: { source: string; target: string }): [string, string] | null => {
+    const resolveEnd = (id: string) => id.startsWith('junc-') ? selectedNodeId : id;
+    const a = resolveEnd(edge.source);
+    const b = resolveEnd(edge.target);
+    if (!a || !b || a === b) return null;
+    return [a, b].sort() as [string, string];
+  }, [selectedNodeId]);
+
+  const selectedEdgeGroup = useMemo(() => {
+    if (!selectedEdgePair) return [];
+    const [a, b] = selectedEdgePair;
+    return edges.filter(e => (e.source === a && e.target === b) || (e.source === b && e.target === a));
+  }, [edges, selectedEdgePair]);
+
+  // Which raw edge currently carries a given object, among all the raw edges backing the selected
+  // system pair - needed because per-object detail (pattern/frequency/type/software) is stored
+  // against a specific edge id, not the pair as a whole.
+  const objectEdgeMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    selectedEdgeGroup.forEach(e => {
+      e.data?.dataObjectIds?.forEach(id => { if (!(id in map)) map[id] = e.id; });
+    });
+    return map;
+  }, [selectedEdgeGroup]);
 
   const [filterSystemId, setFilterSystemId] = useState<string>('');
   const [filterObjectId, setFilterObjectId] = useState<string>('');
@@ -1132,7 +1926,7 @@ function AppContent() {
       sourceHandle: finalSourceHandle,
       targetHandle: finalTargetHandle,
       id: `edge-${Date.now()}`,
-      data: { dataObjectIds: objectId ? [objectId] : [], description: '', integrationPattern: '', frequency: '' },
+      data: { dataObjectIds: objectId ? [objectId] : [], description: '' },
       markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
       style: { stroke: tokens.edgeColor, strokeWidth: 2 },
     };
@@ -1146,7 +1940,7 @@ function AppContent() {
     setPendingEdgeObject('');
 
     // Optionally open the right sidebar for this edge
-    setSelectedEdgeId(newEdge.id);
+    setSelectedEdgePair([newEdge.source, newEdge.target].sort() as [string, string]);
     setSelectedNodeId(null);
   }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, apiPost, tokens.edgeColor]);
 
@@ -1155,24 +1949,68 @@ function AppContent() {
       eds.map((e) => {
         if (e.id === edgeId) {
           const currentIds = e.data?.dataObjectIds || [];
-          const newIds = currentIds.includes(objectId)
+          const isRemoving = currentIds.includes(objectId);
+          const newIds = isRemoving
             ? currentIds.filter((id) => id !== objectId)
             : [...currentIds, objectId];
           apiPatch(`/edges/${edgeId}`, { dataObjectIds: newIds });
+          if (isRemoving) {
+            // The object's per-flow details (pattern/frequency/type/software) belong to this
+            // specific (edge, object) pairing, so they're meaningless once the object is no
+            // longer carried by this edge - drop them rather than leave them stranded.
+            apiDelete(`/edges/${edgeId}/objects/${objectId}`);
+            setEdgeObjectDetails(prev => {
+              const key = edgeObjectDetailKey(edgeId, objectId);
+              if (!(key in prev)) return prev;
+              const next = { ...prev };
+              delete next[key];
+              return next;
+            });
+          }
           return { ...e, data: { ...e.data, dataObjectIds: newIds } };
         }
         return e;
       })
     );
-  }, [setEdges, apiPatch]);
+  }, [setEdges, apiPatch, apiDelete]);
+
+  const getEdgeObjectDetail = useCallback((edgeId: string, objectId: string): EdgeObjectDetail => {
+    return edgeObjectDetails[edgeObjectDetailKey(edgeId, objectId)] || {};
+  }, [edgeObjectDetails]);
+
+  const updateEdgeObjectDetail = useCallback(<K extends keyof EdgeObjectDetail>(
+    edgeId: string, objectId: string, field: K, value: EdgeObjectDetail[K]
+  ) => {
+    const key = edgeObjectDetailKey(edgeId, objectId);
+    setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+    apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: value });
+  }, [apiPatch]);
+
+  // Same toggle shape as toggleObjectOnEdge, for the per-object multi-select fields (integration
+  // type(s), software, and frequency/schedule(s)).
+  const toggleEdgeObjectTag = useCallback((
+    edgeId: string,
+    objectId: string,
+    field: 'integrationTypeIds' | 'integrationSoftwareIds' | 'frequencyIds',
+    itemId: string
+  ) => {
+    const key = edgeObjectDetailKey(edgeId, objectId);
+    const currentIds = edgeObjectDetails[key]?.[field] || [];
+    const newIds = currentIds.includes(itemId)
+      ? currentIds.filter((id) => id !== itemId)
+      : [...currentIds, itemId];
+    setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], [field]: newIds } }));
+    apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: newIds });
+  }, [edgeObjectDetails, apiPatch]);
 
   const deleteSelectedEdge = useCallback(() => {
-    if (selectedEdgeId) {
-      apiDelete(`/edges/${selectedEdgeId}`);
-      setEdges((eds) => eds.filter(e => e.id !== selectedEdgeId));
-      setSelectedEdgeId(null);
+    if (selectedEdgeGroup.length > 0) {
+      const idsToRemove = new Set(selectedEdgeGroup.map(e => e.id));
+      idsToRemove.forEach(id => apiDelete(`/edges/${id}`));
+      setEdges((eds) => eds.filter(e => !idsToRemove.has(e.id)));
+      setSelectedEdgePair(null);
     }
-  }, [selectedEdgeId, setEdges, apiDelete]);
+  }, [selectedEdgeGroup, setEdges, apiDelete]);
 
   const deleteObject = useCallback((objId: string) => {
     const obj = dataObjects.find(o => o.id === objId);
@@ -1265,9 +2103,86 @@ function AppContent() {
     if (debounceKey) scheduleSave(debounceKey, doPatch); else doPatch();
   }, [setEdges, apiPatch, scheduleSave]);
 
+  // Shared CRUD for the two admin-maintainable reference lists (Integration Types, Integration
+  // Software) - both are simple {id, name} tables managed from the Inventory page.
+  const addReferenceListItem = useCallback((
+    path: ReferenceListId,
+    idPrefix: string,
+    setList: React.Dispatch<React.SetStateAction<ReferenceListItem[]>>,
+    name: string
+  ) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const id = `${idPrefix}-${Date.now()}`;
+    setList(items => [...items, { id, name: trimmed }].sort((a, b) => a.name.localeCompare(b.name)));
+    apiPost(`/${path}`, { id, name: trimmed });
+  }, [apiPost]);
+
+  const renameReferenceListItem = useCallback((
+    path: ReferenceListId,
+    setList: React.Dispatch<React.SetStateAction<ReferenceListItem[]>>,
+    id: string,
+    newName: string
+  ) => {
+    setList(items => items.map(item => item.id === id ? { ...item, name: newName } : item));
+    scheduleSave(`refitem-${id}`, () => apiPatch(`/${path}/${id}`, { name: newName }));
+  }, [apiPatch, scheduleSave]);
+
+  const deleteReferenceListItem = useCallback((
+    path: ReferenceListId,
+    setList: React.Dispatch<React.SetStateAction<ReferenceListItem[]>>,
+    id: string
+  ) => {
+    setList(items => items.filter(item => item.id !== id));
+    apiDelete(`/${path}/${id}`);
+  }, [apiDelete]);
+
+  // Only Integration Frequencies carry a schedule, so this doesn't need the generic multi-list
+  // plumbing above - it always targets integrationFrequencies directly.
+  const updateFrequencySchedule = useCallback((id: string, schedule: ScheduleDef) => {
+    setIntegrationFrequencies(items => items.map(item => item.id === id ? { ...item, schedule } : item));
+    apiPatch(`/integration-frequencies/${id}`, { schedule });
+  }, [apiPatch]);
+
+  const addDowntime = useCallback((systemId: string, startsAt: string, endsAt: string, reason: string) => {
+    if (!systemId || !startsAt || !endsAt) return;
+    const id = `downtime-${Date.now()}`;
+    const newDowntime: SystemDowntime = { id, systemId, startsAt, endsAt, reason };
+    setSystemDowntimes(prev => [...prev, newDowntime].sort((a, b) => a.startsAt.localeCompare(b.startsAt)));
+    apiPost('/system-downtimes', { id, systemId, startsAt, endsAt, reason });
+  }, [apiPost]);
+
+  const deleteDowntime = useCallback((id: string) => {
+    setSystemDowntimes(prev => prev.filter(d => d.id !== id));
+    apiDelete(`/system-downtimes/${id}`);
+  }, [apiDelete]);
+
+  // Thin adapters so InventoryView (which doesn't know about each list's individual setState
+  // function or id prefix) can address any of the three lists by name alone.
+  const referenceListSetters = useMemo((): Record<ReferenceListId, [React.Dispatch<React.SetStateAction<ReferenceListItem[]>>, string]> => ({
+    'integration-types': [setIntegrationTypes, 'itype'],
+    'integration-software': [setIntegrationSoftwareList, 'isw'],
+    'integration-frequencies': [setIntegrationFrequencies, 'ifreq'],
+  }), []);
+
+  const handleAddReferenceItem = useCallback((list: ReferenceListId, name: string) => {
+    const [setList, idPrefix] = referenceListSetters[list];
+    addReferenceListItem(list, idPrefix, setList, name);
+  }, [addReferenceListItem, referenceListSetters]);
+
+  const handleRenameReferenceItem = useCallback((list: ReferenceListId, id: string, name: string) => {
+    const [setList] = referenceListSetters[list];
+    renameReferenceListItem(list, setList, id, name);
+  }, [renameReferenceListItem, referenceListSetters]);
+
+  const handleDeleteReferenceItem = useCallback((list: ReferenceListId, id: string) => {
+    const [setList] = referenceListSetters[list];
+    deleteReferenceListItem(list, setList, id);
+  }, [deleteReferenceListItem, referenceListSetters]);
+
   const handleInventorySelect = useCallback((sysId: string) => {
     setSelectedNodeId(sysId);
-    setSelectedEdgeId(null);
+    setSelectedEdgePair(null);
     setSelectedObjectIdSidebar(null);
     setView('canvas');
   }, []);
@@ -1279,7 +2194,7 @@ function AppContent() {
     setFilterObjectId(objId);
     setFilterSystemId('');
     setSelectedNodeId(null);
-    setSelectedEdgeId(null);
+    setSelectedEdgePair(null);
     setSelectedObjectIdSidebar(null);
     setView('canvas');
   }, []);
@@ -1308,6 +2223,47 @@ function AppContent() {
 
     return multiple;
   }, [edges, dataObjects]);
+
+  // Objects that share the same alias within a given system represent the same record type there
+  // (e.g. Workday's "Employee Bank Details" and Coupa's "Supplier Bank Details" both landing as
+  // NetSuite's "Bank Details" record) even though each keeps its own independent master - this is
+  // a deliberate convergence, not the multi-master conflict tracked above. Maps `${objId}::${sysId}`
+  // to the shared alias so edges touching that system can be visually bundled under it.
+  const recordTypeGroupsByObject = useMemo(() => {
+    const bySysAlias = new Map<string, Map<string, Set<string>>>();
+    for (const obj of dataObjects) {
+      if (!obj.aliases) continue;
+      for (const [sysId, aliasRaw] of Object.entries(obj.aliases)) {
+        const alias = aliasRaw?.trim();
+        if (!alias) continue;
+        if (!bySysAlias.has(sysId)) bySysAlias.set(sysId, new Map());
+        const aliasMap = bySysAlias.get(sysId)!;
+        if (!aliasMap.has(alias)) aliasMap.set(alias, new Set());
+        aliasMap.get(alias)!.add(obj.id);
+      }
+    }
+
+    const result = new Map<string, string>();
+    bySysAlias.forEach((aliasMap, sysId) => {
+      aliasMap.forEach((objIds, alias) => {
+        if (objIds.size > 1) {
+          objIds.forEach(id => result.set(`${id}::${sysId}`, alias));
+        }
+      });
+    });
+    return result;
+  }, [dataObjects]);
+
+  const getRecordTypeGroup = useCallback((objIds: string[], sysIds: (string | undefined)[]) => {
+    for (const objId of objIds) {
+      for (const sysId of sysIds) {
+        if (!sysId) continue;
+        const alias = recordTypeGroupsByObject.get(`${objId}::${sysId}`);
+        if (alias) return alias;
+      }
+    }
+    return undefined;
+  }, [recordTypeGroupsByObject]);
 
   const getAlias = useCallback((objId: string, sysId: string) => {
     const obj = dataObjects.find(o => o.id === objId);
@@ -1504,7 +2460,9 @@ function AppContent() {
 
     pairwiseEdges.forEach((group, pairKey) => {
       const e = group[0];
+      const groupObjIds = group.flatMap(ge => ge.data?.dataObjectIds || []);
       const hasConflict = group.some(ge => ge.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
+      const recordType = !hasConflict ? getRecordTypeGroup(groupObjIds, [e.source, e.target]) : undefined;
       const color = hasConflict ? tokens.edgeConflictColor : tokens.edgeColor;
       const strokeWidth = hasConflict ? 3 : 2;
 
@@ -1520,11 +2478,12 @@ function AppContent() {
 
       if (group.length === 1) {
         const labels = e.data?.dataObjectIds?.map(id => getAlias(id, e.source)).join(', ') || '';
+        const displayLabel = recordType ? `${labels} → ${recordType}` : labels;
         finalEdges.push({
           ...e,
           sourceHandle: sHandle,
           targetHandle: tHandle,
-          label: labels,
+          label: displayLabel,
           type: 'smoothstep',
           style: { stroke: color, strokeWidth },
           labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
@@ -1545,7 +2504,8 @@ function AppContent() {
         });
 
         const labels = Array.from(allLabels).filter(Boolean);
-        const displayLabel = labels.length > 3 ? `${labels.length} flows` : labels.join(', ');
+        const joinedLabels = labels.length > 3 ? `${labels.length} flows` : labels.join(', ');
+        const displayLabel = recordType ? `${joinedLabels} → ${recordType}` : joinedLabels;
 
         const markerEnd = hasForward ? { type: MarkerType.ArrowClosed, color } : undefined;
         const markerStart = hasBackward ? { type: MarkerType.ArrowClosed, color, orient: 'auto-start-reverse' } : undefined;
@@ -1645,9 +2605,9 @@ function AppContent() {
     }) as SystemNode[];
 
     return { processedNodes: finalNodes, processedEdges: finalEdges as IntegrationEdge[] };
-  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getAlias, getClosestHandles, tokens]);
+  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getAlias, getRecordTypeGroup, getClosestHandles, tokens]);
 
-  const selectedEdge = edges.find(e => e.id === selectedEdgeId);
+  const primaryEdge = selectedEdgeGroup[0];
   const selectedSystemNode = nodes.find(n => n.id === selectedNodeId);
   const selectedSystemData = isEaSystemNode(selectedSystemNode) ? selectedSystemNode.data : undefined;
   const selectedObject = selectedObjectIdSidebar ? dataObjects.find(o => o.id === selectedObjectIdSidebar) : undefined;
@@ -1805,6 +2765,13 @@ function AppContent() {
           </button>
           <button
             className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+            style={view === 'schedule' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
+            onClick={() => setView('schedule')}
+          >
+            <Calendar size={14} />Schedule
+          </button>
+          <button
+            className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
             style={view === 'settings' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('settings')}
           >
@@ -1952,6 +2919,26 @@ function AppContent() {
           renameObjectGlobal={renameObjectGlobal}
           updateObjectField={updateObjectField}
           canWrite={canWrite}
+          integrationTypes={integrationTypes}
+          integrationSoftwareList={integrationSoftwareList}
+          integrationFrequencies={integrationFrequencies}
+          onAddReferenceItem={handleAddReferenceItem}
+          onRenameReferenceItem={handleRenameReferenceItem}
+          onDeleteReferenceItem={handleDeleteReferenceItem}
+          onUpdateFrequencySchedule={updateFrequencySchedule}
+        />
+      ) : view === 'schedule' ? (
+        <ScheduleView
+          nodes={nodes}
+          edges={edges}
+          dataObjects={dataObjects}
+          edgeObjectDetails={edgeObjectDetails}
+          integrationFrequencies={integrationFrequencies}
+          systemDowntimes={systemDowntimes}
+          getSystemLabel={getSystemLabel}
+          canWrite={canWrite}
+          onAddDowntime={addDowntime}
+          onDeleteDowntime={deleteDowntime}
         />
       ) : view === 'settings' ? (
         <SettingsView />
@@ -1967,18 +2954,20 @@ function AppContent() {
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
             onEdgeClick={(_, edge) => {
-              setSelectedEdgeId(edge.id);
+              const pair = resolveEdgePair(edge);
+              if (!pair) return; // a junction's aggregate hub edge fans into several remotes at once - nothing single to open
+              setSelectedEdgePair(pair);
               setSelectedNodeId(null);
               setSelectedObjectIdSidebar(null);
             }}
             onNodeClick={(_, node) => {
               if (node.type === 'junction') return;
               setSelectedNodeId(node.id);
-              setSelectedEdgeId(null);
+              setSelectedEdgePair(null);
               setSelectedObjectIdSidebar(null);
             }}
             onPaneClick={() => {
-              setSelectedEdgeId(null);
+              setSelectedEdgePair(null);
               setSelectedNodeId(null);
               setSelectedObjectIdSidebar(null);
             }}
@@ -1998,61 +2987,29 @@ function AppContent() {
           style={{ background: 'var(--bg-surface-alt)', borderColor: 'var(--border)' }}
         >
 
-          {selectedEdgeId && selectedEdge ? (
+          {selectedEdgePair && primaryEdge ? (
             <>
               <h2 className={panelHeadingClass}>Connection Data</h2>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className={labelClass}>Integration Pattern</label>
-                  <select
-                    className={inputClass}
-                    value={selectedEdge.data?.integrationPattern || ''}
-                    disabled={!canWrite}
-                    onChange={(e) => updateEdgeField(selectedEdge.id, 'integrationPattern', e.target.value)}
-                  >
-                    <option value="">Unspecified</option>
-                    <option value="rest-api">REST API</option>
-                    <option value="soap-api">SOAP API</option>
-                    <option value="message-queue">Message Queue / Kafka</option>
-                    <option value="file-transfer">File Transfer (SFTP/etc.)</option>
-                    <option value="database">Direct Database</option>
-                    <option value="manual">Manual</option>
-                    <option value="other">Other</option>
-                  </select>
-                </div>
-                <div>
-                  <label className={labelClass}>Frequency</label>
-                  <select
-                    className={inputClass}
-                    value={selectedEdge.data?.frequency || ''}
-                    disabled={!canWrite}
-                    onChange={(e) => updateEdgeField(selectedEdge.id, 'frequency', e.target.value)}
-                  >
-                    <option value="">Unspecified</option>
-                    <option value="real-time">Real-time</option>
-                    <option value="batch-hourly">Batch - Hourly</option>
-                    <option value="batch-daily">Batch - Daily</option>
-                    <option value="batch-weekly">Batch - Weekly</option>
-                    <option value="manual">Manual / Ad-hoc</option>
-                  </select>
-                </div>
-              </div>
+              {selectedEdgeGroup.length > 1 && (
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  This connection is backed by {selectedEdgeGroup.length} separate integration records; the description below is the first one's.
+                </p>
+              )}
 
               <div>
                 <label className={labelClass}>Description</label>
                 <textarea
                   className={inputClass}
                   rows={2}
-                  value={selectedEdge.data?.description || ''}
+                  value={primaryEdge.data?.description || ''}
                   disabled={!canWrite}
-                  onChange={(e) => updateEdgeField(selectedEdge.id, 'description', e.target.value, `edge-desc-${selectedEdge.id}`)}
+                  onChange={(e) => updateEdgeField(primaryEdge.id, 'description', e.target.value, `edge-desc-${primaryEdge.id}`)}
                   placeholder="What does this integration do?"
                 />
               </div>
 
               <div className="text-sm border-t pt-4" style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-subtle)' }}>
-                Select which objects are transferred in this integration.
+                Select which objects are transferred, and configure each one's own integration mechanics - the same connection can move different objects in different ways.
               </div>
 
               {dataObjects.length === 0 && <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Add data objects first.</p>}
@@ -2068,10 +3025,10 @@ function AppContent() {
                 />
               </div>
 
-              <div className="flex flex-col gap-2 max-h-[35vh] overflow-y-auto">
+              <div className="flex flex-col gap-2 max-h-[55vh] overflow-y-auto">
                 {dataObjects
                   .filter(obj => {
-                    const isActive = selectedEdge.data?.dataObjectIds?.includes(obj.id);
+                    const isActive = obj.id in objectEdgeMap;
                     if (isActive) return true; // Always show selected objects
                     if (!connectionObjectSearch) return true;
                     const search = connectionObjectSearch.toLowerCase();
@@ -2080,17 +3037,149 @@ function AppContent() {
                   })
                   .slice(0, 100) // Render limit for performance
                   .map((obj) => {
-                  const isActive = selectedEdge.data?.dataObjectIds?.includes(obj.id);
+                  const isActive = obj.id in objectEdgeMap;
+                  // The specific raw edge that carries this object (falling back to the group's
+                  // first edge for one not yet on any of them) - per-object detail and the
+                  // add/remove toggle both key off this, not the pair as a whole.
+                  const owningEdgeId = objectEdgeMap[obj.id] || primaryEdge.id;
+                  const owningEdge = selectedEdgeGroup.find(e => e.id === owningEdgeId) || primaryEdge;
+                  const detail = getEdgeObjectDetail(owningEdgeId, obj.id);
                   return (
-                    <label key={obj.id} className={`${listItemCardClass} flex items-center gap-2 cursor-pointer`} style={{ color: 'var(--text-primary)' }}>
-                      <input
-                        type="checkbox"
-                        checked={isActive || false}
-                        disabled={!canWrite}
-                        onChange={() => toggleObjectOnEdge(selectedEdge.id, obj.id)}
-                      />
-                      <span className="truncate" title={obj.name}>{obj.name}</span>
-                    </label>
+                    <div key={obj.id} className={`${listItemCardClass} flex flex-col gap-2 px-2 py-1.5`}>
+                      <label className="flex items-center gap-2 cursor-pointer" style={{ color: 'var(--text-primary)' }}>
+                        <input
+                          type="checkbox"
+                          checked={isActive || false}
+                          disabled={!canWrite}
+                          onChange={() => toggleObjectOnEdge(owningEdgeId, obj.id)}
+                        />
+                        <span className="truncate font-semibold text-sm" title={obj.name}>{obj.name}</span>
+                      </label>
+
+                      {isActive && (
+                        <div className="flex flex-col gap-2 pt-2 pl-1 border-t" style={{ borderColor: 'var(--border-subtle)' }}>
+                          <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold" style={{ color: detail.atRisk ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                            <input
+                              type="checkbox"
+                              checked={detail.atRisk || false}
+                              disabled={!canWrite}
+                              onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'atRisk', e.target.checked)}
+                            />
+                            <AlertTriangle size={13} />
+                            At risk if this connection/schedule is interrupted
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>
+                                Pattern at {getSystemLabel(owningEdge.source) || 'source'}
+                              </label>
+                              <select
+                                className={`${inputClass} px-1.5 py-1 text-xs`}
+                                value={detail.sourcePattern || ''}
+                                disabled={!canWrite}
+                                onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'sourcePattern', e.target.value)}
+                              >
+                                <option value="">Unspecified</option>
+                                {INTEGRATION_PATTERN_OPTIONS.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>
+                                Pattern at {getSystemLabel(owningEdge.target) || 'target'}
+                              </label>
+                              <select
+                                className={`${inputClass} px-1.5 py-1 text-xs`}
+                                value={detail.targetPattern || ''}
+                                disabled={!canWrite}
+                                onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'targetPattern', e.target.value)}
+                              >
+                                <option value="">Unspecified</option>
+                                {INTEGRATION_PATTERN_OPTIONS.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                              </select>
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Frequency</label>
+                            <div className="flex flex-wrap gap-1">
+                              {integrationFrequencies.map(item => {
+                                const active = detail.frequencyIds?.includes(item.id);
+                                return (
+                                  <button
+                                    key={item.id}
+                                    type="button"
+                                    disabled={!canWrite}
+                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
+                                    style={active
+                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
+                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
+                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'frequencyIds', item.id)}
+                                  >
+                                    {item.name}
+                                  </button>
+                                );
+                              })}
+                              {integrationFrequencies.length === 0 && (
+                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Integration Type</label>
+                            <div className="flex flex-wrap gap-1">
+                              {integrationTypes.map(item => {
+                                const active = detail.integrationTypeIds?.includes(item.id);
+                                return (
+                                  <button
+                                    key={item.id}
+                                    type="button"
+                                    disabled={!canWrite}
+                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
+                                    style={active
+                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
+                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
+                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'integrationTypeIds', item.id)}
+                                  >
+                                    {item.name}
+                                  </button>
+                                );
+                              })}
+                              {integrationTypes.length === 0 && (
+                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Integration Software</label>
+                            <div className="flex flex-wrap gap-1">
+                              {integrationSoftwareList.map(item => {
+                                const active = detail.integrationSoftwareIds?.includes(item.id);
+                                return (
+                                  <button
+                                    key={item.id}
+                                    type="button"
+                                    disabled={!canWrite}
+                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
+                                    style={active
+                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
+                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
+                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'integrationSoftwareIds', item.id)}
+                                  >
+                                    {item.name}
+                                  </button>
+                                );
+                              })}
+                              {integrationSoftwareList.length === 0 && (
+                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
               </div>
