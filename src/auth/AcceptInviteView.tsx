@@ -7,9 +7,11 @@ import { useAuth } from './useAuth';
 import { AuthShell, FullScreenLoader } from './AuthShell';
 import { ROLE_LABELS } from './roles';
 import type { Role } from './roles';
+import { useI18n } from '../i18n/useI18n';
 
 export function AcceptInviteView({ token, onDone }: { token: string; onDone: () => void }) {
   const { setUser } = useAuth();
+  const { t } = useI18n();
   const [status, setStatus] = useState<'checking' | 'valid' | 'invalid'>('checking');
   const [inviteError, setInviteError] = useState('');
   const [email, setEmail] = useState('');
@@ -72,11 +74,11 @@ export function AcceptInviteView({ token, onDone }: { token: string; onDone: () 
     <AuthShell title="Join EA Designer" subtitle={`You've been invited as ${ROLE_LABELS[role]} - ${email}`}>
       <form className="flex flex-col gap-3" onSubmit={handleSubmit}>
         <div>
-          <label className={labelClass}>Name</label>
+          <label className={labelClass}>{t('common.name')}</label>
           <input autoFocus className={inputClass} value={name} onChange={e => setName(e.target.value)} required />
         </div>
         <div>
-          <label className={labelClass}>Password</label>
+          <label className={labelClass}>{t('auth.login.password')}</label>
           <input
             type="password"
             className={inputClass}

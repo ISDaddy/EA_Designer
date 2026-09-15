@@ -19,11 +19,15 @@ import { useTheme } from './theme/useTheme';
 import { SettingsView } from './theme/SettingsView';
 import { apiFetch } from './api';
 import { useAuth } from './auth/useAuth';
+import { useI18n } from './i18n/useI18n';
+import { TIME_ZONE_OPTIONS, detectBrowserTimeZone, timeZoneLabel, formatInTimeZone } from './i18n/timezone';
 import { AuthGate } from './auth/AuthGate';
+import { NdaGate } from './auth/NdaGate';
 import { canEdit } from './auth/roles';
 import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass, cardClass, panelHeadingClass, labelClass, listItemCardClass } from './ui';
 import { LogoMark } from './LogoMark';
 import { computeNextOccurrences, describeSchedule, DAY_NAMES, type ScheduleDef } from './schedule';
+import { logAuditView } from './audit/logView';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -138,33 +142,51 @@ const nodeTypes = {
 type SystemStatus = 'planned' | 'active' | 'deprecated' | 'retired';
 type Criticality = 'low' | 'medium' | 'high' | 'critical';
 type DataObjectClassification = 'public' | 'internal' | 'confidential' | 'restricted';
+// What one data object is called - and identified by - within a particular system. The same
+// logical object very often has a different name in each system, and each system tracks it under
+// its own object id, so this is keyed per system rather than being a single global value.
+type SystemObjectName = { name: string; objectId?: string };
 
 type SystemNodeData = {
   label: string;
   layoutPositions?: Record<string, { x: number; y: number }>;
   isHighlighted?: boolean;
-  owner?: string;
+  ownerIds?: string[];
   status?: SystemStatus;
   criticality?: Criticality;
   businessCapability?: string;
   techStack?: string[];
   description?: string;
+  timeZone?: string;
 };
 
 type SystemNode = Node<SystemNodeData, 'eaSystem'> | Node<Record<string, never>, 'junction'>;
 type IntegrationEdgeData = {
   dataObjectIds: string[];
   description?: string;
+  ownerIds?: string[];
 };
 type IntegrationEdge = Edge<IntegrationEdgeData>;
 
 // An admin-maintainable tag (Inventory page) that an integration can carry one or more of -
 // shared shape for both the Integration Type list (Manual, API Integration, ...) and the
-// Integration Software list (Middleware, P2P, ...). Integration Frequencies additionally carry a
-// `schedule` - see ScheduleDef in schedule.ts - so the Schedule page can compute real run times
-// instead of the name being just a display label.
-type ReferenceListItem = { id: string; name: string; schedule?: ScheduleDef };
-type ReferenceListId = 'integration-types' | 'integration-software' | 'integration-frequencies';
+// Integration Software list (Middleware, P2P, ...).
+// `timeZone` only ever applies to Integration Software entries - a shared tool like "Boomi" runs
+// out of one place, so every connection tagged with it shares that one time zone.
+type ReferenceListItem = { id: string; name: string; timeZone?: string };
+
+// A minimal, non-admin-only view of a team member - just enough to populate an owner picker for
+// systems/integrations, as opposed to the full admin-only user-management record (role, invite
+// history, ...) from /api/users.
+type TeamRosterUser = { id: string; name: string; email: string };
+type ReferenceListId = 'integration-types' | 'integration-software';
+
+// Every flow's frequency, unlike Integration Type/Software, isn't a shared admin-maintained tag -
+// each (edge, object) flow defines its own cadence directly, and every flow must have one (it's
+// not optional the way the type/software tags are). "none" still means something real here
+// (real-time/on-demand, no fixed cadence) rather than "not configured" - the field itself is what
+// can't be left unset.
+const DEFAULT_SCHEDULE: ScheduleDef = { kind: 'daily', time: '02:00' };
 
 // How a single data object moves over a single connection - one of these per (edge, object)
 // pair, not per edge, since a connection carrying several objects can integrate each one
@@ -175,12 +197,32 @@ type ReferenceListId = 'integration-types' | 'integration-software' | 'integrati
 type EdgeObjectDetail = {
   sourcePattern?: string;
   targetPattern?: string;
-  frequencyIds?: string[];
-  integrationTypeIds?: string[];
-  integrationSoftwareIds?: string[];
+  schedule?: ScheduleDef;
+  integrationTypeId?: string;
+  integrationSoftwareId?: string;
   atRisk?: boolean;
 };
 const edgeObjectDetailKey = (edgeId: string, objectId: string) => `${edgeId}::${objectId}`;
+
+// Which single-valued EdgeObjectDetail field a given reference list actually populates - a flow
+// carries at most one Integration Type and one Integration Software, never several - used to find
+// (and later resolve) every place an entry is referenced before it can be deleted. Frequency isn't
+// a reference list any more, so it has no entry here.
+const REFERENCE_LIST_FIELD: Record<ReferenceListId, 'integrationTypeId' | 'integrationSoftwareId'> = {
+  'integration-types': 'integrationTypeId',
+  'integration-software': 'integrationSoftwareId',
+};
+
+// One (edge, object) flow that currently tags itself with the reference-list item a user is
+// trying to delete - what ReferenceItemDeleteDialog shows so the deletion can't silently leave
+// dangling ids behind.
+type ReferenceItemUsage = {
+  key: string;
+  edgeId: string;
+  objectId: string;
+  edgeLabel: string;
+  objectName: string;
+};
 
 // A planned or unplanned window where a system is unavailable - the Schedule page cross-
 // references these against computed run times to flag which integrations they'd impact.
@@ -209,21 +251,22 @@ const objectsForSystem = (systemId: string | null, dataObjects: DataObject[], ed
 type RawSystemRow = {
   id: string; label: string; x: number; y: number;
   layout_positions?: Record<string, { x: number; y: number }>;
-  owner?: string; status?: string; criticality?: string;
-  business_capability?: string; tech_stack?: string[]; description?: string;
+  status?: string; criticality?: string;
+  business_capability?: string; tech_stack?: string[]; description?: string; time_zone?: string;
+  owner_ids?: string[];
 };
 type RawDataObjectRow = {
   id: string; name: string; master_system_id: string;
-  aliases?: Record<string, string>; description?: string; classification?: string;
+  system_object_names?: Record<string, SystemObjectName>; description?: string; classification?: string;
 };
 type RawEdgeRow = {
   id: string; source: string; target: string; data_object_ids: string[];
-  description?: string;
+  description?: string; owner_ids?: string[];
 };
 type RawEdgeObjectDetailRow = {
   edge_id: string; data_object_id: string;
-  source_pattern?: string; target_pattern?: string; frequency_ids?: string[];
-  integration_type_ids?: string[]; integration_software_ids?: string[]; at_risk?: boolean;
+  source_pattern?: string; target_pattern?: string; schedule?: ScheduleDef;
+  integration_type_id?: string; integration_software_id?: string; at_risk?: boolean;
 };
 type RawSystemDowntimeRow = {
   id: string; system_id: string; starts_at: string; ends_at: string; reason?: string;
@@ -233,7 +276,7 @@ type DataObject = {
   id: string;
   name: string;
   masterSystemId: string;
-  aliases?: Record<string, string>; // systemId -> alias
+  systemObjectNames?: Record<string, SystemObjectName>; // systemId -> name/objectId in that system
   description?: string;
   classification?: DataObjectClassification;
 };
@@ -250,6 +293,8 @@ type ScheduledRun = {
   targetSystemId: string;
   sourceLabel: string;
   targetLabel: string;
+  sourceTimeZone: string;
+  targetTimeZone: string;
   frequencyLabel: string;
   atRisk: boolean;
   impactedDowntimes: SystemDowntime[];
@@ -262,9 +307,9 @@ function computeScheduledRuns(
   edges: IntegrationEdge[],
   dataObjects: DataObject[],
   edgeObjectDetails: Record<string, EdgeObjectDetail>,
-  integrationFrequencies: ReferenceListItem[],
   systemDowntimes: SystemDowntime[],
   getSystemLabel: (id: string | null | undefined) => string | undefined,
+  getSystemTimeZone: (id: string | null | undefined) => string,
 ): ScheduledRun[] {
   const now = new Date();
   const horizonEnd = new Date(now.getTime() + SCHEDULE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
@@ -274,35 +319,33 @@ function computeScheduledRuns(
     const objIds = edge.data?.dataObjectIds || [];
     objIds.forEach(objId => {
       const detail = edgeObjectDetails[edgeObjectDetailKey(edge.id, objId)];
-      if (!detail?.frequencyIds?.length) return;
+      const schedule = detail?.schedule || DEFAULT_SCHEDULE;
+      if (schedule.kind === 'none') return;
       const obj = dataObjects.find(o => o.id === objId);
       if (!obj) return;
 
-      detail.frequencyIds.forEach(freqId => {
-        const freq = integrationFrequencies.find(f => f.id === freqId);
-        if (!freq?.schedule || freq.schedule.kind === 'none') return;
+      const occurrences = computeNextOccurrences(schedule, now, MAX_OCCURRENCES_PER_FLOW)
+        .filter(d => d <= horizonEnd);
 
-        const occurrences = computeNextOccurrences(freq.schedule, now, MAX_OCCURRENCES_PER_FLOW)
-          .filter(d => d <= horizonEnd);
-
-        occurrences.forEach((time, i) => {
-          const impactedDowntimes = systemDowntimes.filter(dt =>
-            (dt.systemId === edge.source || dt.systemId === edge.target) &&
-            time >= new Date(dt.startsAt) && time <= new Date(dt.endsAt)
-          );
-          results.push({
-            key: `${edge.id}-${objId}-${freqId}-${i}`,
-            time,
-            objectName: obj.name,
-            edgeId: edge.id,
-            sourceSystemId: edge.source,
-            targetSystemId: edge.target,
-            sourceLabel: getSystemLabel(edge.source) || edge.source,
-            targetLabel: getSystemLabel(edge.target) || edge.target,
-            frequencyLabel: freq.name,
-            atRisk: !!detail.atRisk,
-            impactedDowntimes,
-          });
+      occurrences.forEach((time, i) => {
+        const impactedDowntimes = systemDowntimes.filter(dt =>
+          (dt.systemId === edge.source || dt.systemId === edge.target) &&
+          time >= new Date(dt.startsAt) && time <= new Date(dt.endsAt)
+        );
+        results.push({
+          key: `${edge.id}-${objId}-${i}`,
+          time,
+          objectName: obj.name,
+          edgeId: edge.id,
+          sourceSystemId: edge.source,
+          targetSystemId: edge.target,
+          sourceLabel: getSystemLabel(edge.source) || edge.source,
+          targetLabel: getSystemLabel(edge.target) || edge.target,
+          sourceTimeZone: getSystemTimeZone(edge.source),
+          targetTimeZone: getSystemTimeZone(edge.target),
+          frequencyLabel: describeSchedule(schedule),
+          atRisk: !!detail?.atRisk,
+          impactedDowntimes,
         });
       });
     });
@@ -392,30 +435,34 @@ function Popover({ trigger, children, align = 'left' }: {
 // a landscape of hundreds or thousands of systems, since rendering that many boxes on one canvas
 // stops being usable long before a real enterprise's system count does.
 type InventoryRow = {
-  id: string; label: string; owner: string; status: string; criticality: string;
-  business_capability: string; description: string;
+  id: string; label: string; status: string; criticality: string;
+  business_capability: string; description: string; time_zone: string; owner_ids: string[];
 };
 
 // The system editor - shown in the canvas sidebar when a node is selected, and reused verbatim by
 // the Inventory page's own details panel so editing a system works identically from either place.
 function SystemDetailsPanel({
-  systemId, data, objectsInSystem, renameSystem, updateSystemField, setSystemAlias, deleteObject, onDelete, readOnly,
+  systemId, data, objectsInSystem, renameSystem, updateSystemField, setSystemObjectName, deleteObject, onDelete, readOnly,
+  teamRoster, canManageOwners,
 }: {
   systemId: string;
   data: SystemNodeData | undefined;
   objectsInSystem: DataObject[];
   renameSystem: (sysId: string, newLabel: string) => void;
   updateSystemField: <K extends keyof SystemNodeData>(sysId: string, field: K, value: SystemNodeData[K], debounceKey?: string) => void;
-  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  setSystemObjectName: (objId: string, sysId: string, entry: SystemObjectName) => void;
   deleteObject: (objId: string) => void;
   onDelete: () => void;
   readOnly?: boolean;
+  teamRoster: TeamRosterUser[];
+  canManageOwners: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <>
-      <h2 className={panelHeadingClass}>System Details</h2>
+      <h2 className={panelHeadingClass}>{t('system.details.title')}</h2>
       <div>
-        <label className={labelClass}>System Name</label>
+        <label className={labelClass}>{t('system.details.name')}</label>
         <input
           type="text"
           className={inputClass}
@@ -427,7 +474,7 @@ function SystemDetailsPanel({
 
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className={labelClass}>Status</label>
+          <label className={labelClass}>{t('system.details.status')}</label>
           <select
             className={inputClass}
             value={data?.status || 'active'}
@@ -438,7 +485,7 @@ function SystemDetailsPanel({
           </select>
         </div>
         <div>
-          <label className={labelClass}>Criticality</label>
+          <label className={labelClass}>{t('system.details.criticality')}</label>
           <select
             className={inputClass}
             value={data?.criticality || 'medium'}
@@ -451,19 +498,16 @@ function SystemDetailsPanel({
       </div>
 
       <div>
-        <label className={labelClass}>Owner</label>
-        <input
-          type="text"
-          className={inputClass}
-          placeholder="e.g. Finance IT Team"
-          value={data?.owner || ''}
-          disabled={readOnly}
-          onChange={(e) => updateSystemField(systemId, 'owner', e.target.value, `system-owner-${systemId}`)}
+        <OwnerPicker
+          ownerIds={data?.ownerIds || []}
+          roster={teamRoster}
+          canManage={canManageOwners}
+          onChange={(ids) => updateSystemField(systemId, 'ownerIds', ids)}
         />
       </div>
 
       <div>
-        <label className={labelClass}>Business Capability</label>
+        <label className={labelClass}>{t('system.details.businessCapability')}</label>
         <input
           type="text"
           className={inputClass}
@@ -475,7 +519,21 @@ function SystemDetailsPanel({
       </div>
 
       <div>
-        <label className={labelClass}>Tech Stack (comma-separated)</label>
+        <label className={labelClass}>{t('system.details.timeZone')}</label>
+        <select
+          className={inputClass}
+          value={data?.timeZone || 'UTC'}
+          disabled={readOnly}
+          onChange={(e) => updateSystemField(systemId, 'timeZone', e.target.value)}
+        >
+          {(TIME_ZONE_OPTIONS.includes(data?.timeZone || 'UTC') ? TIME_ZONE_OPTIONS : [data?.timeZone || 'UTC', ...TIME_ZONE_OPTIONS]).map(tz => (
+            <option key={tz} value={tz}>{timeZoneLabel(tz)}</option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label className={labelClass}>{t('system.details.techStack')}</label>
         <input
           type="text"
           className={inputClass}
@@ -491,7 +549,7 @@ function SystemDetailsPanel({
       </div>
 
       <div>
-        <label className={labelClass}>Description</label>
+        <label className={labelClass}>{t('system.details.description')}</label>
         <textarea
           className={inputClass}
           rows={3}
@@ -503,30 +561,40 @@ function SystemDetailsPanel({
       </div>
 
       <div className="border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
-        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>Objects in this System</h3>
+        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>{t('system.details.objectsInSystem')}</h3>
         {objectsInSystem.length === 0 ? (
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No objects associated.</p>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('system.details.noObjects')}</p>
         ) : (
           <div className="flex flex-col gap-1 max-h-[30vh] overflow-y-auto pr-1">
             {(() => {
               const renderObjectRow = (obj: DataObject) => {
-                const alias = obj.aliases?.[systemId] || '';
+                const entry = obj.systemObjectNames?.[systemId];
+                const name = entry?.name || '';
+                const objectId = entry?.objectId || '';
                 return (
                   <div key={obj.id} className={`${listItemCardClass} text-xs px-2 py-1 flex flex-col gap-1`}>
                     <div className="flex items-center justify-between">
                       <span className="truncate pr-2 font-bold" style={{ color: 'var(--text-secondary)' }} title={obj.name}>{obj.name}</span>
                       {obj.masterSystemId === systemId && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>Master</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}>{t('common.master')}</span>
                       )}
                     </div>
                     <div className="flex items-center justify-between gap-2 mt-1">
                       <input
                         type="text"
                         className={`${inputClass} px-1.5 py-0.5 text-xs`}
-                        placeholder="Alias in this system..."
-                        value={alias}
+                        placeholder={t('system.details.nameInSystem')}
+                        value={name}
                         disabled={readOnly}
-                        onChange={(e) => setSystemAlias(obj.id, systemId, e.target.value)}
+                        onChange={(e) => setSystemObjectName(obj.id, systemId, { name: e.target.value, objectId })}
+                      />
+                      <input
+                        type="text"
+                        className={`${inputClass} px-1.5 py-0.5 text-xs`}
+                        placeholder={t('system.details.objectIdInSystem')}
+                        value={objectId}
+                        disabled={readOnly}
+                        onChange={(e) => setSystemObjectName(obj.id, systemId, { name, objectId: e.target.value })}
                       />
                       {!readOnly && (
                         <button
@@ -537,7 +605,7 @@ function SystemDetailsPanel({
                             deleteObject(obj.id);
                           }}
                         >
-                          Delete
+                          {t('common.delete')}
                         </button>
                       )}
                     </div>
@@ -549,18 +617,18 @@ function SystemDetailsPanel({
               const items: React.ReactElement[] = [];
               for (const obj of objectsInSystem) {
                 if (rendered.has(obj.id)) continue;
-                const alias = obj.aliases?.[systemId]?.trim();
-                const groupMembers = alias
-                  ? objectsInSystem.filter(o => (o.aliases?.[systemId]?.trim()) === alias)
+                const name = obj.systemObjectNames?.[systemId]?.name?.trim();
+                const groupMembers = name
+                  ? objectsInSystem.filter(o => (o.systemObjectNames?.[systemId]?.name?.trim()) === name)
                   : [obj];
                 groupMembers.forEach(o => rendered.add(o.id));
 
                 if (groupMembers.length > 1) {
                   items.push(
-                    <div key={`group-${alias}`} className="rounded-[var(--radius-input)] border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                    <div key={`group-${name}`} className="rounded-[var(--radius-input)] border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
                       <div className="flex items-center gap-1.5 px-2 py-1" style={{ background: 'var(--bg-surface-alt)' }}>
-                        <span className="text-[10px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>Record type</span>
-                        <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{alias}</span>
+                        <span className="text-[10px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>{t('system.details.recordType')}</span>
+                        <span className="text-xs font-bold" style={{ color: 'var(--text-secondary)' }}>{name}</span>
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold ml-auto" style={{ background: 'var(--bg-surface)', color: 'var(--text-muted)' }}>{groupMembers.length}</span>
                       </div>
                       <div className="flex flex-col gap-1 p-1">
@@ -580,7 +648,7 @@ function SystemDetailsPanel({
 
       {!readOnly && (
         <button className={`${buttonDangerClass} mt-8`} onClick={onDelete}>
-          <Trash2 size={14} />Delete System
+          <Trash2 size={14} />{t('system.details.deleteSystem')}
         </button>
       )}
     </>
@@ -590,7 +658,7 @@ function SystemDetailsPanel({
 // The data object editor - same idea as SystemDetailsPanel: one implementation shared by the
 // canvas sidebar and the Inventory page.
 function ObjectDetailsPanel({
-  object, systemNodes, getSystemLabel, onBack, renameObjectGlobal, updateObjectField, setSystemAlias, onDelete, readOnly,
+  object, systemNodes, getSystemLabel, onBack, renameObjectGlobal, updateObjectField, setSystemObjectName, onDelete, readOnly,
 }: {
   object: DataObject;
   systemNodes: SystemNode[];
@@ -598,19 +666,20 @@ function ObjectDetailsPanel({
   onBack: () => void;
   renameObjectGlobal: (objId: string, newName: string) => void;
   updateObjectField: <K extends keyof DataObject>(objId: string, field: K, value: DataObject[K], debounceKey?: string) => void;
-  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  setSystemObjectName: (objId: string, sysId: string, entry: SystemObjectName) => void;
   onDelete: () => void;
   readOnly?: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <>
       <button className="text-xs text-left mb-2 hover:underline" style={{ color: 'var(--primary)' }} onClick={onBack}>
-        &larr; Close
+        &larr; {t('common.close')}
       </button>
-      <h2 className={panelHeadingClass}>Object Details</h2>
+      <h2 className={panelHeadingClass}>{t('object.details.title')}</h2>
 
       <div className="mt-2">
-        <label className={labelClass}>Global Name</label>
+        <label className={labelClass}>{t('object.details.globalName')}</label>
         <input
           type="text"
           className={inputClass}
@@ -621,22 +690,22 @@ function ObjectDetailsPanel({
       </div>
 
       <div className="mt-4">
-        <label className={labelClass}>Classification</label>
+        <label className={labelClass}>{t('object.details.classification')}</label>
         <select
           className={inputClass}
           value={object.classification || 'internal'}
           disabled={readOnly}
           onChange={(e) => updateObjectField(object.id, 'classification', e.target.value as DataObjectClassification)}
         >
-          <option value="public">Public</option>
-          <option value="internal">Internal</option>
-          <option value="confidential">Confidential</option>
-          <option value="restricted">Restricted</option>
+          <option value="public">{t('classification.public')}</option>
+          <option value="internal">{t('classification.internal')}</option>
+          <option value="confidential">{t('classification.confidential')}</option>
+          <option value="restricted">{t('classification.restricted')}</option>
         </select>
       </div>
 
       <div className="mt-4">
-        <label className={labelClass}>Description</label>
+        <label className={labelClass}>{t('object.details.description')}</label>
         <textarea
           className={inputClass}
           rows={2}
@@ -647,25 +716,25 @@ function ObjectDetailsPanel({
       </div>
 
       <div className="mt-4">
-        <label className={labelClass}>Master System</label>
+        <label className={labelClass}>{t('object.details.masterSystem')}</label>
         <select
           className={inputClass}
           value={object.masterSystemId || ''}
           disabled={readOnly}
           onChange={(e) => updateObjectField(object.id, 'masterSystemId', e.target.value)}
         >
-          <option value="" disabled>-- Select a System --</option>
+          <option value="" disabled>{t('object.details.selectSystem')}</option>
           {systemNodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
         </select>
       </div>
 
       <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--border-subtle)' }}>
-        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>System Aliases</h3>
-        {Object.entries(object.aliases || {}).length === 0 ? (
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No aliases defined.</p>
+        <h3 className="font-bold text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>{t('object.details.systemObjectNames')}</h3>
+        {Object.entries(object.systemObjectNames || {}).length === 0 ? (
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('object.details.noSystemObjectNames')}</p>
         ) : (
           <div className="flex flex-col gap-2">
-            {Object.entries(object.aliases || {}).map(([sysId, alias]) => {
+            {Object.entries(object.systemObjectNames || {}).map(([sysId, entry]) => {
               const sysName = getSystemLabel(sysId) || 'Unknown System';
               return (
                 <div key={sysId} className={`${listItemCardClass} flex flex-col gap-1`}>
@@ -673,9 +742,18 @@ function ObjectDetailsPanel({
                   <input
                     type="text"
                     className={`${inputClass} px-1.5 py-0.5 text-xs`}
-                    value={alias}
+                    placeholder={t('system.details.nameInSystem')}
+                    value={entry.name}
                     disabled={readOnly}
-                    onChange={(e) => setSystemAlias(object.id, sysId, e.target.value)}
+                    onChange={(e) => setSystemObjectName(object.id, sysId, { name: e.target.value, objectId: entry.objectId })}
+                  />
+                  <input
+                    type="text"
+                    className={`${inputClass} px-1.5 py-0.5 text-xs`}
+                    placeholder={t('system.details.objectIdInSystem')}
+                    value={entry.objectId || ''}
+                    disabled={readOnly}
+                    onChange={(e) => setSystemObjectName(object.id, sysId, { name: entry.name, objectId: e.target.value })}
                   />
                 </div>
               );
@@ -686,7 +764,7 @@ function ObjectDetailsPanel({
 
       {!readOnly && (
         <button className={`${buttonDangerClass} mt-8`} onClick={onDelete}>
-          <Trash2 size={14} />Delete Object
+          <Trash2 size={14} />{t('object.details.deleteObject')}
         </button>
       )}
     </>
@@ -697,7 +775,7 @@ function ObjectDetailsPanel({
 // as a card with inline rename/delete per row and an add-new row at the bottom. Used twice from
 // ReferenceListsPanel - one instance per list - since both lists share the exact same shape.
 function ReferenceListCard({
-  title, blurb, items, list, onAdd, onRename, onDelete, canWrite,
+  title, blurb, items, list, onAdd, onRename, onDelete, onUpdateTimeZone, canWrite,
 }: {
   title: string;
   blurb: string;
@@ -706,8 +784,10 @@ function ReferenceListCard({
   onAdd: (list: ReferenceListId, name: string) => void;
   onRename: (list: ReferenceListId, id: string, name: string) => void;
   onDelete: (list: ReferenceListId, id: string) => void;
+  onUpdateTimeZone?: (id: string, timeZone: string) => void;
   canWrite: boolean;
 }) {
+  const { t } = useI18n();
   const [newName, setNewName] = useState('');
 
   const submitAdd = () => {
@@ -723,26 +803,40 @@ function ReferenceListCard({
 
       <div className="flex flex-col gap-1.5">
         {items.map(item => (
-          <div key={item.id} className={`${listItemCardClass} flex items-center gap-2 px-2 py-1`}>
-            <input
-              type="text"
-              className={`${inputClass} px-1.5 py-1 text-sm`}
-              value={item.name}
-              disabled={!canWrite}
-              onChange={(e) => onRename(list, item.id, e.target.value)}
-            />
-            {canWrite && (
-              <button
-                className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
-                style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
-                onClick={() => onDelete(list, item.id)}
+          <div key={item.id} className={`${listItemCardClass} flex flex-col gap-1.5 px-2 py-1`}>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className={`${inputClass} px-1.5 py-1 text-sm`}
+                value={item.name}
+                disabled={!canWrite}
+                onChange={(e) => onRename(list, item.id, e.target.value)}
+              />
+              {canWrite && (
+                <button
+                  className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
+                  style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
+                  onClick={() => onDelete(list, item.id)}
+                >
+                  {t('common.delete')}
+                </button>
+              )}
+            </div>
+            {onUpdateTimeZone && (
+              <select
+                className={`${inputClass} px-1.5 py-1 text-xs`}
+                value={item.timeZone || 'UTC'}
+                disabled={!canWrite}
+                onChange={(e) => onUpdateTimeZone(item.id, e.target.value)}
               >
-                Delete
-              </button>
+                {(TIME_ZONE_OPTIONS.includes(item.timeZone || 'UTC') ? TIME_ZONE_OPTIONS : [item.timeZone || 'UTC', ...TIME_ZONE_OPTIONS]).map(tz => (
+                  <option key={tz} value={tz}>{timeZoneLabel(tz)}</option>
+                ))}
+              </select>
             )}
           </div>
         ))}
-        {items.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No entries yet.</p>}
+        {items.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('common.noEntriesYet')}</p>}
       </div>
 
       {canWrite && (
@@ -750,13 +844,13 @@ function ReferenceListCard({
           <input
             type="text"
             className={`${inputClass} text-sm`}
-            placeholder="Add new..."
+            placeholder={t('common.addNew')}
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submitAdd(); }}
           />
           <button className={buttonSecondaryClass} onClick={submitAdd}>
-            <Plus size={14} />Add
+            <Plus size={14} />{t('common.add')}
           </button>
         </div>
       )}
@@ -764,42 +858,86 @@ function ReferenceListCard({
   );
 }
 
-// One row of the Integration Frequencies list - a name plus a structured schedule editor (none /
-// cron / every-N-minutes / daily / weekly) so the Schedule page can compute real run times from
-// it, not just display the name as a label.
-function FrequencyRow({
-  item, onRename, onDelete, onUpdateSchedule, canWrite,
+// Who owns a system or integration - a list of real user accounts (not free text, so an owner
+// change can actually email the people it affects) shown as removable chips plus an "add" picker.
+// `canManage` is passed in by the caller rather than recomputed here, since it depends on whether
+// the viewer is an admin/editor OR is themselves already one of this resource's owners - either is
+// enough to manage that one resource's owner list, even for someone who can't edit anything else
+// about it (see isOwnerManagingOwnersOnly server-side).
+function OwnerPicker({
+  ownerIds, roster, canManage, onChange,
 }: {
-  item: ReferenceListItem;
-  onRename: (id: string, name: string) => void;
-  onDelete: (id: string) => void;
-  onUpdateSchedule: (id: string, schedule: ScheduleDef) => void;
+  ownerIds: string[];
+  roster: TeamRosterUser[];
+  canManage: boolean;
+  onChange: (ids: string[]) => void;
+}) {
+  const { t } = useI18n();
+  const rosterById = useMemo(() => Object.fromEntries(roster.map(u => [u.id, u])), [roster]);
+  const nameOf = (id: string) => rosterById[id]?.name || rosterById[id]?.email || id;
+
+  return (
+    <div>
+      <label className={labelClass}>{t('owners.label')}</label>
+      <div className="flex flex-wrap gap-1.5 mb-1.5">
+        {ownerIds.map(id => (
+          <span
+            key={id}
+            className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full"
+            style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-secondary)' }}
+          >
+            {nameOf(id)}
+            {canManage && (
+              <button
+                className="rounded-full transition-colors"
+                style={{ color: 'var(--text-muted)' }}
+                onClick={() => onChange(ownerIds.filter(x => x !== id))}
+                aria-label={`Remove ${nameOf(id)}`}
+              >
+                <X size={11} />
+              </button>
+            )}
+          </span>
+        ))}
+        {ownerIds.length === 0 && <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('owners.none')}</span>}
+      </div>
+      {canManage && (
+        <select
+          className={`${inputClass} text-xs`}
+          value=""
+          onChange={(e) => { if (e.target.value) onChange([...ownerIds, e.target.value]); }}
+        >
+          <option value="">{t('owners.addOwner')}</option>
+          {roster.filter(u => !ownerIds.includes(u.id)).map(u => (
+            <option key={u.id} value={u.id}>{u.name || u.email}</option>
+          ))}
+        </select>
+      )}
+      {ownerIds.length === 1 && (
+        <p className="text-xs mt-1 flex items-center gap-1" style={{ color: 'var(--warning)' }}>
+          <AlertTriangle size={11} />{t('owners.singleOwnerWarning')}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// A structured schedule editor (real-time / cron / every-N-minutes / daily / weekly) for one
+// flow's mandatory frequency. Frequency used to be an admin-maintained list a flow picked entries
+// from; now each (edge, object) flow just defines its own cadence directly, so this is the only
+// place a schedule is ever edited.
+function ScheduleEditor({
+  schedule, onChange, canWrite,
+}: {
+  schedule: ScheduleDef;
+  onChange: (schedule: ScheduleDef) => void;
   canWrite: boolean;
 }) {
-  const schedule: ScheduleDef = item.schedule || { kind: 'none' };
+  const { t } = useI18n();
   const dayToggleClass = "w-6 h-6 text-[10px] font-bold rounded-full border transition-colors";
 
   return (
-    <div className={`${listItemCardClass} flex flex-col gap-1.5 px-2 py-1.5`}>
-      <div className="flex items-center gap-2">
-        <input
-          type="text"
-          className={`${inputClass} px-1.5 py-1 text-sm`}
-          value={item.name}
-          disabled={!canWrite}
-          onChange={(e) => onRename(item.id, e.target.value)}
-        />
-        {canWrite && (
-          <button
-            className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
-            style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
-            onClick={() => onDelete(item.id)}
-          >
-            Delete
-          </button>
-        )}
-      </div>
-
+    <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-1.5 flex-wrap">
         <select
           className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
@@ -813,14 +951,14 @@ function FrequencyRow({
               kind === 'daily' ? { kind: 'daily', time: '02:00' } :
               kind === 'weekly' ? { kind: 'weekly', time: '02:00', daysOfWeek: [0] } :
               { kind: 'none' };
-            onUpdateSchedule(item.id, next);
+            onChange(next);
           }}
         >
-          <option value="none">No schedule (label only)</option>
-          <option value="cron">Cron expression</option>
-          <option value="interval">Every N minutes</option>
-          <option value="daily">Daily at time</option>
-          <option value="weekly">Weekly at time</option>
+          <option value="none">{t('scheduleDef.none')}</option>
+          <option value="cron">{t('scheduleDef.cron')}</option>
+          <option value="interval">{t('scheduleDef.interval')}</option>
+          <option value="daily">{t('scheduleDef.daily')}</option>
+          <option value="weekly">{t('scheduleDef.weekly')}</option>
         </select>
 
         {schedule.kind === 'cron' && (
@@ -830,22 +968,22 @@ function FrequencyRow({
             placeholder="0 * * * *"
             value={schedule.expression}
             disabled={!canWrite}
-            onChange={(e) => onUpdateSchedule(item.id, { kind: 'cron', expression: e.target.value })}
+            onChange={(e) => onChange({ kind: 'cron', expression: e.target.value })}
           />
         )}
 
         {schedule.kind === 'interval' && (
           <div className="flex items-center gap-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
-            <span>Every</span>
+            <span>{t('scheduleDef.every')}</span>
             <input
               type="number"
               min={1}
               className={`${inputClass} px-1.5 py-1 text-xs w-16`}
               value={schedule.everyMinutes}
               disabled={!canWrite}
-              onChange={(e) => onUpdateSchedule(item.id, { kind: 'interval', everyMinutes: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+              onChange={(e) => onChange({ kind: 'interval', everyMinutes: Math.max(1, parseInt(e.target.value, 10) || 1) })}
             />
-            <span>min</span>
+            <span>{t('scheduleDef.min')}</span>
           </div>
         )}
 
@@ -855,7 +993,7 @@ function FrequencyRow({
             className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
             value={schedule.time}
             disabled={!canWrite}
-            onChange={(e) => onUpdateSchedule(item.id, { kind: 'daily', time: e.target.value })}
+            onChange={(e) => onChange({ kind: 'daily', time: e.target.value })}
           />
         )}
 
@@ -866,7 +1004,7 @@ function FrequencyRow({
               className={`${inputClass} px-1.5 py-1 text-xs w-auto`}
               value={schedule.time}
               disabled={!canWrite}
-              onChange={(e) => onUpdateSchedule(item.id, { kind: 'weekly', time: e.target.value, daysOfWeek: schedule.daysOfWeek })}
+              onChange={(e) => onChange({ kind: 'weekly', time: e.target.value, daysOfWeek: schedule.daysOfWeek })}
             />
             <div className="flex gap-0.5">
               {DAY_NAMES.map((d, i) => {
@@ -883,7 +1021,7 @@ function FrequencyRow({
                     title={d}
                     onClick={() => {
                       const days = active ? schedule.daysOfWeek.filter(x => x !== i) : [...schedule.daysOfWeek, i];
-                      onUpdateSchedule(item.id, { kind: 'weekly', time: schedule.time, daysOfWeek: days });
+                      onChange({ kind: 'weekly', time: schedule.time, daysOfWeek: days });
                     }}
                   >
                     {d[0]}
@@ -899,108 +1037,210 @@ function FrequencyRow({
   );
 }
 
-function FrequencyListCard({
-  items, onAdd, onRename, onDelete, onUpdateSchedule, canWrite,
+// Gatekeeper in front of every reference-list deletion (Integration Types/Software/Frequencies):
+// deleting one of these can silently leave a connection's flow pointing at nothing, so it never
+// happens with a single click. With no usages it's still a real, styled confirmation rather than
+// a plain browser alert; with usages it forces a decision - replace every usage with one other
+// value in one go, or step through and resolve each flow individually - before the delete proceeds.
+function ReferenceItemDeleteDialog({
+  item, otherItems, usages, onCancel, onConfirm,
 }: {
-  items: ReferenceListItem[];
-  onAdd: (name: string) => void;
-  onRename: (id: string, name: string) => void;
-  onDelete: (id: string) => void;
-  onUpdateSchedule: (id: string, schedule: ScheduleDef) => void;
-  canWrite: boolean;
+  item: ReferenceListItem;
+  otherItems: ReferenceListItem[];
+  usages: ReferenceItemUsage[];
+  onCancel: () => void;
+  onConfirm: (resolutions: Record<string, string | null>) => void;
 }) {
-  const [newName, setNewName] = useState('');
+  const { t } = useI18n();
+  const [mode, setMode] = useState<'choose' | 'replaceAll' | 'individual'>('choose');
+  const [replaceAllId, setReplaceAllId] = useState<string>(otherItems[0]?.id || '');
+  const [perUsageChoice, setPerUsageChoice] = useState<Record<string, string>>(
+    () => Object.fromEntries(usages.map(u => [u.key, '']))
+  );
 
-  const submitAdd = () => {
-    if (!newName.trim()) return;
-    onAdd(newName);
-    setNewName('');
-  };
+  const hasUsages = usages.length > 0;
 
   return (
-    <div className={`${cardClass} p-4 flex-1 min-w-[340px]`}>
-      <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>Integration Frequencies</h3>
-      <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
-        How often it runs - a named cadence, a specific cron expression, or a tool's own schedule (a Boomi process, a MuleSoft trigger). An object's flow can have more than one, and the schedule drives the Schedule page.
-      </p>
-
-      <div className="flex flex-col gap-1.5">
-        {items.map(item => (
-          <FrequencyRow key={item.id} item={item} onRename={onRename} onDelete={onDelete} onUpdateSchedule={onUpdateSchedule} canWrite={canWrite} />
-        ))}
-        {items.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No entries yet.</p>}
-      </div>
-
-      {canWrite && (
-        <div className="flex items-center gap-2 mt-3 pt-3 border-t" style={{ borderColor: 'var(--border-subtle)' }}>
-          <input
-            type="text"
-            className={`${inputClass} text-sm`}
-            placeholder="Add new..."
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') submitAdd(); }}
-          />
-          <button className={buttonSecondaryClass} onClick={submitAdd}>
-            <Plus size={14} />Add
+    <div className="fixed inset-0 z-[200] bg-black/40 flex items-center justify-center backdrop-blur-sm p-4">
+      <div className={`${cardClass} p-6 w-[28rem] max-w-full flex flex-col gap-4`}>
+        <div className="flex items-center justify-between">
+          <h3 className="font-bold text-lg flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+            <AlertTriangle size={18} style={{ color: 'var(--danger)' }} />
+            {t('refDelete.title', { name: item.name })}
+          </h3>
+          <button className="p-1 rounded-full transition-colors" style={{ color: 'var(--text-muted)' }} onClick={onCancel} aria-label="Close">
+            <X size={16} />
           </button>
         </div>
-      )}
+
+        {!hasUsages ? (
+          <>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+              {t('refDelete.notUsed')}
+            </p>
+            <div className="flex justify-end gap-2 mt-2">
+              <button className={buttonSecondaryClass} onClick={onCancel}>{t('common.cancel')}</button>
+              <button className={buttonDangerClass} onClick={() => onConfirm({})}>
+                <Trash2 size={14} />{t('common.delete')}
+              </button>
+            </div>
+          </>
+        ) : mode === 'choose' ? (
+          <>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+              {t('refDelete.usedByFlows', { count: usages.length, flows: usages.length === 1 ? 'flow' : 'flows' })}
+            </p>
+            <div className="flex flex-col gap-1 max-h-32 overflow-y-auto">
+              {usages.map(u => (
+                <div key={u.key} className={`${listItemCardClass} text-xs px-2 py-1`} style={{ color: 'var(--text-secondary)' }}>
+                  <span className="font-bold" style={{ color: 'var(--text-primary)' }}>{u.objectName}</span> on {u.edgeLabel}
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-col gap-2 mt-2">
+              <button
+                className={buttonSecondaryClass}
+                disabled={otherItems.length === 0}
+                title={otherItems.length === 0 ? 'No other entry to replace it with' : undefined}
+                onClick={() => setMode('replaceAll')}
+              >
+                {t('refDelete.replaceEverywhere')}
+              </button>
+              <button className={buttonSecondaryClass} onClick={() => setMode('individual')}>
+                {t('refDelete.resolveIndividually')}
+              </button>
+              <button className={buttonSecondaryClass} onClick={onCancel}>{t('common.cancel')}</button>
+            </div>
+          </>
+        ) : mode === 'replaceAll' ? (
+          <>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+              {t('refDelete.replaceOnAllFlows', { name: item.name, count: usages.length, plural: usages.length === 1 ? '' : 's' })}
+            </p>
+            <select className={inputClass} value={replaceAllId} onChange={(e) => setReplaceAllId(e.target.value)}>
+              {otherItems.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+            <div className="flex justify-end gap-2 mt-2">
+              <button className={buttonSecondaryClass} onClick={() => setMode('choose')}>{t('common.back')}</button>
+              <button
+                className={buttonDangerClass}
+                disabled={!replaceAllId}
+                onClick={() => onConfirm(Object.fromEntries(usages.map(u => [u.key, replaceAllId])))}
+              >
+                <Trash2 size={14} />{t('refDelete.replaceAndDelete')}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+              {t('refDelete.chooseReplacementEach', { name: item.name })}
+            </p>
+            <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
+              {usages.map(u => (
+                <div key={u.key} className={`${listItemCardClass} flex flex-col gap-1 px-2 py-1.5`}>
+                  <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                    <span className="font-bold" style={{ color: 'var(--text-primary)' }}>{u.objectName}</span> on {u.edgeLabel}
+                  </span>
+                  <select
+                    className={`${inputClass} px-1.5 py-1 text-xs`}
+                    value={perUsageChoice[u.key] || ''}
+                    onChange={(e) => setPerUsageChoice(prev => ({ ...prev, [u.key]: e.target.value }))}
+                  >
+                    <option value="">{t('refDelete.removeTag')}</option>
+                    {otherItems.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 mt-2">
+              <button className={buttonSecondaryClass} onClick={() => setMode('choose')}>{t('common.back')}</button>
+              <button
+                className={buttonDangerClass}
+                onClick={() => onConfirm(Object.fromEntries(usages.map(u => [u.key, perUsageChoice[u.key] || null])))}
+              >
+                <Trash2 size={14} />{t('refDelete.applyAndDelete')}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
 
 function ReferenceListsPanel({
-  integrationTypes, integrationSoftwareList, integrationFrequencies, onAdd, onRename, onDelete, onUpdateFrequencySchedule, canWrite,
+  integrationTypes, integrationSoftwareList, onAdd, onRename, onUpdateSoftwareTimeZone, canWrite,
+  findReferenceItemUsage, onResolveAndDelete,
 }: {
   integrationTypes: ReferenceListItem[];
   integrationSoftwareList: ReferenceListItem[];
-  integrationFrequencies: ReferenceListItem[];
   onAdd: (list: ReferenceListId, name: string) => void;
   onRename: (list: ReferenceListId, id: string, name: string) => void;
-  onDelete: (list: ReferenceListId, id: string) => void;
-  onUpdateFrequencySchedule: (id: string, schedule: ScheduleDef) => void;
+  onUpdateSoftwareTimeZone: (id: string, timeZone: string) => void;
   canWrite: boolean;
+  findReferenceItemUsage: (list: ReferenceListId, itemId: string) => ReferenceItemUsage[];
+  onResolveAndDelete: (list: ReferenceListId, itemId: string, usages: ReferenceItemUsage[], resolutions: Record<string, string | null>) => void;
 }) {
+  const { t } = useI18n();
+  const listItems: Record<ReferenceListId, ReferenceListItem[]> = {
+    'integration-types': integrationTypes,
+    'integration-software': integrationSoftwareList,
+  };
+  const [deleteRequest, setDeleteRequest] = useState<{ list: ReferenceListId; item: ReferenceListItem } | null>(null);
+
+  const requestDelete = (list: ReferenceListId, id: string) => {
+    const item = listItems[list].find(i => i.id === id);
+    if (item) setDeleteRequest({ list, item });
+  };
+
   return (
     <div className="flex gap-4 flex-wrap items-start">
       <ReferenceListCard
-        title="Integration Types"
-        blurb="How the integration happens - manual, API, file-based, etc. Assignable per connection."
+        title={t('inventory.integrationTypes.title')}
+        blurb={t('inventory.integrationTypes.blurb')}
         items={integrationTypes}
         list="integration-types"
         onAdd={onAdd}
         onRename={onRename}
-        onDelete={onDelete}
+        onDelete={requestDelete}
         canWrite={canWrite}
       />
       <ReferenceListCard
-        title="Integration Software"
-        blurb="What carries the integration - middleware, direct P2P, or a named product. Assignable per connection."
+        title={t('inventory.integrationSoftware.title')}
+        blurb={t('inventory.integrationSoftware.blurb')}
         items={integrationSoftwareList}
         list="integration-software"
         onAdd={onAdd}
         onRename={onRename}
-        onDelete={onDelete}
+        onDelete={requestDelete}
+        onUpdateTimeZone={onUpdateSoftwareTimeZone}
         canWrite={canWrite}
       />
-      <FrequencyListCard
-        items={integrationFrequencies}
-        onAdd={(name) => onAdd('integration-frequencies', name)}
-        onRename={(id, name) => onRename('integration-frequencies', id, name)}
-        onDelete={(id) => onDelete('integration-frequencies', id)}
-        onUpdateSchedule={onUpdateFrequencySchedule}
-        canWrite={canWrite}
-      />
+      {deleteRequest && (
+        <ReferenceItemDeleteDialog
+          item={deleteRequest.item}
+          otherItems={listItems[deleteRequest.list].filter(i => i.id !== deleteRequest.item.id)}
+          usages={findReferenceItemUsage(deleteRequest.list, deleteRequest.item.id)}
+          onCancel={() => setDeleteRequest(null)}
+          onConfirm={(resolutions) => {
+            onResolveAndDelete(deleteRequest.list, deleteRequest.item.id, findReferenceItemUsage(deleteRequest.list, deleteRequest.item.id), resolutions);
+            setDeleteRequest(null);
+          }}
+        />
+      )}
     </div>
   );
 }
 
 function InventoryView({
   onSelectSystem, onViewObject, dataObjects, getSystemLabel, nodes, edges,
-  renameSystem, updateSystemField, setSystemAlias, deleteObject, deleteSystem,
+  renameSystem, updateSystemField, setSystemObjectName, deleteObject, deleteSystem,
   renameObjectGlobal, updateObjectField, canWrite,
-  integrationTypes, integrationSoftwareList, integrationFrequencies, onAddReferenceItem, onRenameReferenceItem, onDeleteReferenceItem, onUpdateFrequencySchedule,
+  integrationTypes, integrationSoftwareList, onAddReferenceItem, onRenameReferenceItem, onUpdateSoftwareTimeZone,
+  findReferenceItemUsage, onResolveAndDeleteReferenceItem,
+  subView, setSubView, editingSystemId, setEditingSystemId, editingObjectId, setEditingObjectId,
+  currentUserId, teamRoster,
 }: {
   onSelectSystem: (id: string) => void;
   onViewObject: (id: string) => void;
@@ -1010,7 +1250,7 @@ function InventoryView({
   edges: IntegrationEdge[];
   renameSystem: (sysId: string, newLabel: string) => void;
   updateSystemField: <K extends keyof SystemNodeData>(sysId: string, field: K, value: SystemNodeData[K], debounceKey?: string) => void;
-  setSystemAlias: (objId: string, sysId: string, alias: string) => void;
+  setSystemObjectName: (objId: string, sysId: string, entry: SystemObjectName) => void;
   deleteObject: (objId: string) => void;
   deleteSystem: (sysId: string) => void;
   renameObjectGlobal: (objId: string, newName: string) => void;
@@ -1018,13 +1258,23 @@ function InventoryView({
   canWrite: boolean;
   integrationTypes: ReferenceListItem[];
   integrationSoftwareList: ReferenceListItem[];
-  integrationFrequencies: ReferenceListItem[];
   onAddReferenceItem: (list: ReferenceListId, name: string) => void;
   onRenameReferenceItem: (list: ReferenceListId, id: string, name: string) => void;
-  onDeleteReferenceItem: (list: ReferenceListId, id: string) => void;
-  onUpdateFrequencySchedule: (id: string, schedule: ScheduleDef) => void;
+  onUpdateSoftwareTimeZone: (id: string, timeZone: string) => void;
+  findReferenceItemUsage: (list: ReferenceListId, itemId: string) => ReferenceItemUsage[];
+  onResolveAndDeleteReferenceItem: (list: ReferenceListId, itemId: string, usages: ReferenceItemUsage[], resolutions: Record<string, string | null>) => void;
+  // Lifted up to AppContent (rather than local state here) so the URL can reflect and restore
+  // exactly which Inventory tab and row are open, the same way canvas selection does.
+  subView: InventoryTab;
+  setSubView: (tab: InventoryTab) => void;
+  editingSystemId: string | null;
+  setEditingSystemId: (id: string | null) => void;
+  editingObjectId: string | null;
+  setEditingObjectId: (id: string | null) => void;
+  currentUserId: string | undefined;
+  teamRoster: TeamRosterUser[];
 }) {
-  const [subView, setSubView] = useState<'systems' | 'objects' | 'lists'>('systems');
+  const { t } = useI18n();
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [total, setTotal] = useState(0);
   const [search, setSearch] = useState('');
@@ -1034,11 +1284,6 @@ function InventoryView({
   const [loading, setLoading] = useState(false);
   const [objectSearch, setObjectSearch] = useState('');
   const pageSize = 25;
-
-  // The row currently open for editing in the right-hand panel - local to this page, so browsing
-  // Inventory never disturbs the canvas's own selection/focus state.
-  const [editingSystemId, setEditingSystemId] = useState<string | null>(null);
-  const [editingObjectId, setEditingObjectId] = useState<string | null>(null);
 
   const editSystem = (id: string) => { setEditingSystemId(id); setEditingObjectId(null); };
   const editObject = (id: string) => { setEditingObjectId(id); setEditingSystemId(null); };
@@ -1056,9 +1301,55 @@ function InventoryView({
     const search = objectSearch.toLowerCase();
     return dataObjects.filter(obj => {
       if (obj.name.toLowerCase().includes(search)) return true;
-      return Object.values(obj.aliases || {}).some(alias => alias.toLowerCase().includes(search));
+      return Object.values(obj.systemObjectNames || {}).some(entry =>
+        entry.name.toLowerCase().includes(search) || (entry.objectId || '').toLowerCase().includes(search)
+      );
     });
   }, [dataObjects, objectSearch]);
+
+  // Three system-to-system relationship views for the Systems inventory table, all derived from
+  // the edges (which carry the data objects actually flowing between systems):
+  // - connected: any system with a direct edge to/from this one, regardless of which objects flow.
+  // - usesObjectsFrom: for a master system, every other system that appears on either end of an
+  //   edge carrying one of that master's objects - i.e. who consumes data this system originates,
+  //   including further hops where the object keeps propagating between two other systems.
+  // - dataFromMasters: for a system, the master systems behind every object flowing in/out of it -
+  //   the mirror image of usesObjectsFrom, read from the other side.
+  const systemRelations = useMemo(() => {
+    const objectsById = new Map(dataObjects.map(o => [o.id, o]));
+    const connected = new Map<string, Set<string>>();
+    const usesObjectsFrom = new Map<string, Set<string>>();
+    const dataFromMasters = new Map<string, Set<string>>();
+    const addTo = (map: Map<string, Set<string>>, key: string, value: string) => {
+      if (!key || !value || value === key) return;
+      if (!map.has(key)) map.set(key, new Set());
+      map.get(key)!.add(value);
+    };
+
+    edges.forEach(e => {
+      addTo(connected, e.source, e.target);
+      addTo(connected, e.target, e.source);
+
+      (e.data?.dataObjectIds || []).forEach(objId => {
+        const masterId = objectsById.get(objId)?.masterSystemId;
+        if (!masterId) return;
+        addTo(usesObjectsFrom, masterId, e.source);
+        addTo(usesObjectsFrom, masterId, e.target);
+        addTo(dataFromMasters, e.source, masterId);
+        addTo(dataFromMasters, e.target, masterId);
+      });
+    });
+
+    return { connected, usesObjectsFrom, dataFromMasters };
+  }, [edges, dataObjects]);
+
+  const formatSystemSet = useCallback((set: Set<string> | undefined) =>
+    set ? Array.from(set).map(id => getSystemLabel(id) || id).sort().join(', ') : '',
+  [getSystemLabel]);
+
+  const ownerNames = useCallback((ids: string[] | undefined) =>
+    (ids || []).map(id => teamRoster.find(u => u.id === id)?.name || id).join(', '),
+  [teamRoster]);
 
   // Reset to page 0 whenever a filter changes. Done during render (React's recommended pattern
   // for resetting derived state - see "Adjusting state when a prop changes") rather than in an
@@ -1099,7 +1390,7 @@ function InventoryView({
         <div className="max-w-6xl mx-auto">
           <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
             <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>
-              {subView === 'systems' ? 'System Inventory' : subView === 'objects' ? 'Data Object Inventory' : 'Integration Reference Lists'}
+              {subView === 'systems' ? t('inventory.systemInventory') : subView === 'objects' ? t('inventory.dataObjectInventory') : t('inventory.integrationReferenceLists')}
             </h2>
             <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
               <button
@@ -1107,21 +1398,21 @@ function InventoryView({
                 style={subView === 'systems' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
                 onClick={() => setSubView('systems')}
               >
-                Systems
+                {t('inventory.tab.systems')}
               </button>
               <button
                 className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
                 style={subView === 'objects' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
                 onClick={() => setSubView('objects')}
               >
-                Data Objects
+                {t('inventory.tab.dataObjects')}
               </button>
               <button
                 className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
                 style={subView === 'lists' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
                 onClick={() => setSubView('lists')}
               >
-                Integration Lists
+                {t('inventory.tab.integrationLists')}
               </button>
             </div>
           </div>
@@ -1130,12 +1421,12 @@ function InventoryView({
             <ReferenceListsPanel
               integrationTypes={integrationTypes}
               integrationSoftwareList={integrationSoftwareList}
-              integrationFrequencies={integrationFrequencies}
               onAdd={onAddReferenceItem}
               onRename={onRenameReferenceItem}
-              onDelete={onDeleteReferenceItem}
-              onUpdateFrequencySchedule={onUpdateFrequencySchedule}
+              onUpdateSoftwareTimeZone={onUpdateSoftwareTimeZone}
               canWrite={canWrite}
+              findReferenceItemUsage={findReferenceItemUsage}
+              onResolveAndDelete={onResolveAndDeleteReferenceItem}
             />
           ) : subView === 'objects' ? (
             <>
@@ -1143,7 +1434,7 @@ function InventoryView({
                 <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
                 <input
                   className={`${inputClass} pl-9 w-64`}
-                  placeholder="Search by name or alias..."
+                  placeholder={t('inventory.searchObjects')}
                   value={objectSearch}
                   onChange={e => setObjectSearch(e.target.value)}
                 />
@@ -1153,15 +1444,21 @@ function InventoryView({
                 <table className="w-full text-sm">
                   <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
                     <tr>
-                      <th className="px-4 py-2.5">Data Object</th>
-                      <th className="px-4 py-2.5">Master System</th>
-                      <th className="px-4 py-2.5">Classification</th>
-                      <th className="px-4 py-2.5">Description</th>
+                      <th className="px-4 py-2.5">{t('inventory.col.dataObject')}</th>
+                      <th className="px-4 py-2.5">{t('inventory.col.masterSystem')}</th>
+                      <th className="px-4 py-2.5">{t('inventory.col.presentInSystems')}</th>
+                      <th className="px-4 py-2.5">{t('inventory.col.classification')}</th>
+                      <th className="px-4 py-2.5">{t('inventory.col.description')}</th>
                       <th className="px-4 py-2.5 w-10"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredObjects.slice(0, 200).map(obj => (
+                    {filteredObjects.slice(0, 200).map(obj => {
+                      const presentInSystems = Object.entries(obj.systemObjectNames || {})
+                        .filter(([sysId]) => sysId !== obj.masterSystemId)
+                        .map(([sysId, entry]) => `${getSystemLabel(sysId) || 'Unknown System'} (${entry.name})`)
+                        .join(', ');
+                      return (
                       <tr
                         key={obj.id}
                         className="border-t cursor-pointer transition-colors"
@@ -1172,6 +1469,7 @@ function InventoryView({
                       >
                         <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{obj.name}</td>
                         <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{getSystemLabel(obj.masterSystemId) || '—'}</td>
+                        <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }} title={presentInSystems}>{presentInSystems || '—'}</td>
                         <td className="px-4 py-2">
                           <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${CLASSIFICATION_BADGE_STYLES[obj.classification || 'internal']}`}>
                             {CLASSIFICATION_LABELS[obj.classification || 'internal']}
@@ -1189,16 +1487,17 @@ function InventoryView({
                           </button>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                     {filteredObjects.length === 0 && (
-                      <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No data objects match this search.</td></tr>
+                      <tr><td colSpan={6} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>{t('inventory.noObjectsMatch')}</td></tr>
                     )}
                   </tbody>
                 </table>
               </div>
 
               <div className="mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
-                {`Showing ${Math.min(filteredObjects.length, 200)} of ${filteredObjects.length}`}
+                {t('inventory.showing', { shown: Math.min(filteredObjects.length, 200), total: filteredObjects.length })}
               </div>
             </>
           ) : (
@@ -1208,17 +1507,17 @@ function InventoryView({
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
               <input
                 className={`${inputClass} pl-9 w-64`}
-                placeholder="Search by name, owner, capability..."
+                placeholder={t('inventory.searchSystems')}
                 value={search}
                 onChange={e => setSearch(e.target.value)}
               />
             </div>
             <select className={`${inputClass} w-auto`} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
-              <option value="">All statuses</option>
+              <option value="">{t('inventory.allStatuses')}</option>
               {Object.entries(STATUS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
             </select>
             <select className={`${inputClass} w-auto`} value={criticalityFilter} onChange={e => setCriticalityFilter(e.target.value)}>
-              <option value="">All criticalities</option>
+              <option value="">{t('inventory.allCriticalities')}</option>
               {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
             </select>
           </div>
@@ -1227,11 +1526,15 @@ function InventoryView({
             <table className="w-full text-sm">
               <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
                 <tr>
-                  <th className="px-4 py-2.5">System</th>
-                  <th className="px-4 py-2.5">Owner</th>
-                  <th className="px-4 py-2.5">Status</th>
-                  <th className="px-4 py-2.5">Criticality</th>
-                  <th className="px-4 py-2.5">Business Capability</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.system')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.owner')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.status')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.criticality')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.businessCapability')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.timeZone')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.connectedSystems')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.systemsUsingItsObjects')}</th>
+                  <th className="px-4 py-2.5">{t('inventory.col.dataFromMasterSystems')}</th>
                   <th className="px-4 py-2.5 w-10"></th>
                 </tr>
               </thead>
@@ -1246,7 +1549,14 @@ function InventoryView({
                     onClick={() => editSystem(r.id)}
                   >
                     <td className="px-4 py-2 font-bold" style={{ color: 'var(--text-primary)' }}>{r.label}</td>
-                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.owner || '—'}</td>
+                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate max-w-[140px]" title={ownerNames(r.owner_ids)}>{ownerNames(r.owner_ids) || '—'}</span>
+                        {(r.owner_ids || []).length === 1 && (
+                          <AlertTriangle size={12} style={{ color: 'var(--warning)' }} aria-label={t('owners.singleOwnerWarning')} />
+                        )}
+                      </div>
+                    </td>
                     <td className="px-4 py-2">
                       <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${STATUS_BADGE_STYLES[r.status] || 'bg-[var(--bg-surface-alt)] text-[var(--text-secondary)]'}`}>
                         {STATUS_LABELS[r.status as SystemStatus] || r.status}
@@ -1258,6 +1568,16 @@ function InventoryView({
                       </span>
                     </td>
                     <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.business_capability || '—'}</td>
+                    <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{r.time_zone || 'UTC'}</td>
+                    <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }} title={formatSystemSet(systemRelations.connected.get(r.id))}>
+                      {formatSystemSet(systemRelations.connected.get(r.id)) || '—'}
+                    </td>
+                    <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }} title={formatSystemSet(systemRelations.usesObjectsFrom.get(r.id))}>
+                      {formatSystemSet(systemRelations.usesObjectsFrom.get(r.id)) || '—'}
+                    </td>
+                    <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }} title={formatSystemSet(systemRelations.dataFromMasters.get(r.id))}>
+                      {formatSystemSet(systemRelations.dataFromMasters.get(r.id)) || '—'}
+                    </td>
                     <td className="px-4 py-2">
                       <button
                         className="p-1.5 rounded-full transition-colors"
@@ -1271,14 +1591,14 @@ function InventoryView({
                   </tr>
                 ))}
                 {rows.length === 0 && !loading && (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>No systems match these filters.</td></tr>
+                  <tr><td colSpan={10} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>{t('inventory.noSystemsMatch')}</td></tr>
                 )}
               </tbody>
             </table>
           </div>
 
           <div className="flex items-center justify-between mt-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
-            <span>{loading ? 'Loading...' : `Showing ${from}-${to} of ${total}`}</span>
+            <span>{loading ? t('common.loading') : t('inventory.showing', { shown: `${from}-${to}`, total })}</span>
             <div className="flex gap-2">
               <button
                 className={buttonSecondaryClass}
@@ -1316,10 +1636,12 @@ function InventoryView({
               objectsInSystem={objectsInEditingSystem}
               renameSystem={renameSystem}
               updateSystemField={updateSystemField}
-              setSystemAlias={setSystemAlias}
+              setSystemObjectName={setSystemObjectName}
               deleteObject={deleteObject}
               onDelete={() => { deleteSystem(editingSystemId); setEditingSystemId(null); }}
               readOnly={!canWrite}
+              teamRoster={teamRoster}
+              canManageOwners={canWrite || !!(currentUserId && (editingSystemData?.ownerIds || []).includes(currentUserId))}
             />
           ) : editingObject ? (
             <ObjectDetailsPanel
@@ -1329,7 +1651,7 @@ function InventoryView({
               onBack={() => setEditingObjectId(null)}
               renameObjectGlobal={renameObjectGlobal}
               updateObjectField={updateObjectField}
-              setSystemAlias={setSystemAlias}
+              setSystemObjectName={setSystemObjectName}
               onDelete={() => { deleteObject(editingObject.id); setEditingObjectId(null); }}
               readOnly={!canWrite}
             />
@@ -1351,17 +1673,20 @@ const runSeverityStyle = (run: ScheduledRun): { background: string; color: strin
       : { background: 'var(--bg-surface-alt)', color: 'var(--text-secondary)' };
 
 function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
+  const { t, locale } = useI18n();
+  const { user } = useAuth();
+  const userTimeZone = user?.timeZone || detectBrowserTimeZone();
   const visible = runs.slice(0, 200);
   return (
     <div className={`${cardClass} overflow-x-auto`}>
       <table className="w-full text-sm">
         <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
           <tr>
-            <th className="px-4 py-2.5">When</th>
-            <th className="px-4 py-2.5">Object</th>
-            <th className="px-4 py-2.5">Flow</th>
-            <th className="px-4 py-2.5">Frequency</th>
-            <th className="px-4 py-2.5">Flags</th>
+            <th className="px-4 py-2.5">{t('schedulePage.col.when')}</th>
+            <th className="px-4 py-2.5">{t('schedulePage.col.object')}</th>
+            <th className="px-4 py-2.5">{t('schedulePage.col.flow')}</th>
+            <th className="px-4 py-2.5">{t('schedulePage.col.frequency')}</th>
+            <th className="px-4 py-2.5">{t('schedulePage.col.flags')}</th>
           </tr>
         </thead>
         <tbody>
@@ -1373,7 +1698,18 @@ function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
                 className="border-t"
                 style={{ borderColor: 'var(--border-subtle)', background: run.impactedDowntimes.length > 0 ? severity.background : undefined }}
               >
-                <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>{run.time.toLocaleString()}</td>
+                <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>
+                  <div>{formatInTimeZone(run.time, userTimeZone, locale)}</div>
+                  <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                    {t('schedulePage.yourTime')} ({userTimeZone})
+                  </div>
+                  <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                    {formatInTimeZone(run.time, run.sourceTimeZone, locale)}
+                  </div>
+                  <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                    {t('schedulePage.systemTime')}: {run.sourceLabel} ({run.sourceTimeZone})
+                  </div>
+                </td>
                 <td className="px-4 py-2 font-semibold" style={{ color: 'var(--text-primary)' }}>{run.objectName}</td>
                 <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{run.sourceLabel} → {run.targetLabel}</td>
                 <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{run.frequencyLabel}</td>
@@ -1381,7 +1717,7 @@ function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {run.atRisk && (
                       <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'var(--warning-container)', color: 'var(--on-warning-container)' }}>
-                        <AlertTriangle size={10} />At risk
+                        <AlertTriangle size={10} />{t('schedulePage.atRisk')}
                       </span>
                     )}
                     {run.impactedDowntimes.map(dt => (
@@ -1396,7 +1732,7 @@ function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
           })}
           {visible.length === 0 && (
             <tr><td colSpan={5} className="px-4 py-8 text-center" style={{ color: 'var(--text-muted)' }}>
-              No scheduled runs in the next {SCHEDULE_WINDOW_DAYS} days. Assign a frequency with a schedule to a connection&apos;s object to see it here.
+              {t('schedulePage.noRuns')}
             </td></tr>
           )}
         </tbody>
@@ -1409,6 +1745,9 @@ function UpcomingRunsList({ runs }: { runs: ScheduledRun[] }) {
 }
 
 function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
+  const { locale } = useI18n();
+  const { user } = useAuth();
+  const userTimeZone = user?.timeZone || detectBrowserTimeZone();
   const days = useMemo(() => {
     const result: { date: Date; key: string }[] = [];
     const start = new Date();
@@ -1450,9 +1789,9 @@ function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
                   key={run.key}
                   className="text-[10px] px-1.5 py-1 rounded-[var(--radius-input)] truncate"
                   style={runSeverityStyle(run)}
-                  title={`${run.objectName}: ${run.sourceLabel} → ${run.targetLabel} (${run.frequencyLabel})`}
+                  title={`${run.objectName}: ${run.sourceLabel} → ${run.targetLabel} (${run.frequencyLabel}) — ${formatInTimeZone(run.time, userTimeZone, locale)} (you, ${userTimeZone}) / ${formatInTimeZone(run.time, run.sourceTimeZone, locale)} (${run.sourceLabel}, ${run.sourceTimeZone})`}
                 >
-                  {run.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} {run.objectName}
+                  {new Intl.DateTimeFormat(locale, { timeZone: userTimeZone, hour: '2-digit', minute: '2-digit' }).format(run.time)} {run.objectName}
                 </div>
               ))}
               {dayRuns.length > 8 && (
@@ -1468,20 +1807,23 @@ function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
 }
 
 function ScheduleView({
-  nodes, edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes,
-  getSystemLabel, canWrite, onAddDowntime, onDeleteDowntime,
+  nodes, edges, dataObjects, edgeObjectDetails, systemDowntimes,
+  getSystemLabel, getSystemTimeZone, canWrite, onAddDowntime, onDeleteDowntime,
 }: {
   nodes: SystemNode[];
   edges: IntegrationEdge[];
   dataObjects: DataObject[];
   edgeObjectDetails: Record<string, EdgeObjectDetail>;
-  integrationFrequencies: ReferenceListItem[];
   systemDowntimes: SystemDowntime[];
   getSystemLabel: (id: string | null | undefined) => string | undefined;
+  getSystemTimeZone: (id: string | null | undefined) => string;
   canWrite: boolean;
   onAddDowntime: (systemId: string, startsAt: string, endsAt: string, reason: string) => void;
   onDeleteDowntime: (id: string) => void;
 }) {
+  const { t, locale } = useI18n();
+  const { user } = useAuth();
+  const userTimeZone = user?.timeZone || detectBrowserTimeZone();
   const [subView, setSubView] = useState<'runs' | 'calendar'>('runs');
   const [dtSystemId, setDtSystemId] = useState('');
   const [dtStart, setDtStart] = useState('');
@@ -1489,8 +1831,8 @@ function ScheduleView({
   const [dtReason, setDtReason] = useState('');
 
   const runs = useMemo(
-    () => computeScheduledRuns(edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes, getSystemLabel),
-    [edges, dataObjects, edgeObjectDetails, integrationFrequencies, systemDowntimes, getSystemLabel]
+    () => computeScheduledRuns(edges, dataObjects, edgeObjectDetails, systemDowntimes, getSystemLabel, getSystemTimeZone),
+    [edges, dataObjects, edgeObjectDetails, systemDowntimes, getSystemLabel, getSystemTimeZone]
   );
 
   const systemOptions = nodes.filter(isEaSystemNode);
@@ -1507,36 +1849,41 @@ function ScheduleView({
     <div className="flex-1 overflow-y-auto p-6" style={{ background: 'var(--bg-canvas)' }}>
       <div className="max-w-6xl mx-auto flex flex-col gap-4">
         <div className="flex items-center justify-between flex-wrap gap-2">
-          <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>Integration Schedule</h2>
+          <h2 className="text-lg font-bold tracking-[var(--heading-tracking)]" style={{ color: 'var(--text-primary)' }}>{t('schedulePage.title')}</h2>
           <div className="inline-flex gap-1 p-1" style={{ background: 'var(--bg-surface-alt)', borderRadius: 'var(--radius-card)' }}>
             <button
               className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
               style={subView === 'runs' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
               onClick={() => setSubView('runs')}
             >
-              Upcoming Runs
+              {t('schedulePage.upcomingRuns')}
             </button>
             <button
               className="px-3 py-1 text-sm font-medium rounded-[var(--radius-button)] transition-colors"
               style={subView === 'calendar' ? { background: 'var(--bg-surface)', color: 'var(--primary)', boxShadow: 'var(--shadow-sm)' } : { color: 'var(--text-secondary)' }}
               onClick={() => setSubView('calendar')}
             >
-              Calendar
+              {t('schedulePage.calendar')}
             </button>
           </div>
         </div>
 
         <div className={`${cardClass} p-4`}>
-          <h3 className="font-bold text-sm mb-1" style={{ color: 'var(--text-primary)' }}>Planned Downtimes</h3>
-          <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>Mark a system unavailable for a window - runs below that fall inside it are flagged as impacted.</p>
+          <h3 className="font-bold text-sm mb-1" style={{ color: 'var(--text-primary)' }}>{t('schedulePage.plannedDowntimes')}</h3>
+          <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>{t('schedulePage.plannedDowntimesBlurb')}</p>
 
           <div className="flex flex-col gap-1.5 mb-3">
-            {systemDowntimes.map(dt => (
+            {systemDowntimes.map(dt => {
+              const systemTz = getSystemTimeZone(dt.systemId);
+              return (
               <div key={dt.id} className={`${listItemCardClass} flex items-center justify-between gap-2 px-2 py-1.5 text-sm`}>
                 <div className="flex flex-col min-w-0">
                   <span className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>{getSystemLabel(dt.systemId) || dt.systemId}</span>
                   <span className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
-                    {new Date(dt.startsAt).toLocaleString()} — {new Date(dt.endsAt).toLocaleString()}{dt.reason ? ` · ${dt.reason}` : ''}
+                    {formatInTimeZone(new Date(dt.startsAt), systemTz, locale)} — {formatInTimeZone(new Date(dt.endsAt), systemTz, locale)} ({systemTz}){dt.reason ? ` · ${dt.reason}` : ''}
+                  </span>
+                  <span className="text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>
+                    {t('schedulePage.yourTime')}: {formatInTimeZone(new Date(dt.startsAt), userTimeZone, locale)} — {formatInTimeZone(new Date(dt.endsAt), userTimeZone, locale)} ({userTimeZone})
                   </span>
                 </div>
                 {canWrite && (
@@ -1545,37 +1892,38 @@ function ScheduleView({
                     style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
                     onClick={() => onDeleteDowntime(dt.id)}
                   >
-                    Delete
+                    {t('common.delete')}
                   </button>
                 )}
               </div>
-            ))}
+              );
+            })}
             {systemDowntimes.length === 0 && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No planned downtimes.</p>}
           </div>
 
           {canWrite && (
             <div className="flex flex-wrap items-end gap-2">
               <div>
-                <label className={labelClass}>System</label>
+                <label className={labelClass}>{t('schedulePage.system')}</label>
                 <select className={`${inputClass} w-40`} value={dtSystemId} onChange={(e) => setDtSystemId(e.target.value)}>
-                  <option value="">Select...</option>
+                  <option value="">{t('schedulePage.select')}</option>
                   {systemOptions.map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
                 </select>
               </div>
               <div>
-                <label className={labelClass}>Starts</label>
+                <label className={labelClass}>{t('schedulePage.starts')}</label>
                 <input type="datetime-local" className={`${inputClass} w-auto`} value={dtStart} onChange={(e) => setDtStart(e.target.value)} />
               </div>
               <div>
-                <label className={labelClass}>Ends</label>
+                <label className={labelClass}>{t('schedulePage.ends')}</label>
                 <input type="datetime-local" className={`${inputClass} w-auto`} value={dtEnd} onChange={(e) => setDtEnd(e.target.value)} />
               </div>
               <div className="flex-1 min-w-[140px]">
-                <label className={labelClass}>Reason</label>
-                <input type="text" className={inputClass} placeholder="e.g. Planned maintenance" value={dtReason} onChange={(e) => setDtReason(e.target.value)} />
+                <label className={labelClass}>{t('schedulePage.reason')}</label>
+                <input type="text" className={inputClass} placeholder={t('schedulePage.reasonPlaceholder')} value={dtReason} onChange={(e) => setDtReason(e.target.value)} />
               </div>
               <button className={buttonSecondaryClass} onClick={submitDowntime}>
-                <Plus size={14} />Add Downtime
+                <Plus size={14} />{t('schedulePage.addDowntime')}
               </button>
             </div>
           )}
@@ -1587,19 +1935,85 @@ function ScheduleView({
   );
 }
 
+type AppView = 'canvas' | 'inventory' | 'schedule' | 'settings';
+type InventoryTab = 'systems' | 'objects' | 'lists';
+
+type AppRoute = {
+  view: AppView;
+  canvasSystemId: string | null;
+  canvasObjectId: string | null;
+  canvasEdgePair: [string, string] | null;
+  inventoryTab: InventoryTab;
+  inventorySystemId: string | null;
+  inventoryObjectId: string | null;
+};
+
+// Reads which page - and, where relevant, which system/object/edge is open for editing - the URL
+// currently points at, so a refresh (or a link copied and sent to a teammate) lands back on the
+// same view instead of always resetting to the canvas.
+function parseRouteFromLocation(): AppRoute {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get('view');
+  const validView: AppView = view === 'inventory' || view === 'schedule' || view === 'settings' ? view : 'canvas';
+  const tab = params.get('tab');
+  const validTab: InventoryTab = tab === 'objects' || tab === 'lists' ? tab : 'systems';
+  const edgeIds = params.get('edge')?.split(',');
+
+  return {
+    view: validView,
+    canvasSystemId: validView === 'canvas' ? params.get('system') : null,
+    canvasObjectId: validView === 'canvas' ? params.get('object') : null,
+    canvasEdgePair: validView === 'canvas' && edgeIds?.length === 2 ? [edgeIds[0], edgeIds[1]] : null,
+    inventoryTab: validTab,
+    inventorySystemId: validView === 'inventory' && validTab === 'systems' ? params.get('system') : null,
+    inventoryObjectId: validView === 'inventory' && validTab === 'objects' ? params.get('object') : null,
+  };
+}
+
+// The inverse of parseRouteFromLocation - serializes the current view/selection into the address
+// bar's query string via replaceState, so normal clicking around updates the shareable URL without
+// filling up the browser's back-button history with every intermediate selection.
+function syncRouteToLocation(route: AppRoute) {
+  const params = new URLSearchParams();
+  if (route.view !== 'canvas') params.set('view', route.view);
+
+  if (route.view === 'canvas') {
+    if (route.canvasSystemId) params.set('system', route.canvasSystemId);
+    else if (route.canvasObjectId) params.set('object', route.canvasObjectId);
+    else if (route.canvasEdgePair) params.set('edge', route.canvasEdgePair.join(','));
+  } else if (route.view === 'inventory') {
+    if (route.inventoryTab !== 'systems') params.set('tab', route.inventoryTab);
+    if (route.inventoryTab === 'systems' && route.inventorySystemId) params.set('system', route.inventorySystemId);
+    if (route.inventoryTab === 'objects' && route.inventoryObjectId) params.set('object', route.inventoryObjectId);
+  }
+
+  const query = params.toString();
+  const newSearch = query ? `?${query}` : '';
+  if (newSearch !== window.location.search) {
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}${newSearch}${window.location.hash}`);
+  }
+}
+
 function AppContent() {
   const { tokens } = useTheme();
   const { user, logout } = useAuth();
+  const { t } = useI18n();
   const canWrite = canEdit(user?.role);
+  // Parsed once on mount so a refresh - or a URL a teammate was sent - opens straight back into
+  // the same page and selection, rather than always landing on the canvas.
+  const [initialRoute] = useState(() => parseRouteFromLocation());
   const [nodes, setNodes] = useNodesState<SystemNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<IntegrationEdge>([]);
   const [dataObjects, setDataObjects] = useState<DataObject[]>([]);
   const [integrationTypes, setIntegrationTypes] = useState<ReferenceListItem[]>([]);
   const [integrationSoftwareList, setIntegrationSoftwareList] = useState<ReferenceListItem[]>([]);
-  const [integrationFrequencies, setIntegrationFrequencies] = useState<ReferenceListItem[]>([]);
   const [edgeObjectDetails, setEdgeObjectDetails] = useState<Record<string, EdgeObjectDetail>>({});
   const [systemDowntimes, setSystemDowntimes] = useState<SystemDowntime[]>([]);
-  const [view, setView] = useState<'canvas' | 'inventory' | 'schedule' | 'settings'>('canvas');
+  const [teamRoster, setTeamRoster] = useState<TeamRosterUser[]>([]);
+  const [view, setView] = useState<AppView>(initialRoute.view);
+  const [inventoryTab, setInventoryTab] = useState<InventoryTab>(initialRoute.inventoryTab);
+  const [inventoryEditingSystemId, setInventoryEditingSystemId] = useState<string | null>(initialRoute.inventorySystemId);
+  const [inventoryEditingObjectId, setInventoryEditingObjectId] = useState<string | null>(initialRoute.inventoryObjectId);
 
   const [newSystemName, setNewSystemName] = useState('');
   const [newObjectName, setNewObjectName] = useState('');
@@ -1618,12 +2032,13 @@ function AppContent() {
             data: {
               label: s.label,
               layoutPositions: s.layout_positions || {},
-              owner: s.owner || '',
+              ownerIds: s.owner_ids || [],
               status: (s.status as SystemStatus) || 'active',
               criticality: (s.criticality as Criticality) || 'medium',
               businessCapability: s.business_capability || '',
               techStack: s.tech_stack || [],
               description: s.description || '',
+              timeZone: s.time_zone || 'UTC',
             }
           })));
         }
@@ -1632,7 +2047,7 @@ function AppContent() {
             id: o.id,
             name: o.name,
             masterSystemId: o.master_system_id,
-            aliases: o.aliases || {},
+            systemObjectNames: o.system_object_names || {},
             description: o.description || '',
             classification: (o.classification as DataObjectClassification) || 'internal',
           })));
@@ -1645,23 +2060,27 @@ function AppContent() {
             data: {
               dataObjectIds: e.data_object_ids,
               description: e.description || '',
+              ownerIds: e.owner_ids || [],
             },
             markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
             style: { stroke: tokens.edgeColor, strokeWidth: 2 },
           })));
         }
         if (data.integrationTypes) setIntegrationTypes(data.integrationTypes);
-        if (data.integrationSoftware) setIntegrationSoftwareList(data.integrationSoftware);
-        if (data.integrationFrequencies) setIntegrationFrequencies(data.integrationFrequencies);
+        if (data.integrationSoftware) {
+          setIntegrationSoftwareList(data.integrationSoftware.map((s: { id: string; name: string; time_zone?: string }) => ({
+            id: s.id, name: s.name, timeZone: s.time_zone || 'UTC',
+          })));
+        }
         if (data.edgeObjectDetails) {
           const map: Record<string, EdgeObjectDetail> = {};
           data.edgeObjectDetails.forEach((d: RawEdgeObjectDetailRow) => {
             map[edgeObjectDetailKey(d.edge_id, d.data_object_id)] = {
               sourcePattern: d.source_pattern || '',
               targetPattern: d.target_pattern || '',
-              frequencyIds: d.frequency_ids || [],
-              integrationTypeIds: d.integration_type_ids || [],
-              integrationSoftwareIds: d.integration_software_ids || [],
+              schedule: d.schedule || DEFAULT_SCHEDULE,
+              integrationTypeId: d.integration_type_id || '',
+              integrationSoftwareId: d.integration_software_id || '',
               atRisk: d.at_risk || false,
             };
           });
@@ -1682,6 +2101,15 @@ function AppContent() {
     // every render regardless, so `tokens` doesn't need to be a dependency here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setNodes, setEdges]);
+
+  // Every signed-in user needs the team roster to populate an owner picker (not just admins, since
+  // a system/integration's own current owners can manage that one resource's owner list too).
+  React.useEffect(() => {
+    apiFetch('/team-roster')
+      .then(res => res.json())
+      .then(data => setTeamRoster(data.users || []))
+      .catch(err => console.error('Failed to load team roster', err));
+  }, []);
 
   // ---------------------------------------------------------------------------
   // Persistence: every mutation below is saved as its own granular REST call
@@ -1738,9 +2166,23 @@ function AppContent() {
   // line, and a focused system's junction view renders a spoke per remote using a synthetic
   // junction-node id on one end. Keying selection by the resolved real system pair (see
   // resolveEdgePair) lets both of those visual forms open the same, complete connection panel.
-  const [selectedEdgePair, setSelectedEdgePair] = useState<[string, string] | null>(null);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [selectedObjectIdSidebar, setSelectedObjectIdSidebar] = useState<string | null>(null);
+  const [selectedEdgePair, setSelectedEdgePair] = useState<[string, string] | null>(initialRoute.canvasEdgePair);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(initialRoute.canvasSystemId);
+  const [selectedObjectIdSidebar, setSelectedObjectIdSidebar] = useState<string | null>(initialRoute.canvasObjectId);
+
+  // Keeps the address bar's query string in sync with whatever page/selection is currently open,
+  // so refreshing - or copying the URL and sending it to a teammate with access - reopens it here.
+  React.useEffect(() => {
+    syncRouteToLocation({
+      view,
+      canvasSystemId: selectedNodeId,
+      canvasObjectId: selectedObjectIdSidebar,
+      canvasEdgePair: selectedEdgePair,
+      inventoryTab,
+      inventorySystemId: inventoryEditingSystemId,
+      inventoryObjectId: inventoryEditingObjectId,
+    });
+  }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId]);
   const [pendingEdge, setPendingEdge] = useState<Connection | null>(null);
   const [pendingEdgeObject, setPendingEdgeObject] = useState<string>('');
 
@@ -1793,12 +2235,13 @@ function AppContent() {
       data: {
         label: newSystemName.trim(),
         layoutPositions: { 'global': position },
-        owner: '',
+        ownerIds: user ? [user.id] : [],
         status: 'active',
         criticality: 'medium',
         businessCapability: '',
         techStack: [],
         description: '',
+        timeZone: user?.timeZone || detectBrowserTimeZone(),
       },
       position,
     };
@@ -1806,10 +2249,11 @@ function AppContent() {
     setNewSystemName('');
     apiPost('/systems', {
       id: newNode.id, label: newNode.data.label, x: position.x, y: position.y,
-      layoutPositions: newNode.data.layoutPositions,
+      layoutPositions: newNode.data.layoutPositions, timeZone: newNode.data.timeZone,
+      ownerIds: newNode.data.ownerIds,
     });
     return true;
-  }, [newSystemName, nodes, setNodes, apiPost]);
+  }, [newSystemName, nodes, setNodes, apiPost, user]);
 
   const addObject = useCallback(() => {
     if (!newObjectName || !newObjectMaster) {
@@ -1827,25 +2271,26 @@ function AppContent() {
     // Create master system if it doesn't exist
     if (!masterNode) {
       const position = { x: Math.random() * 400, y: Math.random() * 400 };
+      const ownerIds = user ? [user.id] : [];
       masterNode = {
         id: `sys-${Date.now()}`,
         type: 'eaSystem',
         data: {
           label: masterName,
           layoutPositions: { global: position },
-          owner: '', status: 'active', criticality: 'medium', businessCapability: '', techStack: [], description: '',
+          ownerIds, status: 'active', criticality: 'medium', businessCapability: '', techStack: [], description: '',
         },
         position,
       };
       setNodes((nds) => [...nds, masterNode!]);
-      apiPost('/systems', { id: masterNode.id, label: masterName, x: position.x, y: position.y, layoutPositions: { global: position } });
+      apiPost('/systems', { id: masterNode!.id, label: masterName, x: position.x, y: position.y, layoutPositions: { global: position }, ownerIds });
     }
 
     const newObject: DataObject = {
       id: `obj-${Date.now()}`,
       name: newObjectName.trim(),
       masterSystemId: masterNode!.id,
-      aliases: {},
+      systemObjectNames: {},
       description: '',
       classification: 'internal',
     };
@@ -1854,7 +2299,7 @@ function AppContent() {
     setNewObjectName('');
     setNewObjectMaster('');
     return true;
-  }, [newObjectName, newObjectMaster, dataObjects, nodes, setNodes, apiPost]);
+  }, [newObjectName, newObjectMaster, dataObjects, nodes, setNodes, apiPost, user]);
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -1903,7 +2348,7 @@ function AppContent() {
       } else {
         objectId = `obj-${Date.now()}`;
         // Set the source of the edge as the master system for the new object
-        const newObject: DataObject = { id: objectId, name: objName, masterSystemId: pendingEdge.source, aliases: {}, description: '', classification: 'internal' };
+        const newObject: DataObject = { id: objectId, name: objName, masterSystemId: pendingEdge.source, systemObjectNames: {}, description: '', classification: 'internal' };
         setDataObjects(objs => [...objs, newObject]);
         apiPost('/data-objects', { id: newObject.id, name: newObject.name, masterSystemId: newObject.masterSystemId });
       }
@@ -1921,12 +2366,13 @@ function AppContent() {
       finalTargetHandle = best.targetHandle;
     }
 
+    const ownerIds = user ? [user.id] : [];
     const newEdge: IntegrationEdge = {
       ...pendingEdge,
       sourceHandle: finalSourceHandle,
       targetHandle: finalTargetHandle,
       id: `edge-${Date.now()}`,
-      data: { dataObjectIds: objectId ? [objectId] : [], description: '' },
+      data: { dataObjectIds: objectId ? [objectId] : [], description: '', ownerIds },
       markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
       style: { stroke: tokens.edgeColor, strokeWidth: 2 },
     };
@@ -1934,15 +2380,21 @@ function AppContent() {
     setEdges((eds) => addEdge(newEdge, eds));
     apiPost('/edges', {
       id: newEdge.id, source: newEdge.source, target: newEdge.target,
-      dataObjectIds: newEdge.data!.dataObjectIds,
+      dataObjectIds: newEdge.data!.dataObjectIds, ownerIds,
     });
+    if (objectId) {
+      // Frequency is mandatory per flow, so this new (edge, object) pairing gets a default the
+      // moment it exists rather than being left unconfigured until someone opens the panel.
+      setEdgeObjectDetails(prev => ({ ...prev, [edgeObjectDetailKey(newEdge.id, objectId)]: { schedule: DEFAULT_SCHEDULE } }));
+      apiPatch(`/edges/${newEdge.id}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE });
+    }
     setPendingEdge(null);
     setPendingEdgeObject('');
 
     // Optionally open the right sidebar for this edge
     setSelectedEdgePair([newEdge.source, newEdge.target].sort() as [string, string]);
     setSelectedNodeId(null);
-  }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, apiPost, tokens.edgeColor]);
+  }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, setEdgeObjectDetails, apiPost, apiPatch, tokens.edgeColor, user]);
 
   const toggleObjectOnEdge = useCallback((edgeId: string, objectId: string) => {
     setEdges((eds) =>
@@ -1966,13 +2418,19 @@ function AppContent() {
               delete next[key];
               return next;
             });
+          } else {
+            // Frequency is mandatory per flow, so this new pairing gets a default schedule the
+            // moment it exists rather than being left unconfigured until someone opens the panel.
+            const key = edgeObjectDetailKey(edgeId, objectId);
+            setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], schedule: prev[key]?.schedule || DEFAULT_SCHEDULE } }));
+            apiPatch(`/edges/${edgeId}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE });
           }
           return { ...e, data: { ...e.data, dataObjectIds: newIds } };
         }
         return e;
       })
     );
-  }, [setEdges, apiPatch, apiDelete]);
+  }, [setEdges, setEdgeObjectDetails, apiPatch, apiDelete]);
 
   const getEdgeObjectDetail = useCallback((edgeId: string, objectId: string): EdgeObjectDetail => {
     return edgeObjectDetails[edgeObjectDetailKey(edgeId, objectId)] || {};
@@ -1985,23 +2443,6 @@ function AppContent() {
     setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
     apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: value });
   }, [apiPatch]);
-
-  // Same toggle shape as toggleObjectOnEdge, for the per-object multi-select fields (integration
-  // type(s), software, and frequency/schedule(s)).
-  const toggleEdgeObjectTag = useCallback((
-    edgeId: string,
-    objectId: string,
-    field: 'integrationTypeIds' | 'integrationSoftwareIds' | 'frequencyIds',
-    itemId: string
-  ) => {
-    const key = edgeObjectDetailKey(edgeId, objectId);
-    const currentIds = edgeObjectDetails[key]?.[field] || [];
-    const newIds = currentIds.includes(itemId)
-      ? currentIds.filter((id) => id !== itemId)
-      : [...currentIds, itemId];
-    setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], [field]: newIds } }));
-    apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: newIds });
-  }, [edgeObjectDetails, apiPatch]);
 
   const deleteSelectedEdge = useCallback(() => {
     if (selectedEdgeGroup.length > 0) {
@@ -2072,12 +2513,12 @@ function AppContent() {
     scheduleSave(`object-name-${objId}`, () => apiPatch(`/data-objects/${objId}`, { name: newName }));
   }, [setDataObjects, scheduleSave, apiPatch]);
 
-  const setSystemAlias = useCallback((objId: string, sysId: string, alias: string) => {
+  const setSystemObjectName = useCallback((objId: string, sysId: string, entry: SystemObjectName) => {
     setDataObjects(objs => objs.map(o => {
       if (o.id === objId) {
-        const aliases = { ...(o.aliases || {}), [sysId]: alias };
-        scheduleSave(`object-aliases-${objId}`, () => apiPatch(`/data-objects/${objId}`, { aliases }));
-        return { ...o, aliases };
+        const systemObjectNames = { ...(o.systemObjectNames || {}), [sysId]: entry };
+        scheduleSave(`object-system-names-${objId}`, () => apiPatch(`/data-objects/${objId}`, { systemObjectNames }));
+        return { ...o, systemObjectNames };
       }
       return o;
     }));
@@ -2137,13 +2578,6 @@ function AppContent() {
     apiDelete(`/${path}/${id}`);
   }, [apiDelete]);
 
-  // Only Integration Frequencies carry a schedule, so this doesn't need the generic multi-list
-  // plumbing above - it always targets integrationFrequencies directly.
-  const updateFrequencySchedule = useCallback((id: string, schedule: ScheduleDef) => {
-    setIntegrationFrequencies(items => items.map(item => item.id === id ? { ...item, schedule } : item));
-    apiPatch(`/integration-frequencies/${id}`, { schedule });
-  }, [apiPatch]);
-
   const addDowntime = useCallback((systemId: string, startsAt: string, endsAt: string, reason: string) => {
     if (!systemId || !startsAt || !endsAt) return;
     const id = `downtime-${Date.now()}`;
@@ -2158,11 +2592,10 @@ function AppContent() {
   }, [apiDelete]);
 
   // Thin adapters so InventoryView (which doesn't know about each list's individual setState
-  // function or id prefix) can address any of the three lists by name alone.
+  // function or id prefix) can address either list by name alone.
   const referenceListSetters = useMemo((): Record<ReferenceListId, [React.Dispatch<React.SetStateAction<ReferenceListItem[]>>, string]> => ({
     'integration-types': [setIntegrationTypes, 'itype'],
     'integration-software': [setIntegrationSoftwareList, 'isw'],
-    'integration-frequencies': [setIntegrationFrequencies, 'ifreq'],
   }), []);
 
   const handleAddReferenceItem = useCallback((list: ReferenceListId, name: string) => {
@@ -2175,10 +2608,12 @@ function AppContent() {
     renameReferenceListItem(list, setList, id, name);
   }, [renameReferenceListItem, referenceListSetters]);
 
-  const handleDeleteReferenceItem = useCallback((list: ReferenceListId, id: string) => {
-    const [setList] = referenceListSetters[list];
-    deleteReferenceListItem(list, setList, id);
-  }, [deleteReferenceListItem, referenceListSetters]);
+  // Integration Software is the only reference list with a field beyond {id, name} - its shared
+  // time zone - so it gets its own small update path rather than the generic rename plumbing.
+  const handleUpdateSoftwareTimeZone = useCallback((id: string, timeZone: string) => {
+    setIntegrationSoftwareList(items => items.map(item => item.id === id ? { ...item, timeZone } : item));
+    apiPatch(`/integration-software/${id}`, { timeZone });
+  }, [apiPatch]);
 
   const handleInventorySelect = useCallback((sysId: string) => {
     setSelectedNodeId(sysId);
@@ -2224,30 +2659,30 @@ function AppContent() {
     return multiple;
   }, [edges, dataObjects]);
 
-  // Objects that share the same alias within a given system represent the same record type there
+  // Objects that share the same name within a given system represent the same record type there
   // (e.g. Workday's "Employee Bank Details" and Coupa's "Supplier Bank Details" both landing as
   // NetSuite's "Bank Details" record) even though each keeps its own independent master - this is
   // a deliberate convergence, not the multi-master conflict tracked above. Maps `${objId}::${sysId}`
-  // to the shared alias so edges touching that system can be visually bundled under it.
+  // to the shared name so edges touching that system can be visually bundled under it.
   const recordTypeGroupsByObject = useMemo(() => {
-    const bySysAlias = new Map<string, Map<string, Set<string>>>();
+    const bySysName = new Map<string, Map<string, Set<string>>>();
     for (const obj of dataObjects) {
-      if (!obj.aliases) continue;
-      for (const [sysId, aliasRaw] of Object.entries(obj.aliases)) {
-        const alias = aliasRaw?.trim();
-        if (!alias) continue;
-        if (!bySysAlias.has(sysId)) bySysAlias.set(sysId, new Map());
-        const aliasMap = bySysAlias.get(sysId)!;
-        if (!aliasMap.has(alias)) aliasMap.set(alias, new Set());
-        aliasMap.get(alias)!.add(obj.id);
+      if (!obj.systemObjectNames) continue;
+      for (const [sysId, entry] of Object.entries(obj.systemObjectNames)) {
+        const name = entry?.name?.trim();
+        if (!name) continue;
+        if (!bySysName.has(sysId)) bySysName.set(sysId, new Map());
+        const nameMap = bySysName.get(sysId)!;
+        if (!nameMap.has(name)) nameMap.set(name, new Set());
+        nameMap.get(name)!.add(obj.id);
       }
     }
 
     const result = new Map<string, string>();
-    bySysAlias.forEach((aliasMap, sysId) => {
-      aliasMap.forEach((objIds, alias) => {
+    bySysName.forEach((nameMap, sysId) => {
+      nameMap.forEach((objIds, name) => {
         if (objIds.size > 1) {
-          objIds.forEach(id => result.set(`${id}::${sysId}`, alias));
+          objIds.forEach(id => result.set(`${id}::${sysId}`, name));
         }
       });
     });
@@ -2258,23 +2693,70 @@ function AppContent() {
     for (const objId of objIds) {
       for (const sysId of sysIds) {
         if (!sysId) continue;
-        const alias = recordTypeGroupsByObject.get(`${objId}::${sysId}`);
-        if (alias) return alias;
+        const name = recordTypeGroupsByObject.get(`${objId}::${sysId}`);
+        if (name) return name;
       }
     }
     return undefined;
   }, [recordTypeGroupsByObject]);
 
-  const getAlias = useCallback((objId: string, sysId: string) => {
+  const getSystemObjectName = useCallback((objId: string, sysId: string) => {
     const obj = dataObjects.find(o => o.id === objId);
     if (!obj) return '';
-    return obj.aliases?.[sysId] || obj.name;
+    return obj.systemObjectNames?.[sysId]?.name || obj.name;
   }, [dataObjects]);
 
   const getSystemLabel = useCallback((sysId: string | null | undefined) => {
     const node = nodes.find(n => n.id === sysId);
     return isEaSystemNode(node) ? node.data.label : undefined;
   }, [nodes]);
+
+  const getSystemTimeZone = useCallback((sysId: string | null | undefined) => {
+    const node = nodes.find(n => n.id === sysId);
+    return (isEaSystemNode(node) ? node.data.timeZone : undefined) || 'UTC';
+  }, [nodes]);
+
+  // Every (edge, object) flow currently tagged with a given reference-list item - what gates the
+  // Integration Lists tab's delete flow from silently leaving a flow pointing at a deleted id.
+  const findReferenceItemUsage = useCallback((list: ReferenceListId, itemId: string): ReferenceItemUsage[] => {
+    const field = REFERENCE_LIST_FIELD[list];
+    const usages: ReferenceItemUsage[] = [];
+    Object.entries(edgeObjectDetails).forEach(([key, detail]) => {
+      if (detail[field] !== itemId) return;
+      const [edgeId, objectId] = key.split('::');
+      const edge = edges.find(e => e.id === edgeId);
+      const obj = dataObjects.find(o => o.id === objectId);
+      usages.push({
+        key, edgeId, objectId,
+        edgeLabel: edge ? `${getSystemLabel(edge.source) || edge.source} → ${getSystemLabel(edge.target) || edge.target}` : edgeId,
+        objectName: obj?.name || objectId,
+      });
+    });
+    return usages;
+  }, [edgeObjectDetails, edges, dataObjects, getSystemLabel]);
+
+  // Applies each usage's resolution (a replacement item, or plain removal) before deleting the
+  // reference-list item itself, so no connection is left tagged with an id that no longer exists.
+  const handleResolveAndDeleteReferenceItem = useCallback((
+    list: ReferenceListId,
+    itemId: string,
+    usages: ReferenceItemUsage[],
+    resolutions: Record<string, string | null>
+  ) => {
+    if (usages.length > 0) {
+      const field = REFERENCE_LIST_FIELD[list];
+      const nextDetails = { ...edgeObjectDetails };
+      usages.forEach(u => {
+        const replacement = resolutions[u.key] || '';
+        nextDetails[u.key] = { ...nextDetails[u.key], [field]: replacement };
+        apiPatch(`/edges/${u.edgeId}/objects/${u.objectId}`, { [field]: replacement });
+      });
+      setEdgeObjectDetails(nextDetails);
+    }
+
+    const [setList] = referenceListSetters[list];
+    deleteReferenceListItem(list, setList, itemId);
+  }, [edgeObjectDetails, apiPatch, referenceListSetters, deleteReferenceListItem]);
 
   const { processedNodes, processedEdges } = useMemo(() => {
     let finalNodes: Node[] = [...nodes.filter(n => n.type !== 'junction')]; // Base system nodes
@@ -2286,7 +2768,7 @@ function AppContent() {
       const selectedNode = finalNodes.find(n => n.id === selectedNodeId);
       if (selectedNode) {
         // For a given direction, every remote system must contribute exactly one line into/out of
-        // the selected node - otherwise a remote with several differently-aliased flows ends up
+        // the selected node - otherwise a remote with several differently-named flows ends up
         // drawn as both a direct edge AND a junction spoke occupying the same path. So we first
         // bucket edges by remote system (one line per remote), then group remotes that share an
         // identical combined local label - only those groups are genuine fan-in/fan-out and need
@@ -2305,7 +2787,7 @@ function AppContent() {
           byRemote.forEach((es, remoteId) => {
             const objIds = new Set<string>();
             es.forEach(e => e.data?.dataObjectIds?.forEach(id => objIds.add(id)));
-            remoteLocalLabel.set(remoteId, Array.from(objIds).map(id => getAlias(id, selectedNodeId)).join(', ') || 'Unknown');
+            remoteLocalLabel.set(remoteId, Array.from(objIds).map(id => getSystemObjectName(id, selectedNodeId)).join(', ') || 'Unknown');
           });
 
           const labelGroups = new Map<string, string[]>();
@@ -2319,7 +2801,7 @@ function AppContent() {
 
             // A junction only earns its keep when it declutters a genuine fan-in/fan-out of
             // multiple remote systems. A single remote is always a plain 1:1 link - even if its
-            // aliases differ from the selected node's naming - and is drawn as a normal
+            // name there differs from the selected node's naming - and is drawn as a normal
             // (possibly consolidated) edge in the standard-edges pass below.
             if (remoteIds.length === 1) {
               return;
@@ -2395,7 +2877,7 @@ function AppContent() {
                 const remoteEdges = byRemote.get(remoteId)!;
                 const remoteObjIds = new Set<string>();
                 remoteEdges.forEach(e => e.data?.dataObjectIds?.forEach(id => remoteObjIds.add(id)));
-                const remoteLabel = Array.from(remoteObjIds).map(id => getAlias(id, remoteId)).join(', ');
+                const remoteLabel = Array.from(remoteObjIds).map(id => getSystemObjectName(id, remoteId)).join(', ');
                 finalEdges.push({
                   ...baseEdgeStyle,
                   id: `${juncId}-sub-${i}`,
@@ -2424,7 +2906,7 @@ function AppContent() {
                 const remoteEdges = byRemote.get(remoteId)!;
                 const remoteObjIds = new Set<string>();
                 remoteEdges.forEach(e => e.data?.dataObjectIds?.forEach(id => remoteObjIds.add(id)));
-                const remoteLabel = Array.from(remoteObjIds).map(id => getAlias(id, remoteId)).join(', ');
+                const remoteLabel = Array.from(remoteObjIds).map(id => getSystemObjectName(id, remoteId)).join(', ');
                 finalEdges.push({
                   ...baseEdgeStyle,
                   id: `${juncId}-sub-${i}`,
@@ -2477,7 +2959,7 @@ function AppContent() {
       }
 
       if (group.length === 1) {
-        const labels = e.data?.dataObjectIds?.map(id => getAlias(id, e.source)).join(', ') || '';
+        const labels = e.data?.dataObjectIds?.map(id => getSystemObjectName(id, e.source)).join(', ') || '';
         const displayLabel = recordType ? `${labels} → ${recordType}` : labels;
         finalEdges.push({
           ...e,
@@ -2500,7 +2982,7 @@ function AppContent() {
         group.forEach(ge => {
           if (ge.source === e.source) hasForward = true;
           if (ge.source === e.target) hasBackward = true;
-          ge.data?.dataObjectIds?.forEach(id => allLabels.add(getAlias(id, ge.source)));
+          ge.data?.dataObjectIds?.forEach(id => allLabels.add(getSystemObjectName(id, ge.source)));
         });
 
         const labels = Array.from(allLabels).filter(Boolean);
@@ -2605,12 +3087,63 @@ function AppContent() {
     }) as SystemNode[];
 
     return { processedNodes: finalNodes, processedEdges: finalEdges as IntegrationEdge[] };
-  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getAlias, getRecordTypeGroup, getClosestHandles, tokens]);
+  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getSystemObjectName, getRecordTypeGroup, getClosestHandles, tokens]);
 
   const primaryEdge = selectedEdgeGroup[0];
   const selectedSystemNode = nodes.find(n => n.id === selectedNodeId);
   const selectedSystemData = isEaSystemNode(selectedSystemNode) ? selectedSystemNode.data : undefined;
   const selectedObject = selectedObjectIdSidebar ? dataObjects.find(o => o.id === selectedObjectIdSidebar) : undefined;
+
+  // Audit trail: pings a "view" event for whichever record's detail panel is now on screen -
+  // covers every way of getting there (canvas click, Inventory's "show on canvas" eye icon, or
+  // restoring a shared/deep-linked URL on page load), since they all funnel through these same
+  // three selection states. Deliberately not tied to the underlying /api/systems, /api/edges, or
+  // /api/data-objects list fetches, which fire on every canvas/Inventory load and would otherwise
+  // flood the trail with "views" nobody actually looked at.
+  //
+  // Each effect below is keyed only on the *id* (selectedNodeId/selectedEdgePair/
+  // selectedObjectIdSidebar), never on `nodes`/`dataObjects` or anything derived from them
+  // (getSystemLabel, selectedObject) - those are recreated on every autosave/poll/drag even when
+  // the selection itself hasn't changed, and including them here would re-log a "view" on every
+  // one of those instead of only on an actual selection change. `nodesRef`/`dataObjectsRef` (kept
+  // current on every render, read only inside the effects) let the label still be resolved fresh
+  // without pulling either array into a dependency array.
+  const nodesRef = useRef(nodes);
+  const dataObjectsRef = useRef(dataObjects);
+  // Refs can't be written during render (only read/written from an effect or event handler) - two
+  // dependency-less effects keep them current after every render, ordered ahead of the selection-
+  // ping effects below so those always read an already-fresh value within the same commit.
+  useEffect(() => { nodesRef.current = nodes; });
+  useEffect(() => { dataObjectsRef.current = dataObjects; });
+
+  useEffect(() => {
+    if (!selectedNodeId) return;
+    const node = nodesRef.current.find(n => n.id === selectedNodeId);
+    logAuditView('system', selectedNodeId, isEaSystemNode(node) ? node.data.label : selectedNodeId);
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    if (!selectedEdgePair) return;
+    const labelOf = (id: string) => {
+      const node = nodesRef.current.find(n => n.id === id);
+      return isEaSystemNode(node) ? node.data.label : id;
+    };
+    logAuditView('edge', selectedEdgePair.join(':'), `${labelOf(selectedEdgePair[0])} → ${labelOf(selectedEdgePair[1])}`);
+  }, [selectedEdgePair]);
+
+  useEffect(() => {
+    if (!selectedObjectIdSidebar) return;
+    const obj = dataObjectsRef.current.find(o => o.id === selectedObjectIdSidebar);
+    logAuditView('data_object', selectedObjectIdSidebar, obj?.name || selectedObjectIdSidebar);
+  }, [selectedObjectIdSidebar]);
+
+  // Coarser "which page/tab is open" view logging, alongside (not instead of) the record-level
+  // pings above - covers Canvas, Schedule, and each Inventory tab, which don't have a more specific
+  // record to attribute a view to when nothing on them is individually selected.
+  useEffect(() => {
+    const pageId = view === 'inventory' ? `inventory/${inventoryTab}` : view;
+    logAuditView('page', pageId, pageId);
+  }, [view, inventoryTab]);
 
   const onContextAwareNodesChange = useCallback((changes: NodeChange[]) => {
     setNodes((prevNodes) => {
@@ -2685,6 +3218,14 @@ function AppContent() {
 
   return (
     <div className="w-full h-screen flex flex-col relative" style={{ fontFamily: 'var(--font-sans)' }}>
+      {/* Confidentiality notice - reminds users this is proprietary POC material, not something to reuse independently */}
+      <div
+        className="absolute bottom-4 left-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none opacity-60"
+        style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
+      >
+        Confidential — Proprietary POC, do not distribute
+      </div>
+
       {/* Subtle save banner */}
       {(pendingSaves > 0 || saveSuccess) && (
         <div
@@ -2754,28 +3295,28 @@ function AppContent() {
             style={view === 'canvas' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('canvas')}
           >
-            <Workflow size={14} />Canvas
+            <Workflow size={14} />{t('nav.canvas')}
           </button>
           <button
             className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
             style={view === 'inventory' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('inventory')}
           >
-            <Table size={14} />Inventory
+            <Table size={14} />{t('nav.inventory')}
           </button>
           <button
             className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
             style={view === 'schedule' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('schedule')}
           >
-            <Calendar size={14} />Schedule
+            <Calendar size={14} />{t('nav.schedule')}
           </button>
           <button
             className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
             style={view === 'settings' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
             onClick={() => setView('settings')}
           >
-            <SettingsIcon size={14} />Settings
+            <SettingsIcon size={14} />{t('nav.settings')}
           </button>
         </div>
 
@@ -2785,7 +3326,7 @@ function AppContent() {
             <button
               className="p-1.5 rounded-full transition-colors"
               style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
-              title="Log out"
+              title={t('nav.logout')}
               onClick={() => logout()}
             >
               <LogOut size={14} />
@@ -2805,22 +3346,22 @@ function AppContent() {
             <>
               <Popover
                 trigger={({ toggle }) => (
-                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />Add System</button>
+                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />{t('canvas.addSystem')}</button>
                 )}
               >
                 {(close) => (
                   <div className="flex flex-col gap-3">
-                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>New System</h3>
+                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newSystem')}</h3>
                     <input
                       autoFocus
                       className={inputClass}
-                      placeholder="System name"
+                      placeholder={t('canvas.systemNamePlaceholder')}
                       value={newSystemName}
                       onChange={(e) => setNewSystemName(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter' && addSystem()) close(); }}
                     />
                     <button className={buttonPrimaryClass} onClick={() => { if (addSystem()) close(); }}>
-                      <Plus size={14} />Add System
+                      <Plus size={14} />{t('canvas.addSystem')}
                     </button>
                   </div>
                 )}
@@ -2828,16 +3369,16 @@ function AppContent() {
 
               <Popover
                 trigger={({ toggle }) => (
-                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />Add Object</button>
+                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />{t('canvas.addObject')}</button>
                 )}
               >
                 {(close) => (
                   <div className="flex flex-col gap-3">
-                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>New Data Object</h3>
+                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newObject')}</h3>
                     <input
                       autoFocus
                       className={inputClass}
-                      placeholder="Object name"
+                      placeholder={t('canvas.objectNamePlaceholder')}
                       value={newObjectName}
                       onChange={(e) => setNewObjectName(e.target.value)}
                     />
@@ -2846,11 +3387,11 @@ function AppContent() {
                       value={newObjectMaster}
                       onChange={(e) => setNewObjectMaster(e.target.value)}
                     >
-                      <option value="" disabled>Master system</option>
+                      <option value="" disabled>{t('canvas.masterSystemPlaceholder')}</option>
                       {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
                     </select>
                     <button className={buttonPrimaryClass} onClick={() => { if (addObject()) close(); }}>
-                      <Plus size={14} />Add Object
+                      <Plus size={14} />{t('canvas.addObject')}
                     </button>
                   </div>
                 )}
@@ -2866,7 +3407,7 @@ function AppContent() {
               className={`${inputClass} pl-8 w-40`}
               value={filterSystemId}
               onChange={(e) => setFilterSystemId(e.target.value)}
-              placeholder="Filter by system"
+              placeholder={t('canvas.filterBySystem')}
               list="filter-systems-list"
             />
             <datalist id="filter-systems-list">
@@ -2880,13 +3421,13 @@ function AppContent() {
               className={`${inputClass} pl-8 w-40`}
               value={filterObjectId}
               onChange={(e) => setFilterObjectId(e.target.value)}
-              placeholder="Filter by object"
+              placeholder={t('canvas.filterByObject')}
               list="filter-objects-list"
             />
             <datalist id="filter-objects-list">
               {dataObjects.map(o => {
-                const aliasValues = Object.values(o.aliases || {}).join(', ');
-                return <option key={o.id} value={o.id}>{o.name} {aliasValues ? `(${aliasValues})` : ''}</option>;
+                const systemNames = Object.values(o.systemObjectNames || {}).map(e => e.name).filter(Boolean).join(', ');
+                return <option key={o.id} value={o.id}>{o.name} {systemNames ? `(${systemNames})` : ''}</option>;
               })}
             </datalist>
           </div>
@@ -2913,7 +3454,7 @@ function AppContent() {
           edges={edges}
           renameSystem={renameSystem}
           updateSystemField={updateSystemField}
-          setSystemAlias={setSystemAlias}
+          setSystemObjectName={setSystemObjectName}
           deleteObject={deleteObject}
           deleteSystem={deleteSystem}
           renameObjectGlobal={renameObjectGlobal}
@@ -2921,11 +3462,19 @@ function AppContent() {
           canWrite={canWrite}
           integrationTypes={integrationTypes}
           integrationSoftwareList={integrationSoftwareList}
-          integrationFrequencies={integrationFrequencies}
           onAddReferenceItem={handleAddReferenceItem}
           onRenameReferenceItem={handleRenameReferenceItem}
-          onDeleteReferenceItem={handleDeleteReferenceItem}
-          onUpdateFrequencySchedule={updateFrequencySchedule}
+          onUpdateSoftwareTimeZone={handleUpdateSoftwareTimeZone}
+          findReferenceItemUsage={findReferenceItemUsage}
+          onResolveAndDeleteReferenceItem={handleResolveAndDeleteReferenceItem}
+          subView={inventoryTab}
+          setSubView={setInventoryTab}
+          editingSystemId={inventoryEditingSystemId}
+          setEditingSystemId={setInventoryEditingSystemId}
+          editingObjectId={inventoryEditingObjectId}
+          setEditingObjectId={setInventoryEditingObjectId}
+          currentUserId={user?.id}
+          teamRoster={teamRoster}
         />
       ) : view === 'schedule' ? (
         <ScheduleView
@@ -2933,9 +3482,9 @@ function AppContent() {
           edges={edges}
           dataObjects={dataObjects}
           edgeObjectDetails={edgeObjectDetails}
-          integrationFrequencies={integrationFrequencies}
           systemDowntimes={systemDowntimes}
           getSystemLabel={getSystemLabel}
+          getSystemTimeZone={getSystemTimeZone}
           canWrite={canWrite}
           onAddDowntime={addDowntime}
           onDeleteDowntime={deleteDowntime}
@@ -2989,7 +3538,7 @@ function AppContent() {
 
           {selectedEdgePair && primaryEdge ? (
             <>
-              <h2 className={panelHeadingClass}>Connection Data</h2>
+              <h2 className={panelHeadingClass}>{t('connection.data')}</h2>
               {selectedEdgeGroup.length > 1 && (
                 <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
                   This connection is backed by {selectedEdgeGroup.length} separate integration records; the description below is the first one's.
@@ -2997,19 +3546,26 @@ function AppContent() {
               )}
 
               <div>
-                <label className={labelClass}>Description</label>
+                <label className={labelClass}>{t('common.description')}</label>
                 <textarea
                   className={inputClass}
                   rows={2}
                   value={primaryEdge.data?.description || ''}
                   disabled={!canWrite}
                   onChange={(e) => updateEdgeField(primaryEdge.id, 'description', e.target.value, `edge-desc-${primaryEdge.id}`)}
-                  placeholder="What does this integration do?"
+                  placeholder={t('connection.description')}
                 />
               </div>
 
+              <OwnerPicker
+                ownerIds={primaryEdge.data?.ownerIds || []}
+                roster={teamRoster}
+                canManage={canWrite || !!(user && (primaryEdge.data?.ownerIds || []).includes(user.id))}
+                onChange={(ids) => updateEdgeField(primaryEdge.id, 'ownerIds', ids)}
+              />
+
               <div className="text-sm border-t pt-4" style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-subtle)' }}>
-                Select which objects are transferred, and configure each one's own integration mechanics - the same connection can move different objects in different ways.
+                {t('connection.selectObjectsBlurb')}
               </div>
 
               {dataObjects.length === 0 && <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Add data objects first.</p>}
@@ -3018,7 +3574,7 @@ function AppContent() {
                 <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
                 <input
                   type="text"
-                  placeholder="Search objects..."
+                  placeholder={t('connection.searchObjects')}
                   className={`${inputClass} pl-8 mb-2`}
                   value={connectionObjectSearch}
                   onChange={e => setConnectionObjectSearch(e.target.value)}
@@ -3033,7 +3589,9 @@ function AppContent() {
                     if (!connectionObjectSearch) return true;
                     const search = connectionObjectSearch.toLowerCase();
                     if (obj.name.toLowerCase().includes(search)) return true;
-                    return Object.values(obj.aliases || {}).some(alias => alias.toLowerCase().includes(search));
+                    return Object.values(obj.systemObjectNames || {}).some(entry =>
+                      entry.name.toLowerCase().includes(search) || (entry.objectId || '').toLowerCase().includes(search)
+                    );
                   })
                   .slice(0, 100) // Render limit for performance
                   .map((obj) => {
@@ -3066,13 +3624,13 @@ function AppContent() {
                               onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'atRisk', e.target.checked)}
                             />
                             <AlertTriangle size={13} />
-                            At risk if this connection/schedule is interrupted
+                            {t('connection.atRisk')}
                           </label>
 
                           <div className="grid grid-cols-2 gap-2">
                             <div>
                               <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>
-                                Pattern at {getSystemLabel(owningEdge.source) || 'source'}
+                                {t('connection.patternAt', { system: getSystemLabel(owningEdge.source) || 'source' })}
                               </label>
                               <select
                                 className={`${inputClass} px-1.5 py-1 text-xs`}
@@ -3080,13 +3638,13 @@ function AppContent() {
                                 disabled={!canWrite}
                                 onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'sourcePattern', e.target.value)}
                               >
-                                <option value="">Unspecified</option>
+                                <option value="">{t('common.unspecified')}</option>
                                 {INTEGRATION_PATTERN_OPTIONS.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                               </select>
                             </div>
                             <div>
                               <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>
-                                Pattern at {getSystemLabel(owningEdge.target) || 'target'}
+                                {t('connection.patternAt', { system: getSystemLabel(owningEdge.target) || 'target' })}
                               </label>
                               <select
                                 className={`${inputClass} px-1.5 py-1 text-xs`}
@@ -3094,88 +3652,53 @@ function AppContent() {
                                 disabled={!canWrite}
                                 onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'targetPattern', e.target.value)}
                               >
-                                <option value="">Unspecified</option>
+                                <option value="">{t('common.unspecified')}</option>
                                 {INTEGRATION_PATTERN_OPTIONS.map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                               </select>
                             </div>
                           </div>
 
                           <div>
-                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Frequency</label>
-                            <div className="flex flex-wrap gap-1">
-                              {integrationFrequencies.map(item => {
-                                const active = detail.frequencyIds?.includes(item.id);
-                                return (
-                                  <button
-                                    key={item.id}
-                                    type="button"
-                                    disabled={!canWrite}
-                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
-                                    style={active
-                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
-                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
-                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'frequencyIds', item.id)}
-                                  >
-                                    {item.name}
-                                  </button>
-                                );
-                              })}
-                              {integrationFrequencies.length === 0 && (
-                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
-                              )}
-                            </div>
+                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>
+                              {t('connection.frequency')} <span style={{ color: 'var(--danger)' }}>*</span>
+                            </label>
+                            <ScheduleEditor
+                              schedule={detail.schedule || DEFAULT_SCHEDULE}
+                              canWrite={canWrite}
+                              onChange={(schedule) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'schedule', schedule)}
+                            />
                           </div>
 
                           <div>
-                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Integration Type</label>
-                            <div className="flex flex-wrap gap-1">
-                              {integrationTypes.map(item => {
-                                const active = detail.integrationTypeIds?.includes(item.id);
-                                return (
-                                  <button
-                                    key={item.id}
-                                    type="button"
-                                    disabled={!canWrite}
-                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
-                                    style={active
-                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
-                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
-                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'integrationTypeIds', item.id)}
-                                  >
-                                    {item.name}
-                                  </button>
-                                );
-                              })}
-                              {integrationTypes.length === 0 && (
-                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
-                              )}
-                            </div>
+                            <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>{t('connection.integrationType')}</label>
+                            <select
+                              className={`${inputClass} px-1.5 py-1 text-xs`}
+                              value={detail.integrationTypeId || ''}
+                              disabled={!canWrite}
+                              onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'integrationTypeId', e.target.value)}
+                            >
+                              <option value="">{t('common.unspecified')}</option>
+                              {integrationTypes.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+                            </select>
+                            {integrationTypes.length === 0 && (
+                              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{t('common.noneDefinedYet')}</span>
+                            )}
                           </div>
 
                           <div>
-                            <label className="block text-[10px] font-bold mb-1" style={{ color: 'var(--text-muted)' }}>Integration Software</label>
-                            <div className="flex flex-wrap gap-1">
-                              {integrationSoftwareList.map(item => {
-                                const active = detail.integrationSoftwareIds?.includes(item.id);
-                                return (
-                                  <button
-                                    key={item.id}
-                                    type="button"
-                                    disabled={!canWrite}
-                                    className="text-[11px] px-1.5 py-0.5 rounded-full border transition-colors disabled:opacity-60"
-                                    style={active
-                                      ? { background: 'var(--primary-container)', color: 'var(--on-primary-container)', borderColor: 'var(--primary)' }
-                                      : { background: 'var(--bg-surface)', color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
-                                    onClick={() => toggleEdgeObjectTag(owningEdgeId, obj.id, 'integrationSoftwareIds', item.id)}
-                                  >
-                                    {item.name}
-                                  </button>
-                                );
-                              })}
-                              {integrationSoftwareList.length === 0 && (
-                                <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>None defined yet — add some from Inventory.</span>
-                              )}
-                            </div>
+                            <label className="block text-[10px] font-bold mb-0.5" style={{ color: 'var(--text-muted)' }}>{t('connection.integrationSoftware')}</label>
+                            <select
+                              className={`${inputClass} px-1.5 py-1 text-xs`}
+                              value={detail.integrationSoftwareId || ''}
+                              disabled={!canWrite}
+                              onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'integrationSoftwareId', e.target.value)}
+                            >
+                              <option value="">{t('common.unspecified')}</option>
+                              {integrationSoftwareList.map(item => <option key={item.id} value={item.id}>{`${item.name} (${item.timeZone || 'UTC'})`}</option>)}
+                            </select>
+                            {integrationSoftwareList.length === 0 && (
+                              <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{t('common.noneDefinedYet')}</span>
+                            )}
                           </div>
                         </div>
                       )}
@@ -3189,7 +3712,7 @@ function AppContent() {
                   className={`${buttonDangerClass} mt-8`}
                   onClick={deleteSelectedEdge}
                 >
-                  <Trash2 size={14} />Delete Connection
+                  <Trash2 size={14} />{t('connection.deleteConnection')}
                 </button>
               )}
             </>
@@ -3200,10 +3723,12 @@ function AppContent() {
               objectsInSystem={objectsInSelectedSystem}
               renameSystem={renameSystem}
               updateSystemField={updateSystemField}
-              setSystemAlias={setSystemAlias}
+              setSystemObjectName={setSystemObjectName}
               deleteObject={deleteObject}
               onDelete={() => { deleteSystem(selectedNodeId); setSelectedNodeId(null); }}
               readOnly={!canWrite}
+              teamRoster={teamRoster}
+              canManageOwners={canWrite || !!(user && (selectedSystemData?.ownerIds || []).includes(user.id))}
             />
           ) : selectedObject ? (
             <ObjectDetailsPanel
@@ -3213,16 +3738,16 @@ function AppContent() {
               onBack={() => setSelectedObjectIdSidebar(null)}
               renameObjectGlobal={renameObjectGlobal}
               updateObjectField={updateObjectField}
-              setSystemAlias={setSystemAlias}
+              setSystemObjectName={setSystemObjectName}
               onDelete={() => { deleteObject(selectedObject.id); setSelectedObjectIdSidebar(null); }}
               readOnly={!canWrite}
             />
           ) : (
             <div className="flex flex-col items-center text-center gap-2 mt-12 px-4">
               <MousePointerClick size={28} style={{ color: 'var(--text-muted)' }} />
-              <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>Nothing selected</p>
+              <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>{t('canvas.nothingSelected')}</p>
               <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                Click a system or connection on the canvas to view its details, or browse and edit every data object from the <span className="font-semibold">Inventory</span> page.
+                {t('canvas.nothingSelectedBlurb')}
               </p>
             </div>
           )}
@@ -3237,7 +3762,9 @@ function AppContent() {
 export default function App() {
   return (
     <AuthGate>
-      <AppContent />
+      <NdaGate>
+        <AppContent />
+      </NdaGate>
     </AuthGate>
   );
 }

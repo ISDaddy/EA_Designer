@@ -1,6 +1,12 @@
 # EA Designer
 
-A visual designer for mapping enterprise systems and the data flowing between them. Add systems (ArchiMate-styled application components) with ownership/lifecycle/criticality metadata, define data objects with a master system and per-system aliases, and draw integrations between systems - the canvas auto-declutters multi-system fan-in/fan-out into junction nodes and flags data objects with more than one apparent master in red.
+> **Confidential - Proof of Concept.** This repository and the application it builds are proprietary and provided
+> solely for evaluation. Anyone with access must accept the in-app NDA (`server/nda.js`) before using the app, and
+> may not copy, reuse, or build on this code or design independently of that agreement. See `server/nda.js` for the
+> full terms - it is a starting template, not vetted legal advice, and should be reviewed by a lawyer before this
+> is relied on to actually protect the project.
+
+A visual designer for mapping enterprise systems and the data flowing between them. Add systems (ArchiMate-styled application components) with ownership/lifecycle/criticality metadata, define data objects with a master system and, per system, the name and object id that system knows the object by, and draw integrations between systems - the canvas auto-declutters multi-system fan-in/fan-out into junction nodes and flags data objects with more than one apparent master in red.
 
 Two views over the same landscape:
 - **Canvas** - the visual node-and-edge diagram, with a focus mode (click a system) that declutters its connections.

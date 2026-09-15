@@ -1,6 +1,6 @@
-// Turns an Integration Frequency's structured `schedule` into actual points in time, so the
-// Schedule page can show real upcoming runs (and cross-reference them against planned downtimes)
-// instead of just a descriptive label like "Batch - Hourly" that a computer can't act on.
+// Turns one integration flow's mandatory, structured `schedule` into actual points in time, so
+// the Schedule page can show real upcoming runs (and cross-reference them against planned
+// downtimes) instead of just a descriptive label like "Batch - Hourly" that a computer can't act on.
 import { CronExpressionParser } from 'cron-parser';
 
 export type ScheduleDef =

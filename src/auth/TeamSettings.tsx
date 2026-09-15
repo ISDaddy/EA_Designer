@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertCircle, Check, Copy, LogOut, Send, Trash2 } from 'lucide-react';
+import { AlertCircle, Check, Copy, LogOut, Send, ShieldCheck, ShieldAlert, Trash2 } from 'lucide-react';
 import { apiFetch, parseJsonOrError } from '../api';
 import { inputClass, buttonPrimaryClass, buttonSecondaryClass, labelClass } from '../ui';
 import { useAuth } from './useAuth';
@@ -13,6 +13,8 @@ type TeamUser = {
   role: Role;
   created_at: string;
   last_login_at: string | null;
+  nda_accepted_version: string | null;
+  nda_accepted_at: string | null;
 };
 
 type Invite = {
@@ -32,6 +34,7 @@ export function TeamSettings() {
   const { user, logout } = useAuth();
   const [users, setUsers] = useState<TeamUser[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
+  const [ndaVersion, setNdaVersion] = useState<string | null>(null);
   const [loadError, setLoadError] = useState('');
 
   const [inviteEmail, setInviteEmail] = useState('');
@@ -43,9 +46,10 @@ export function TeamSettings() {
   const loadAll = useCallback(async () => {
     try {
       const [usersRes, invitesRes] = await Promise.all([apiFetch('/users'), apiFetch('/invites')]);
-      const usersData = (await parseJsonOrError(usersRes)) as { users: TeamUser[] };
+      const usersData = (await parseJsonOrError(usersRes)) as { users: TeamUser[]; ndaVersion: string };
       const invitesData = (await parseJsonOrError(invitesRes)) as { invites: Invite[] };
       setUsers(usersData.users);
+      setNdaVersion(usersData.ndaVersion);
       setInvites(invitesData.invites);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Failed to load the team.');
@@ -60,10 +64,11 @@ export function TeamSettings() {
     (async () => {
       try {
         const [usersRes, invitesRes] = await Promise.all([apiFetch('/users'), apiFetch('/invites')]);
-        const usersData = (await parseJsonOrError(usersRes)) as { users: TeamUser[] };
+        const usersData = (await parseJsonOrError(usersRes)) as { users: TeamUser[]; ndaVersion: string };
         const invitesData = (await parseJsonOrError(invitesRes)) as { invites: Invite[] };
         if (cancelled) return;
         setUsers(usersData.users);
+        setNdaVersion(usersData.ndaVersion);
         setInvites(invitesData.invites);
       } catch (err) {
         if (!cancelled) setLoadError(err instanceof Error ? err.message : 'Failed to load the team.');
@@ -248,6 +253,7 @@ export function TeamSettings() {
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Email</th>
                 <th className="px-3 py-2">Role</th>
+                <th className="px-3 py-2">NDA</th>
                 <th className="px-3 py-2 w-10"></th>
               </tr>
             </thead>
@@ -266,6 +272,25 @@ export function TeamSettings() {
                     >
                       {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
                     </select>
+                  </td>
+                  <td className="px-3 py-2">
+                    {u.nda_accepted_version && u.nda_accepted_version === ndaVersion ? (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold"
+                        style={{ background: 'var(--success-container)', color: 'var(--on-success-container)' }}
+                        title={u.nda_accepted_at ? `Accepted ${new Date(u.nda_accepted_at).toLocaleDateString()}` : undefined}
+                      >
+                        <ShieldCheck size={12} />Signed
+                      </span>
+                    ) : (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold"
+                        style={{ background: 'var(--warning-container)', color: 'var(--on-warning-container)' }}
+                        title={u.nda_accepted_version ? 'Accepted an earlier version - not yet re-signed' : 'Has not signed yet'}
+                      >
+                        <ShieldAlert size={12} />{u.nda_accepted_version ? 'Outdated' : 'Not signed'}
+                      </span>
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     <button

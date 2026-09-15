@@ -4,9 +4,11 @@ import { apiFetch, parseJsonOrError } from '../api';
 import { inputClass, buttonPrimaryClass, labelClass } from '../ui';
 import { useAuth } from './useAuth';
 import { AuthShell, FullScreenLoader } from './AuthShell';
+import { useI18n } from '../i18n/useI18n';
 
 export function LoginView() {
   const { login, refresh } = useAuth();
+  const { t } = useI18n();
   const [mode, setMode] = useState<'checking' | 'setup' | 'login'>('checking');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -48,18 +50,18 @@ export function LoginView() {
 
   return (
     <AuthShell
-      title={mode === 'setup' ? 'Create the first admin account' : 'Log in'}
+      title={mode === 'setup' ? t('auth.setup.title') : t('auth.login.title')}
       subtitle={mode === 'setup' ? 'No one has set up this workspace yet - the first account becomes an admin.' : undefined}
     >
       <form className="flex flex-col gap-3" onSubmit={handleSubmit}>
         {mode === 'setup' && (
           <div>
-            <label className={labelClass}>Name</label>
+            <label className={labelClass}>{t('auth.setup.name')}</label>
             <input autoFocus className={inputClass} value={name} onChange={e => setName(e.target.value)} required />
           </div>
         )}
         <div>
-          <label className={labelClass}>Email</label>
+          <label className={labelClass}>{t('auth.login.email')}</label>
           <input
             type="email"
             autoFocus={mode === 'login'}
@@ -70,7 +72,7 @@ export function LoginView() {
           />
         </div>
         <div>
-          <label className={labelClass}>Password</label>
+          <label className={labelClass}>{t('auth.login.password')}</label>
           <input
             type="password"
             className={inputClass}
@@ -89,7 +91,7 @@ export function LoginView() {
         )}
 
         <button type="submit" className={`${buttonPrimaryClass} justify-center mt-1`} disabled={submitting}>
-          {submitting ? 'Please wait...' : mode === 'setup' ? 'Create account' : 'Log in'}
+          {submitting ? 'Please wait...' : mode === 'setup' ? t('auth.setup.submit') : t('auth.login.submit')}
         </button>
       </form>
     </AuthShell>

@@ -15,6 +15,11 @@ export type ApiUser = {
   email: string;
   name: string;
   role: 'admin' | 'editor' | 'viewer';
+  language: string;
+  timeZone: string | null;
+  // Which version of the NDA (see server/nda.js) this user has accepted, if any - compared
+  // against the current version by NdaGate to decide whether they need to (re-)accept it.
+  ndaAcceptedVersion: string | null;
 };
 
 export async function parseJsonOrError(res: Response): Promise<unknown> {
