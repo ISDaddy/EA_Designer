@@ -137,6 +137,18 @@ async function initDB() {
       accepted_at TIMESTAMPTZ
     );
 
+    -- One-time links for the "forgot password" flow, parallel to invites but tied to an existing
+    -- user instead of an email that doesn't have an account yet. used_at (rather than a
+    -- status enum) is enough here since a reset link only ever has two states: usable or spent.
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id VARCHAR(255) PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token VARCHAR(255) UNIQUE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ
+    );
+
     -- Singleton row (id is always 1) holding the SMTP sender credentials admins configure from
     -- Settings, so they're editable at runtime instead of being fixed at container start via env
     -- vars. The env vars (see secrets.env) remain the fallback for a fresh install.
@@ -205,6 +217,7 @@ async function initDB() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
   `);
 
   // Additive migrations for columns introduced after the initial release. Each is wrapped so
@@ -411,6 +424,7 @@ async function getLanguageCodes() {
   return rows.map(r => r.code);
 }
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour - short-lived since, unlike an invite, this grants access to an existing account
 
 const COOKIE_OPTS = {
   httpOnly: true,
@@ -568,6 +582,27 @@ async function sendInviteEmail({ to, role, link }) {
     return { sent: true };
   } catch (err) {
     console.error('Failed to send invite email:', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+async function sendPasswordResetEmail({ to, link }) {
+  if (!mailTransporter) return { sent: false, reason: 'Email is not configured on the server.' };
+  try {
+    await mailTransporter.sendMail({
+      from: `"EA Designer" <${smtpConfig.user}>`,
+      to,
+      subject: 'Reset your EA Designer password',
+      html: `
+        <p>A password reset was requested for your <strong>EA Designer</strong> account.</p>
+        <p><a href="${link}">Reset your password</a></p>
+        <p>Or copy and paste this link into your browser:<br>${link}</p>
+        <p style="color:#666;font-size:13px">This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
+      `,
+    });
+    return { sent: true };
+  } catch (err) {
+    console.error('Failed to send password reset email:', err.message);
     return { sent: false, reason: err.message };
   }
 }
@@ -827,6 +862,94 @@ app.post('/api/auth/logout', async (req, res) => {
     }
     res.clearCookie('sid', COOKIE_OPTS);
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Always responds the same way regardless of whether the email matches an account, so this can't
+// be used to find out which addresses are registered - a reset link is only actually created and
+// emailed when it does. `appUrl` is the frontend's own origin (see /api/invites for why the
+// backend can't determine this itself).
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email, appUrl } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required.' });
+    const normalizedEmail = email.toLowerCase().trim();
+    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+    const user = userResult.rows[0];
+
+    if (user) {
+      // Invalidate any older unused link for this user so only the newest one still works.
+      await pool.query('UPDATE password_resets SET used_at = now() WHERE user_id = $1 AND used_at IS NULL', [user.id]);
+
+      const token = newToken();
+      const id = `reset-${Date.now()}`;
+      const expiresAt = new Date(Date.now() + RESET_TTL_MS);
+      await pool.query(
+        `INSERT INTO password_resets (id, user_id, token, expires_at) VALUES ($1, $2, $3, $4)`,
+        [id, user.id, token, expiresAt]
+      );
+
+      const base = typeof appUrl === 'string' && appUrl ? appUrl.replace(/\/$/, '') : '';
+      const link = `${base}/?reset=${token}`;
+      await sendPasswordResetEmail({ to: normalizedEmail, link });
+      await logAudit(req, { actor: null, action: 'password_reset_requested', resourceType: 'user', resourceId: user.id, resourceLabel: normalizedEmail });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public lookup used by the reset-password screen to validate the token (and show which account
+// it's for) before the user picks a new password.
+app.get('/api/reset-password-info/:token', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pr.expires_at, pr.used_at, u.email FROM password_resets pr JOIN users u ON u.id = pr.user_id WHERE pr.token = $1`,
+      [req.params.token]
+    );
+    const reset = result.rows[0];
+    if (!reset) return res.status(404).json({ error: 'This reset link is invalid.' });
+    if (reset.used_at) return res.status(410).json({ error: 'This reset link has already been used.' });
+    if (new Date(reset.expires_at) < new Date()) return res.status(410).json({ error: 'This reset link has expired.' });
+    res.json({ email: reset.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password || password.length < 8) {
+      return res.status(400).json({ error: 'A password of at least 8 characters is required.' });
+    }
+    const result = await pool.query(
+      `SELECT pr.id, pr.user_id, pr.expires_at, pr.used_at, u.email, u.name, u.role
+       FROM password_resets pr JOIN users u ON u.id = pr.user_id WHERE pr.token = $1`,
+      [token]
+    );
+    const reset = result.rows[0];
+    if (!reset) return res.status(404).json({ error: 'This reset link is invalid.' });
+    if (reset.used_at) return res.status(410).json({ error: 'This reset link has already been used.' });
+    if (new Date(reset.expires_at) < new Date()) return res.status(410).json({ error: 'This reset link has expired.' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const updateResult = await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING *', [passwordHash, reset.user_id]);
+    await pool.query('UPDATE password_resets SET used_at = now() WHERE id = $1', [reset.id]);
+    // A changed password invalidates every existing session for this account, in case whichever
+    // one prompted the reset (a forgotten password, or a suspected compromise) is still live.
+    await pool.query('DELETE FROM sessions WHERE user_id = $1', [reset.user_id]);
+
+    await logAudit(req, {
+      actor: { id: reset.user_id, email: reset.email, name: reset.name, role: reset.role },
+      action: 'password_reset', resourceType: 'user', resourceId: reset.user_id, resourceLabel: reset.name || reset.email,
+    });
+    await createSession(res, reset.user_id);
+    res.json(toApiUser(updateResult.rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

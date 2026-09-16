@@ -232,6 +232,20 @@ module.exports = {
   'auth.setup.submit': { en: 'Create account', cs: 'Vytvořit účet', de: 'Konto erstellen', fi: 'Luo tili' },
   'auth.acceptInvite.title': { en: 'Accept invite', cs: 'Přijmout pozvánku', de: 'Einladung annehmen', fi: 'Hyväksy kutsu' },
   'auth.acceptInvite.submit': { en: 'Join', cs: 'Připojit se', de: 'Beitreten', fi: 'Liity' },
+  'auth.login.forgotPassword': { en: 'Forgot password?', cs: 'Zapomenuté heslo?', de: 'Passwort vergessen?', fi: 'Unohditko salasanan?' },
+  'auth.forgotPassword.title': { en: 'Reset your password', cs: 'Obnovit heslo', de: 'Passwort zurücksetzen', fi: 'Palauta salasana' },
+  'auth.forgotPassword.submit': { en: 'Send reset link', cs: 'Odeslat odkaz pro obnovení', de: 'Link zum Zurücksetzen senden', fi: 'Lähetä palautuslinkki' },
+  'auth.forgotPassword.sent': {
+    en: "If an account exists for that email, we've sent a link to reset the password.",
+    cs: 'Pokud pro tento e-mail existuje účet, odeslali jsme odkaz pro obnovení hesla.',
+    de: 'Falls für diese E-Mail ein Konto existiert, haben wir einen Link zum Zurücksetzen des Passworts gesendet.',
+    fi: 'Jos tälle sähköpostille on olemassa tili, lähetimme linkin salasanan palauttamiseksi.',
+  },
+  'auth.forgotPassword.backToLogin': { en: 'Back to login', cs: 'Zpět na přihlášení', de: 'Zurück zur Anmeldung', fi: 'Takaisin kirjautumiseen' },
+  'auth.resetPassword.title': { en: 'Choose a new password', cs: 'Zvolte nové heslo', de: 'Neues Passwort wählen', fi: 'Valitse uusi salasana' },
+  'auth.resetPassword.newPassword': { en: 'New password', cs: 'Nové heslo', de: 'Neues Passwort', fi: 'Uusi salasana' },
+  'auth.resetPassword.submit': { en: 'Reset password', cs: 'Obnovit heslo', de: 'Passwort zurücksetzen', fi: 'Palauta salasana' },
+  'auth.resetPassword.unavailable': { en: 'Reset link not available', cs: 'Odkaz pro obnovení není dostupný', de: 'Link zum Zurücksetzen nicht verfügbar', fi: 'Palautuslinkki ei ole käytettävissä' },
 
   // Audit Log (Settings > Audit Log) - the SOX-style "who did/saw what, when" trail and its
   // filterable/exportable report for auditors.
@@ -265,6 +279,8 @@ module.exports = {
   'auditLog.action.login': { en: 'Login', cs: 'Přihlášení', de: 'Anmeldung', fi: 'Kirjautuminen' },
   'auditLog.action.login_failed': { en: 'Failed login', cs: 'Neúspěšné přihlášení', de: 'Fehlgeschlagene Anmeldung', fi: 'Epäonnistunut kirjautuminen' },
   'auditLog.action.logout': { en: 'Logout', cs: 'Odhlášení', de: 'Abmeldung', fi: 'Uloskirjautuminen' },
+  'auditLog.action.password_reset_requested': { en: 'Password reset requested', cs: 'Vyžádáno obnovení hesla', de: 'Passwort-Reset angefordert', fi: 'Salasanan palautus pyydetty' },
+  'auditLog.action.password_reset': { en: 'Password reset', cs: 'Heslo obnoveno', de: 'Passwort zurückgesetzt', fi: 'Salasana palautettu' },
   'auditLog.resourceType.system': { en: 'System', cs: 'Systém', de: 'System', fi: 'Järjestelmä' },
   'auditLog.resourceType.data_object': { en: 'Data Object', cs: 'Datový objekt', de: 'Datenobjekt', fi: 'Dataobjekti' },
   'auditLog.resourceType.edge': { en: 'Integration', cs: 'Integrace', de: 'Integration', fi: 'Integraatio' },

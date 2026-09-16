@@ -26,7 +26,7 @@ type AuditEntry = {
 
 type RosterUser = { id: string; name: string; email: string };
 
-const ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout'] as const;
+const ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout', 'password_reset_requested', 'password_reset'] as const;
 
 // Every resourceType string the backend's logAudit calls actually use (see server/index.js), plus
 // "page" for the frontend's own page-level view pings - kept as an explicit list rather than
@@ -48,6 +48,8 @@ const ACTION_COLORS: Record<string, { bg: string; fg: string }> = {
   login: { bg: 'var(--success-container)', fg: 'var(--on-success-container)' },
   login_failed: { bg: 'var(--danger-container)', fg: 'var(--on-danger-container)' },
   logout: { bg: 'var(--bg-surface-alt)', fg: 'var(--text-secondary)' },
+  password_reset_requested: { bg: 'var(--warning-container)', fg: 'var(--on-warning-container)' },
+  password_reset: { bg: 'var(--success-container)', fg: 'var(--on-success-container)' },
 };
 
 async function downloadFile(path: string, filename: string) {
