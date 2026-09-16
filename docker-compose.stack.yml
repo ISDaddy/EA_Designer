@@ -1,0 +1,57 @@
+# ==========================================
+# EA Designer - Portainer / NAS stack
+# ==========================================
+# This is the compose file to paste into Portainer as a Stack on the NAS. Unlike
+# docker-compose.yml (used for local dev, which builds images from source), this file only
+# pulls pre-built images - the NAS has no build step, it just runs whatever was last pushed
+# to Docker Hub by scripts/deploy.sh.
+#
+# Setup (one-time, in Portainer):
+#   1. Stacks -> Add stack -> paste this file's contents (or point Portainer at this repo/file
+#      if you're using a Git-backed stack).
+#   2. Set the environment variables below in Portainer's "Environment variables" section
+#      (Advanced mode / .env): FRONTEND_IMAGE, BACKEND_IMAGE, SMTP_USER, SMTP_PASS, and any
+#      port overrides you need. Do NOT paste secrets.env into this file - Portainer's env
+#      var UI is the equivalent of secrets.env for the NAS.
+#   3. Deploy the stack, then open it and enable "Webhook" - copy the generated URL into
+#      scripts/deploy.sh (PORTAINER_WEBHOOK_URL) so the deploy script can trigger a redeploy
+#      after pushing new images.
+#
+# The frontend proxies /api to the backend internally (see nginx.conf.template) rather than the
+# browser hitting the backend's own port directly, so the backend's port never needs to be
+# published or forwarded through Cloudflare/a reverse proxy - only the frontend's port does.
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: eadesigner
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    image: ${BACKEND_IMAGE:-yourdockerhubuser/ea-designer-backend}:${IMAGE_TAG:-latest}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: eadesigner
+      POSTGRES_HOST: db
+      PORT: ${APP_BACKEND_PORT:-4001}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    depends_on:
+      - db
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-yourdockerhubuser/ea-designer-frontend}:${IMAGE_TAG:-latest}
+    environment:
+      BACKEND_INTERNAL_PORT: ${APP_BACKEND_PORT:-4001}
+    ports:
+      - "${APP_FRONTEND_PORT:-80}:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:

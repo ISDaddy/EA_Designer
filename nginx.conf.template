@@ -1,0 +1,21 @@
+server {
+    listen 80;
+
+    # Forwarded to the backend container over the internal Docker network - $BACKEND_INTERNAL_PORT
+    # is substituted from the environment at container startup (nginx's own envsubst-on-templates
+    # entrypoint step; only variables that exist in the environment get substituted, so nginx's own
+    # $host/$uri/etc. below are left alone). This is what lets the app work on one public origin
+    # no matter how it's reached, instead of needing a second port forwarded to it.
+    location /api/ {
+        proxy_pass http://backend:${BACKEND_INTERNAL_PORT}/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri /index.html;
+    }
+}

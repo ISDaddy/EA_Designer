@@ -16,6 +16,14 @@ dist-ssr
 secrets.env
 server/.env
 
+# Machine-specific build/deploy script (Docker Hub user, Portainer webhook URL) -
+# copy scripts/deploy.example.sh to scripts/deploy.sh and fill in your own values.
+scripts/deploy.sh
+
+# Machine-specific DB sync script (NAS SSH host, container names) -
+# copy scripts/sync-db.example.sh to scripts/sync-db.sh and fill in your own values.
+scripts/sync-db.sh
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

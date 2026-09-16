@@ -38,6 +38,50 @@ APP_FRONTEND_PORT=8080 APP_BACKEND_PORT=5000 docker compose up -d
 
 The app stores state in the Postgres volume (`pgdata`), so data survives `docker compose down` / `up` cycles; use `docker compose down -v` to also wipe the database.
 
+## Deploying to a NAS (Portainer stack)
+
+`docker-compose.stack.yml` is the compose file to paste into Portainer as a Stack - unlike
+`docker-compose.yml` (which builds from source), it only pulls pre-built images from Docker Hub,
+since Portainer/the NAS has no build step. See the comments in that file for one-time Portainer
+setup (env vars, webhook).
+
+To build, push to Docker Hub, and redeploy both the local PC stack and the NAS's Portainer stack
+in one step, copy `scripts/deploy.example.sh` to `scripts/deploy.sh` (gitignored - it holds your
+Docker Hub username and Portainer webhook URL), fill in the placeholders, and run:
+
+```bash
+scripts/deploy.sh            # build, update PC, push to Docker Hub, redeploy NAS
+scripts/deploy.sh --local    # build and update the PC stack only
+```
+
+## Keeping the PC and NAS databases in sync
+
+The PC and NAS each run their own Postgres container, so their data can drift apart. To
+overwrite one side's data with the other's, copy `scripts/sync-db.example.sh` to
+`scripts/sync-db.sh` (gitignored - it holds your NAS's SSH host and container name), fill in
+the placeholders, and run:
+
+```bash
+scripts/sync-db.sh --to-nas    # PC data overwrites NAS data
+scripts/sync-db.sh --to-pc     # NAS data overwrites PC data
+```
+
+This requires SSH access from the PC to the NAS. It's a one-way, destructive copy (the
+destination's existing data is dropped), so pick the direction carefully - the script asks
+for confirmation before running.
+
+On a Synology NAS, the SSH login user usually can't reach `/var/run/docker.sock` directly
+(`permission denied` even for an account in the `administrators` group), so the script runs
+remote `docker` commands via a scoped passwordless `sudo` rule. Set this up once by SSHing
+into the NAS and, from a root shell (`sudo -i`), running:
+
+```bash
+echo "<nas-ssh-user> ALL=(ALL) NOPASSWD: /usr/local/bin/docker" > /etc/sudoers.d/<nas-ssh-user>-docker
+chmod 440 /etc/sudoers.d/<nas-ssh-user>-docker
+```
+
+(adjust the docker path if `ls /usr/local/bin/docker` doesn't find it on your model/DSM version).
+
 ## Local development (frontend only)
 
 ```bash
