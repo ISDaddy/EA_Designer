@@ -24,6 +24,9 @@ scripts/deploy.sh
 # copy scripts/sync-db.example.sh to scripts/sync-db.sh and fill in your own values.
 scripts/sync-db.sh
 
+# Project-specific standing instructions for Claude Code - not part of the app itself
+CLAUDE.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
