@@ -92,6 +92,7 @@ module.exports = {
   'object.details.globalName': { en: 'Global Name', cs: 'Globální název', de: 'Globaler Name', fi: 'Yleinen nimi' },
   'object.details.classification': { en: 'Classification', cs: 'Klasifikace', de: 'Klassifizierung', fi: 'Luokitus' },
   'object.details.masterSystem': { en: 'Master System', cs: 'Master systém', de: 'Master-System', fi: 'Isäntäjärjestelmä' },
+  'object.details.description': { en: 'Description', cs: 'Popis', de: 'Beschreibung', fi: 'Kuvaus' },
   'object.details.selectSystem': { en: '-- Select a System --', cs: '-- Vyberte systém --', de: '-- System auswählen --', fi: '-- Valitse järjestelmä --' },
   'object.details.systemObjectNames': { en: 'System Object Names', cs: 'Názvy objektu v systémech', de: 'Systemobjektnamen', fi: 'Järjestelmäkohtaiset objektinimet' },
   'object.details.noSystemObjectNames': { en: 'No per-system names defined.', cs: 'Nejsou definovány žádné názvy pro jednotlivé systémy.', de: 'Keine systemspezifischen Namen definiert.', fi: 'Ei järjestelmäkohtaisia nimiä määritetty.' },
