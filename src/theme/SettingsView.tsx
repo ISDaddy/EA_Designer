@@ -11,13 +11,14 @@ import { LanguageSettings } from '../i18n/LanguageSettings';
 import { TranslationsAdmin } from '../i18n/TranslationsAdmin';
 import { AuditLogSettings } from '../audit/AuditLogSettings';
 import { logAuditView } from '../audit/logView';
+import { ReleaseNotesSettings } from '../ReleaseNotesSettings';
 
 // Admin-only tabs are pages of sensitive data (the team roster, email credentials, translations) -
 // worth a "page view" audit entry in their own right, same as opening a specific system/object/
 // integration's detail panel on the canvas. "audit" excluded - AuditLogSettings logs its own view.
 const AUDIT_LOGGED_TABS: Partial<Record<SettingsTab, string>> = { team: 'Team', email: 'Email Settings', translations: 'Translations' };
 
-type SettingsTab = 'appearance' | 'language' | 'team' | 'email' | 'translations' | 'audit';
+type SettingsTab = 'appearance' | 'language' | 'releaseNotes' | 'team' | 'email' | 'translations' | 'audit';
 
 export function SettingsView() {
   const { style, mode, palette, palettesForStyle, setStyle, setMode, setPalette } = useTheme();
@@ -29,6 +30,7 @@ export function SettingsView() {
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: 'appearance', label: t('settings.tab.appearance') },
     { id: 'language', label: t('settings.tab.language') },
+    { id: 'releaseNotes', label: t('settings.tab.releaseNotes') },
     ...(canManageTeam ? [
       { id: 'team' as const, label: t('settings.tab.team') },
       { id: 'email' as const, label: t('settings.tab.email') },
@@ -166,6 +168,7 @@ export function SettingsView() {
         )}
 
         {activeTab === 'language' && <LanguageSettings />}
+        {activeTab === 'releaseNotes' && <ReleaseNotesSettings />}
         {activeTab === 'team' && canManageTeam && <TeamSettings />}
         {activeTab === 'email' && canManageTeam && <EmailSettings />}
         {activeTab === 'translations' && canManageTeam && <TranslationsAdmin />}

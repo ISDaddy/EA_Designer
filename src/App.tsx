@@ -28,6 +28,7 @@ import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass
 import { LogoMark } from './LogoMark';
 import { computeNextOccurrences, describeSchedule, DAY_NAMES, type ScheduleDef } from './schedule';
 import { logAuditView } from './audit/logView';
+import { APP_VERSION } from './version';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -3254,10 +3255,18 @@ function AppContent() {
         Confidential — Proprietary POC, do not distribute
       </div>
 
+      {/* Version tag - kept visible on every view since this is a very early alpha still finding its footing */}
+      <div
+        className="absolute bottom-4 right-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none opacity-60"
+        style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
+      >
+        v{APP_VERSION} alpha
+      </div>
+
       {/* Subtle save banner */}
       {(pendingSaves > 0 || saveSuccess) && (
         <div
-          className="absolute bottom-4 right-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none transition-opacity shadow-[var(--shadow-md)]"
+          className="absolute bottom-12 right-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none transition-opacity shadow-[var(--shadow-md)]"
           style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)', opacity: 0.9 }}
         >
           {pendingSaves > 0 ? 'Syncing...' : 'Saved'}
