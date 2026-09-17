@@ -114,6 +114,30 @@ module.exports = {
   'connection.integrationType': { en: 'Integration Type', cs: 'Typ integrace', de: 'Integrationstyp', fi: 'Integraatiotyyppi' },
   'connection.integrationSoftware': { en: 'Integration Software', cs: 'Integrační software', de: 'Integrationssoftware', fi: 'Integraatio-ohjelmisto' },
   'connection.deleteConnection': { en: 'Delete Connection', cs: 'Smazat propojení', de: 'Verbindung löschen', fi: 'Poista yhteys' },
+  'connection.assignObjectTitle': { en: 'Assign Data Object to Flow', cs: 'Přiřadit datový objekt k toku', de: 'Datenobjekt dem Fluss zuweisen', fi: 'Liitä dataobjekti virtaan' },
+  'connection.assignObjectBlurb': {
+    en: 'Choose an existing data object already in {system}, or create a new one.',
+    cs: 'Vyberte existující datový objekt již v systému {system}, nebo vytvořte nový.',
+    de: 'Wählen Sie ein vorhandenes Datenobjekt aus {system}, oder erstellen Sie ein neues.',
+    fi: 'Valitse olemassa oleva dataobjekti, joka on jo järjestelmässä {system}, tai luo uusi.',
+  },
+  'connection.createNewObjectButton': { en: 'Create New Object', cs: 'Vytvořit nový objekt', de: 'Neues Objekt erstellen', fi: 'Luo uusi objekti' },
+  'connection.orChooseExisting': { en: 'Or choose an existing object', cs: 'Nebo vyberte existující objekt', de: 'Oder vorhandenes Objekt auswählen', fi: 'Tai valitse olemassa oleva objekti' },
+  'connection.noObjectYet': { en: 'No object yet (leave unassigned)', cs: 'Zatím žádný objekt (nechat nepřiřazeno)', de: 'Noch kein Objekt (nicht zuweisen)', fi: 'Ei objektia (jätä määrittämättä)' },
+  'connection.noObjectsInSource': { en: 'No data objects in this system yet.', cs: 'V tomto systému zatím nejsou žádné datové objekty.', de: 'In diesem System noch keine Datenobjekte.', fi: 'Tässä järjestelmässä ei ole vielä dataobjekteja.' },
+  'connection.saveFlow': { en: 'Save Flow', cs: 'Uložit tok', de: 'Fluss speichern', fi: 'Tallenna virta' },
+
+  // New Data Object wizard (launched when assigning an object to a flow)
+  'objectWizard.title': { en: 'Create New Data Object', cs: 'Vytvořit nový datový objekt', de: 'Neues Datenobjekt erstellen', fi: 'Luo uusi dataobjekti' },
+  'objectWizard.stepOf': { en: 'Step {current} of {total}', cs: 'Krok {current} z {total}', de: 'Schritt {current} von {total}', fi: 'Vaihe {current}/{total}' },
+  'objectWizard.nameLabel': { en: 'Object Name', cs: 'Název objektu', de: 'Objektname', fi: 'Objektin nimi' },
+  'objectWizard.namePlaceholder': { en: 'e.g. User Profile', cs: 'např. Uživatelský profil', de: 'z. B. Benutzerprofil', fi: 'esim. Käyttäjäprofiili' },
+  'objectWizard.classificationLabel': { en: 'Classification', cs: 'Klasifikace', de: 'Klassifizierung', fi: 'Luokitus' },
+  'objectWizard.masterSystemNote': { en: 'This object will belong to {system}.', cs: 'Tento objekt bude patřit do {system}.', de: 'Dieses Objekt gehört zu {system}.', fi: 'Tämä objekti kuuluu järjestelmään {system}.' },
+  'objectWizard.descriptionLabel': { en: 'Description', cs: 'Popis', de: 'Beschreibung', fi: 'Kuvaus' },
+  'objectWizard.descriptionPlaceholder': { en: 'What does this object represent?', cs: 'Co tento objekt představuje?', de: 'Was stellt dieses Objekt dar?', fi: 'Mitä tämä objekti edustaa?' },
+  'objectWizard.create': { en: 'Create Object', cs: 'Vytvořit objekt', de: 'Objekt erstellen', fi: 'Luo objekti' },
+  'objectWizard.duplicateName': { en: 'A data object with this name already exists.', cs: 'Datový objekt s tímto názvem již existuje.', de: 'Ein Datenobjekt mit diesem Namen existiert bereits.', fi: 'Tämän niminen dataobjekti on jo olemassa.' },
 
   // Schedule (frequency) editor
   'scheduleDef.none': { en: 'Real-time / on-demand (no fixed cadence)', cs: 'V reálném čase / na vyžádání (bez pevného intervalu)', de: 'Echtzeit / bei Bedarf (kein fester Rhythmus)', fi: 'Reaaliaikainen / tarvittaessa (ei kiinteää sykliä)' },

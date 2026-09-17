@@ -2184,7 +2184,13 @@ function AppContent() {
     });
   }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId]);
   const [pendingEdge, setPendingEdge] = useState<Connection | null>(null);
-  const [pendingEdgeObject, setPendingEdgeObject] = useState<string>('');
+  const [pendingEdgeObjectId, setPendingEdgeObjectId] = useState<string>('');
+  const [pendingObjectFilter, setPendingObjectFilter] = useState<string>('');
+  const [showObjectWizard, setShowObjectWizard] = useState(false);
+  const [wizardStep, setWizardStep] = useState<1 | 2>(1);
+  const [wizardName, setWizardName] = useState('');
+  const [wizardClassification, setWizardClassification] = useState<DataObjectClassification>('internal');
+  const [wizardDescription, setWizardDescription] = useState('');
 
   // A junction node's id (see JunctionNode/'junc-' ids below) isn't a real system - it's a visual
   // hub standing in for whichever system is currently focused (selectedNodeId). Substituting it
@@ -2337,22 +2343,7 @@ function AppContent() {
   const confirmPendingEdge = useCallback(() => {
     if (!pendingEdge) return;
 
-    let objectId = '';
-
-    // Find or create object
-    if (pendingEdgeObject.trim()) {
-      const objName = pendingEdgeObject.trim();
-      const existingObj = dataObjects.find(o => o.name.toLowerCase() === objName.toLowerCase());
-      if (existingObj) {
-        objectId = existingObj.id;
-      } else {
-        objectId = `obj-${Date.now()}`;
-        // Set the source of the edge as the master system for the new object
-        const newObject: DataObject = { id: objectId, name: objName, masterSystemId: pendingEdge.source, systemObjectNames: {}, description: '', classification: 'internal' };
-        setDataObjects(objs => [...objs, newObject]);
-        apiPost('/data-objects', { id: newObject.id, name: newObject.name, masterSystemId: newObject.masterSystemId });
-      }
-    }
+    const objectId = pendingEdgeObjectId;
 
     let finalSourceHandle = pendingEdge.sourceHandle;
     let finalTargetHandle = pendingEdge.targetHandle;
@@ -2389,12 +2380,49 @@ function AppContent() {
       apiPatch(`/edges/${newEdge.id}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE });
     }
     setPendingEdge(null);
-    setPendingEdgeObject('');
+    setPendingEdgeObjectId('');
+    setPendingObjectFilter('');
 
     // Optionally open the right sidebar for this edge
     setSelectedEdgePair([newEdge.source, newEdge.target].sort() as [string, string]);
     setSelectedNodeId(null);
-  }, [pendingEdge, pendingEdgeObject, dataObjects, nodes, getClosestHandles, setDataObjects, setEdges, setEdgeObjectDetails, apiPost, apiPatch, tokens.edgeColor, user]);
+  }, [pendingEdge, pendingEdgeObjectId, nodes, getClosestHandles, setEdges, setEdgeObjectDetails, apiPost, apiPatch, tokens.edgeColor, user]);
+
+  const closeObjectWizard = useCallback(() => {
+    setShowObjectWizard(false);
+    setWizardStep(1);
+    setWizardName('');
+    setWizardClassification('internal');
+    setWizardDescription('');
+  }, []);
+
+  const createObjectForPendingEdge = useCallback(() => {
+    if (!pendingEdge) return;
+    const name = wizardName.trim();
+    if (!name) {
+      alert('Please provide an object name.');
+      return;
+    }
+    if (dataObjects.some(o => o.name.toLowerCase() === name.toLowerCase())) {
+      alert(t('objectWizard.duplicateName'));
+      return;
+    }
+    const newObject: DataObject = {
+      id: `obj-${Date.now()}`,
+      name,
+      masterSystemId: pendingEdge.source,
+      systemObjectNames: {},
+      description: wizardDescription.trim(),
+      classification: wizardClassification,
+    };
+    setDataObjects(objs => [...objs, newObject]);
+    apiPost('/data-objects', {
+      id: newObject.id, name: newObject.name, masterSystemId: newObject.masterSystemId,
+      classification: newObject.classification, description: newObject.description,
+    });
+    setPendingEdgeObjectId(newObject.id);
+    closeObjectWizard();
+  }, [pendingEdge, wizardName, wizardDescription, wizardClassification, dataObjects, setDataObjects, apiPost, t, closeObjectWizard]);
 
   const toggleObjectOnEdge = useCallback((edgeId: string, objectId: string) => {
     setEdges((eds) =>
@@ -3241,38 +3269,140 @@ function AppContent() {
         <div className="absolute inset-0 z-[100] bg-black/40 flex items-center justify-center backdrop-blur-sm">
           <div className={`${cardClass} p-6 w-96 flex flex-col gap-4`}>
             <div className="flex items-center justify-between">
-              <h3 className="font-bold text-lg" style={{ color: 'var(--text-primary)' }}>Assign Data Object to Flow</h3>
+              <h3 className="font-bold text-lg" style={{ color: 'var(--text-primary)' }}>{t('connection.assignObjectTitle')}</h3>
               <button
                 className="p-1 rounded-full transition-colors"
                 style={{ color: 'var(--text-muted)' }}
-                onClick={() => { setPendingEdge(null); setPendingEdgeObject(''); }}
-                aria-label="Close"
+                onClick={() => { setPendingEdge(null); setPendingEdgeObjectId(''); setPendingObjectFilter(''); }}
+                aria-label={t('common.close')}
               >
                 <X size={16} />
               </button>
             </div>
             <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-              What object is flowing in this connection? (You can type an existing object or a new one, or leave blank)
+              {t('connection.assignObjectBlurb', { system: getSystemLabel(pendingEdge.source) || '' })}
             </p>
-            <input
-              autoFocus
-              className={inputClass}
-              placeholder="e.g. User Profile"
-              value={pendingEdgeObject}
-              onChange={(e) => setPendingEdgeObject(e.target.value)}
-              list="modal-objects-list"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') confirmPendingEdge();
-                if (e.key === 'Escape') { setPendingEdge(null); setPendingEdgeObject(''); }
-              }}
-            />
-            <datalist id="modal-objects-list">
-              {objectsInPendingSource.map(o => <option key={o.id} value={o.name} />)}
-            </datalist>
-            <div className="flex justify-end gap-2 mt-2">
-              <button className={buttonSecondaryClass} onClick={() => { setPendingEdge(null); setPendingEdgeObject(''); }}>Cancel</button>
-              <button className={buttonPrimaryClass} onClick={confirmPendingEdge}>Save Flow</button>
+
+            <button
+              className={buttonSecondaryClass}
+              onClick={() => { setWizardName(''); setWizardClassification('internal'); setWizardDescription(''); setWizardStep(1); setShowObjectWizard(true); }}
+            >
+              <Plus size={14} />{t('connection.createNewObjectButton')}
+            </button>
+
+            <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>
+              {t('connection.orChooseExisting')}
             </div>
+
+            <div className="relative">
+              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+              <input
+                autoFocus
+                type="text"
+                className={`${inputClass} pl-8`}
+                placeholder={t('connection.searchObjects')}
+                value={pendingObjectFilter}
+                onChange={(e) => setPendingObjectFilter(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Escape') { setPendingEdge(null); setPendingEdgeObjectId(''); setPendingObjectFilter(''); } }}
+              />
+            </div>
+
+            <div className="flex flex-col gap-1 max-h-56 overflow-y-auto border rounded-[var(--radius-input)]" style={{ borderColor: 'var(--border-subtle)' }}>
+              <label
+                className="flex items-center gap-2 px-2 py-1.5 cursor-pointer text-sm italic"
+                style={{ color: 'var(--text-muted)', background: pendingEdgeObjectId === '' ? 'var(--bg-surface-alt)' : undefined }}
+              >
+                <input type="radio" name="pending-edge-object" checked={pendingEdgeObjectId === ''} onChange={() => setPendingEdgeObjectId('')} />
+                {t('connection.noObjectYet')}
+              </label>
+              {objectsInPendingSource
+                .filter(o => !pendingObjectFilter || o.name.toLowerCase().includes(pendingObjectFilter.toLowerCase()))
+                .map(o => (
+                  <label
+                    key={o.id}
+                    className="flex items-center gap-2 px-2 py-1.5 cursor-pointer text-sm"
+                    style={{ color: 'var(--text-primary)', background: pendingEdgeObjectId === o.id ? 'var(--bg-surface-alt)' : undefined }}
+                  >
+                    <input type="radio" name="pending-edge-object" checked={pendingEdgeObjectId === o.id} onChange={() => setPendingEdgeObjectId(o.id)} />
+                    <span className="truncate">{o.name}</span>
+                  </label>
+                ))}
+              {objectsInPendingSource.length === 0 && (
+                <div className="px-2 py-3 text-sm text-center" style={{ color: 'var(--text-muted)' }}>{t('connection.noObjectsInSource')}</div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 mt-2">
+              <button className={buttonSecondaryClass} onClick={() => { setPendingEdge(null); setPendingEdgeObjectId(''); setPendingObjectFilter(''); }}>{t('common.cancel')}</button>
+              <button className={buttonPrimaryClass} onClick={confirmPendingEdge}>{t('connection.saveFlow')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Object Wizard Modal - guides the user through creating a Data Object that's immediately assigned to the flow being created */}
+      {showObjectWizard && pendingEdge && (
+        <div className="absolute inset-0 z-[110] bg-black/40 flex items-center justify-center backdrop-blur-sm">
+          <div className={`${cardClass} p-6 w-96 flex flex-col gap-4`}>
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-lg" style={{ color: 'var(--text-primary)' }}>{t('objectWizard.title')}</h3>
+              <button className="p-1 rounded-full transition-colors" style={{ color: 'var(--text-muted)' }} onClick={closeObjectWizard} aria-label={t('common.close')}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="text-xs font-semibold" style={{ color: 'var(--text-muted)' }}>
+              {t('objectWizard.stepOf', { current: wizardStep, total: 2 })}
+            </div>
+
+            {wizardStep === 1 ? (
+              <>
+                <div>
+                  <label className={labelClass}>{t('objectWizard.nameLabel')}</label>
+                  <input
+                    autoFocus
+                    className={inputClass}
+                    placeholder={t('objectWizard.namePlaceholder')}
+                    value={wizardName}
+                    onChange={(e) => setWizardName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && wizardName.trim()) setWizardStep(2); }}
+                  />
+                </div>
+                <div>
+                  <label className={labelClass}>{t('objectWizard.classificationLabel')}</label>
+                  <select className={inputClass} value={wizardClassification} onChange={(e) => setWizardClassification(e.target.value as DataObjectClassification)}>
+                    <option value="public">{t('classification.public')}</option>
+                    <option value="internal">{t('classification.internal')}</option>
+                    <option value="confidential">{t('classification.confidential')}</option>
+                    <option value="restricted">{t('classification.restricted')}</option>
+                  </select>
+                </div>
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  {t('objectWizard.masterSystemNote', { system: getSystemLabel(pendingEdge.source) || '' })}
+                </p>
+                <div className="flex justify-end gap-2 mt-2">
+                  <button className={buttonSecondaryClass} onClick={closeObjectWizard}>{t('common.cancel')}</button>
+                  <button className={buttonPrimaryClass} disabled={!wizardName.trim()} onClick={() => setWizardStep(2)}>{t('common.next')}</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <label className={labelClass}>{t('objectWizard.descriptionLabel')}</label>
+                  <textarea
+                    autoFocus
+                    className={inputClass}
+                    rows={4}
+                    placeholder={t('objectWizard.descriptionPlaceholder')}
+                    value={wizardDescription}
+                    onChange={(e) => setWizardDescription(e.target.value)}
+                  />
+                </div>
+                <div className="flex justify-end gap-2 mt-2">
+                  <button className={buttonSecondaryClass} onClick={() => setWizardStep(1)}>{t('common.back')}</button>
+                  <button className={buttonPrimaryClass} onClick={createObjectForPendingEdge}>{t('objectWizard.create')}</button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
