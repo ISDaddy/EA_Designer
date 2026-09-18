@@ -8,7 +8,7 @@
 // entry in RELEASE_NOTES sorts and filters consistently.
 export type AppPhase = 'alpha' | 'beta' | 'ga';
 export const APP_PHASE: AppPhase = 'alpha';
-export const APP_VERSION = '2026.9.18.9';
+export const APP_VERSION = '2026.9.18.14';
 export const APP_VERSION_DISPLAY = `${APP_PHASE}_${APP_VERSION}`;
 
 export type ReleaseNote = {
@@ -22,6 +22,59 @@ export type ReleaseNote = {
 // history (see `git log`) rather than written at release time, so their wording is reconstructed
 // from commit messages.
 export const RELEASE_NOTES: ReleaseNote[] = [
+  {
+    version: 'alpha_2026.9.18.14',
+    date: '2026-09-18',
+    title: 'Stakeholder canvas view and Business Capability as a managed list',
+    notes: [
+      'Business Capability is now a managed list (Inventory > Reference Lists), picked from a dropdown instead of typed freely, so it can be relied on for grouping.',
+      'Added a Stakeholder view alongside the existing canvas (now called Technical) - one box per Business Capability instead of every individual system, with connections rolled up and weighted by how many real system-to-system links back them. Systems with no capability assigned show under "Uncategorized" rather than disappearing.',
+      'Clicking a Business Capability in the Stakeholder view jumps into the Technical view filtered to exactly that capability\'s systems and connections. The Technical view also gained a standalone "Filter by business capability" dropdown.',
+      'Added an "Auto-arrange" button to the Technical view to declutter a busy landscape on demand - temporary for this viewing session only, never overwriting anyone\'s saved layout.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.13',
+    date: '2026-09-18',
+    title: 'System Owner role, approvals, and notifications',
+    notes: [
+      'Added a System Owner role: full write access to the systems they own (creating objects, and connections to or from an owned system), read-only everywhere else, same as a Viewer.',
+      'A connection or flow-detail change that also touches a system the System Owner doesn\'t own is now held for approval instead of applying immediately - any Admin, or an owner of the other system, can approve or reject it. A pending change stays visible on the canvas (dashed, labeled "Pending") rather than disappearing.',
+      'Added an Approvals page: decide changes awaiting your approval, track the status of your own requests, and withdraw one while it\'s still pending.',
+      'Added in-app notifications (a bell in the header) for approval requests and decisions, and for existing ownership-change alerts - with a per-notification-type email opt-out under Profile > Notifications (in-app notifications themselves always stay on).',
+      'Importing a bundle as a System Owner now applies the parts touching systems they own right away and queues the rest for approval, instead of failing the whole import.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.12',
+    date: '2026-09-18',
+    title: 'Dependencies auto-select and lock in Import/Export',
+    notes: [
+      'In both Export and Import, selecting something that depends on another system/object (an edge needs its two systems and the objects it carries; an object needs its master system) now ticks that dependency immediately, instead of only pulling it in silently behind the scenes.',
+      'An auto-included dependency is shown ticked and locked (greyed out, with a lock icon) - the same convention used by installers and package managers for a required component - since it can only be removed by first deselecting whatever still needs it.',
+      'Fixed a related bug: a system or object could end up skipped at commit time even though the checkbox showed it locked-and-included, if it had been individually skipped earlier and then became required again.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.11',
+    date: '2026-09-18',
+    title: 'Import preview now covers new items too',
+    notes: [
+      'The Import preview in Settings > Import / Export now lists every "new" system, data object, and edge in its own table (not just a count), each with a checkbox so it can still be excluded even though it doesn’t conflict with anything.',
+      '"Include all" / "Skip all" bulk actions were added for new items, matching the existing bulk actions for conflicts.',
+      'Skipping a new item that something else you’re still importing depends on now fails with a clear message instead of a raw database error.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.10',
+    date: '2026-09-18',
+    title: 'Selective Import / Export',
+    notes: [
+      'Added an "Import / Export" tab in Settings: pick specific systems, data objects, and edges and export them as a single JSON file - anything they depend on (an edge’s two systems and the objects it carries, an object’s master system) is pulled in automatically so the file always stands on its own.',
+      'Importing a file shows exactly what’s new versus what already exists in this environment, and every conflicting id must be resolved - override, skip, or rename - individually or in bulk, before anything is written.',
+      'Built for moving part of a landscape between environments (e.g. a local instance and the NAS) without a full database copy.',
+    ],
+  },
   {
     version: 'alpha_2026.9.18.9',
     date: '2026-09-18',

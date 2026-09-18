@@ -26,7 +26,7 @@ type AuditEntry = {
 
 type RosterUser = { id: string; name: string; email: string };
 
-const ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout', 'password_reset_requested', 'password_reset'] as const;
+const ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout', 'password_reset_requested', 'password_reset', 'export', 'import', 'approve', 'reject', 'withdraw'] as const;
 
 // Every resourceType string the backend's logAudit calls actually use (see server/index.js), plus
 // "page" for the frontend's own page-level view pings - kept as an explicit list rather than
@@ -35,7 +35,7 @@ const ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 
 const RESOURCE_TYPES = [
   'system', 'data_object', 'edge', 'integration_flow', 'integration_types', 'integration_software',
   'system_downtime', 'language', 'translation', 'translation_import', 'user', 'invite', 'session',
-  'nda_acceptance', 'settings_email', 'page',
+  'nda_acceptance', 'settings_email', 'page', 'import_export', 'change_request',
 ] as const;
 
 const PAGE_SIZE = 25;
@@ -50,6 +50,11 @@ const ACTION_COLORS: Record<string, { bg: string; fg: string }> = {
   logout: { bg: 'var(--bg-surface-alt)', fg: 'var(--text-secondary)' },
   password_reset_requested: { bg: 'var(--warning-container)', fg: 'var(--on-warning-container)' },
   password_reset: { bg: 'var(--success-container)', fg: 'var(--on-success-container)' },
+  export: { bg: 'var(--info-container)', fg: 'var(--on-info-container)' },
+  import: { bg: 'var(--success-container)', fg: 'var(--on-success-container)' },
+  approve: { bg: 'var(--success-container)', fg: 'var(--on-success-container)' },
+  reject: { bg: 'var(--danger-container)', fg: 'var(--on-danger-container)' },
+  withdraw: { bg: 'var(--bg-surface-alt)', fg: 'var(--text-secondary)' },
 };
 
 async function downloadFile(path: string, filename: string) {

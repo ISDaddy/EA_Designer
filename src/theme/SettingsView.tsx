@@ -8,14 +8,23 @@ import { TranslationsAdmin } from '../i18n/TranslationsAdmin';
 import { AuditLogSettings } from '../audit/AuditLogSettings';
 import { logAuditView } from '../audit/logView';
 import { ReleaseNotesSettings } from '../ReleaseNotesSettings';
+import { ImportExportSettings, type ExportSystem, type ExportObject, type ExportEdge } from '../ImportExportSettings';
 import { type SettingsTab } from './settingsTabs';
 
 // Admin-only tabs are pages of sensitive data (the team roster, server credentials, translations)
 // - worth a "page view" audit entry in their own right, same as opening a specific system/object/
 // integration's detail panel on the canvas. "audit" excluded - AuditLogSettings logs its own view.
-const AUDIT_LOGGED_TABS: Partial<Record<SettingsTab, string>> = { team: 'Team', serverSettings: 'Server Settings', translations: 'Translations' };
+const AUDIT_LOGGED_TABS: Partial<Record<SettingsTab, string>> = { team: 'Team', serverSettings: 'Server Settings', translations: 'Translations', importExport: 'Import / Export' };
 
-export function SettingsView({ tab, setTab }: { tab: SettingsTab; setTab: (tab: SettingsTab) => void }) {
+export function SettingsView({ tab, setTab, importExportSystems, importExportObjects, importExportEdges, getSystemLabel, reloadState }: {
+  tab: SettingsTab;
+  setTab: (tab: SettingsTab) => void;
+  importExportSystems: ExportSystem[];
+  importExportObjects: ExportObject[];
+  importExportEdges: ExportEdge[];
+  getSystemLabel: (id: string | null | undefined) => string | undefined;
+  reloadState: () => Promise<void>;
+}) {
   const { user } = useAuth();
   const { t } = useI18n();
   const canManageTeam = isAdmin(user?.role);
@@ -23,13 +32,15 @@ export function SettingsView({ tab, setTab }: { tab: SettingsTab; setTab: (tab: 
 
   // Appearance and Language & Region moved to the Profile page (personal, per-account preferences
   // reached by clicking your name in the header) - everything left here is either shared/app-wide
-  // config (Team, Server Settings, Translations, Audit Log) or open to everyone to read (Release
-  // Notes). Server Settings (email + Google Sign-In) is superadmin-only, one notch above the rest.
+  // config (Team, Server Settings, Translations, Audit Log, Import/Export) or open to everyone to
+  // read (Release Notes). Server Settings (email + Google Sign-In) is superadmin-only, one notch
+  // above the rest.
   const tabs: { id: SettingsTab; label: string }[] = [
     ...(canManageTeam ? [
       { id: 'team' as const, label: t('settings.tab.team') },
       { id: 'translations' as const, label: t('settings.tab.translations') },
       { id: 'audit' as const, label: t('settings.tab.audit') },
+      { id: 'importExport' as const, label: t('settings.tab.importExport') },
     ] : []),
     ...(canManageServer ? [{ id: 'serverSettings' as const, label: t('settings.tab.serverSettings') }] : []),
     { id: 'releaseNotes', label: t('settings.tab.releaseNotes') },
@@ -70,6 +81,15 @@ export function SettingsView({ tab, setTab }: { tab: SettingsTab; setTab: (tab: 
         {activeTab === 'serverSettings' && canManageServer && <ServerSettings />}
         {activeTab === 'translations' && canManageTeam && <TranslationsAdmin />}
         {activeTab === 'audit' && canManageTeam && <AuditLogSettings />}
+        {activeTab === 'importExport' && canManageTeam && (
+          <ImportExportSettings
+            systems={importExportSystems}
+            dataObjects={importExportObjects}
+            edges={importExportEdges}
+            getSystemLabel={getSystemLabel}
+            reloadState={reloadState}
+          />
+        )}
       </div>
     </div>
   );

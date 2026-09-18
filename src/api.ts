@@ -15,7 +15,7 @@ export type ApiUser = {
   id: string;
   email: string;
   name: string;
-  role: 'superadmin' | 'admin' | 'editor' | 'viewer';
+  role: 'superadmin' | 'admin' | 'editor' | 'system_owner' | 'viewer';
   language: string;
   timeZone: string | null;
   // Which version of the NDA (see server/nda.js) this user has accepted, if any - compared
@@ -24,6 +24,9 @@ export type ApiUser = {
   themePrefs: ThemePrefs | null;
   avatarUrl: string | null;
   totpEnabled: boolean;
+  // Per-notification-type email opt-out (see notify() in server/index.js) - a missing entry or
+  // explicit `true` means email stays on for that type; in-app notifications are never opt-out-able.
+  notificationEmailPrefs: Record<string, boolean>;
 };
 
 export async function parseJsonOrError(res: Response): Promise<unknown> {

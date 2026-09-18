@@ -14,7 +14,8 @@ import {
 } from '@xyflow/react';
 import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { AlertTriangle, Calendar, ChevronDown, Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
+import ELK from 'elkjs/lib/elk.bundled.js';
+import { AlertTriangle, Building2, Calendar, CheckCircle2, ChevronDown, Component, Eye, LogOut, MousePointerClick, Network, Plus, Search, Settings as SettingsIcon, Shuffle, Table, Trash2, Workflow, X } from 'lucide-react';
 import { useTheme } from './theme/useTheme';
 import { SettingsView } from './theme/SettingsView';
 import { ProfileView } from './auth/ProfileView';
@@ -26,12 +27,13 @@ import { useI18n } from './i18n/useI18n';
 import { TIME_ZONE_OPTIONS, detectBrowserTimeZone, timeZoneLabel, formatInTimeZone } from './i18n/timezone';
 import { AuthGate } from './auth/AuthGate';
 import { NdaGate } from './auth/NdaGate';
-import { canEdit } from './auth/roles';
 import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass, cardClass, panelHeadingClass, labelClass, listItemCardClass } from './ui';
 import { LogoMark } from './LogoMark';
 import { computeNextOccurrences, describeSchedule, DAY_NAMES, type ScheduleDef } from './schedule';
 import { logAuditView } from './audit/logView';
 import { APP_VERSION_DISPLAY } from './version';
+import { ApprovalsView } from './ApprovalsView';
+import { NotificationsBell } from './notifications/NotificationsBell';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -138,10 +140,44 @@ const JunctionNode = () => (
   </div>
 );
 
+// The Stakeholder view's node - one per Business Capability, rolling up however many systems and
+// connections sit behind it. Deliberately simpler than EASystemNode (no ArchiMate/M3 chrome, no
+// per-side handle grid) since this is a different, higher level of abstraction, not just a bigger
+// system box. Dashed border marks the synthetic "Uncategorized" bucket.
+type CapabilityNodeData = { label: string; systemCount: number; isUncategorized?: boolean };
+const CapabilityNode = ({ data }: { data: CapabilityNodeData }) => {
+  const { t } = useI18n();
+  return (
+    <div
+      className="relative min-w-[180px] min-h-[80px] flex flex-col items-center justify-center gap-1 px-4 py-3 rounded-[var(--radius-node)] border-2 cursor-pointer transition-transform hover:-translate-y-0.5"
+      style={{
+        background: 'var(--node-bg)',
+        borderColor: data.isUncategorized ? 'var(--text-muted)' : 'var(--node-border)',
+        borderStyle: data.isUncategorized ? 'dashed' : 'solid',
+        color: 'var(--node-text)',
+        boxShadow: 'var(--shadow-md)',
+      }}
+    >
+      <Building2 size={18} style={{ opacity: 0.7 }} />
+      <div className="font-bold text-center text-sm">{data.label}</div>
+      <div className="text-xs" style={{ opacity: 0.7 }}>
+        {t('capability.systemCount', { count: data.systemCount, plural: data.systemCount === 1 ? '' : 's' })}
+      </div>
+      {/* One unnamed handle per type (matching the ELK layout's left-to-right direction) - unlike
+          EASystemNode's multi-handle grid, edges here never specify source/targetHandle, and a
+          node with exactly one handle of each type needs no id for React Flow to connect to it. */}
+      <Handle type="target" position={Position.Left} className="opacity-0" />
+      <Handle type="source" position={Position.Right} className="opacity-0" />
+    </div>
+  );
+};
+
 const nodeTypes = {
   eaSystem: EASystemNode,
   junction: JunctionNode,
+  capability: CapabilityNode,
 };
+
 
 type SystemStatus = 'planned' | 'active' | 'deprecated' | 'retired';
 type Criticality = 'low' | 'medium' | 'high' | 'critical';
@@ -158,7 +194,7 @@ type SystemNodeData = {
   ownerIds?: string[];
   status?: SystemStatus;
   criticality?: Criticality;
-  businessCapability?: string;
+  businessCapabilityId?: string;
   techStack?: string[];
   description?: string;
   timeZone?: string;
@@ -183,7 +219,12 @@ type ReferenceListItem = { id: string; name: string; timeZone?: string };
 // systems/integrations, as opposed to the full admin-only user-management record (role, invite
 // history, ...) from /api/users.
 type TeamRosterUser = { id: string; name: string; email: string };
-type ReferenceListId = 'integration-types' | 'integration-software';
+type ReferenceListId = 'integration-types' | 'integration-software' | 'business-capabilities';
+
+// Sentinel used wherever a system without a Business Capability assigned needs to be addressed as
+// a value (a filter dropdown's option, the Stakeholder view's synthetic bucket) - matches the same
+// convention the backend's GET /api/systems businessCapabilityId filter understands.
+const UNCATEGORIZED = '__uncategorized__';
 
 // Every flow's frequency, unlike Integration Type/Software, isn't a shared admin-maintained tag -
 // each (edge, object) flow defines its own cadence directly, and every flow must have one (it's
@@ -211,21 +252,23 @@ const edgeObjectDetailKey = (edgeId: string, objectId: string) => `${edgeId}::${
 // Which single-valued EdgeObjectDetail field a given reference list actually populates - a flow
 // carries at most one Integration Type and one Integration Software, never several - used to find
 // (and later resolve) every place an entry is referenced before it can be deleted. Frequency isn't
-// a reference list any more, so it has no entry here.
-const REFERENCE_LIST_FIELD: Record<ReferenceListId, 'integrationTypeId' | 'integrationSoftwareId'> = {
+// a reference list any more, so it has no entry here. Business Capabilities isn't in this map at
+// all - it tags a system directly (data.businessCapabilityId), not an edge/object flow, so its
+// usage lookup and resolution take a different path (see findReferenceItemUsage below).
+const REFERENCE_LIST_FIELD: Partial<Record<ReferenceListId, 'integrationTypeId' | 'integrationSoftwareId'>> = {
   'integration-types': 'integrationTypeId',
   'integration-software': 'integrationSoftwareId',
 };
 
-// One (edge, object) flow that currently tags itself with the reference-list item a user is
-// trying to delete - what ReferenceItemDeleteDialog shows so the deletion can't silently leave
-// dangling ids behind.
+// One place that currently tags itself with the reference-list item a user is trying to delete -
+// either an (edge, object) flow (edgeId+objectId set) or a system (systemId set) - what
+// ReferenceItemDeleteDialog shows so the deletion can't silently leave a dangling id behind.
 type ReferenceItemUsage = {
   key: string;
-  edgeId: string;
-  objectId: string;
-  edgeLabel: string;
-  objectName: string;
+  label: string;
+  edgeId?: string;
+  objectId?: string;
+  systemId?: string;
 };
 
 // A planned or unplanned window where a system is unavailable - the Schedule page cross-
@@ -237,6 +280,33 @@ type SystemDowntime = { id: string; systemId: string; startsAt: string; endsAt: 
 // lets them narrow properly instead.
 const isEaSystemNode = (n: Node | null | undefined): n is Node<SystemNodeData, 'eaSystem'> =>
   !!n && n.type === 'eaSystem';
+
+// Shared by the Stakeholder view (always auto-laid-out, never persisted - capability nodes have
+// no stored position of their own) and the Technical view's "Auto-arrange" button (session-only
+// per product decision - never written back to the DB, just overrides rendering for this tab).
+// The `.bundled` build runs the layout engine synchronously in this thread rather than via a Web
+// Worker, which needs no extra bundler configuration.
+const elk = new ELK();
+async function computeAutoLayout(
+  layoutNodes: { id: string; width?: number; height?: number }[],
+  layoutEdges: { id: string; source: string; target: string }[]
+): Promise<Record<string, { x: number; y: number }>> {
+  const graph = {
+    id: 'root',
+    layoutOptions: {
+      'elk.algorithm': 'layered',
+      'elk.direction': 'RIGHT',
+      'elk.spacing.nodeNode': '70',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '110',
+    },
+    children: layoutNodes.map(n => ({ id: n.id, width: n.width || 170, height: n.height || 70 })),
+    edges: layoutEdges.map(e => ({ id: e.id, sources: [e.source], targets: [e.target] })),
+  };
+  const result = await elk.layout(graph);
+  const positions: Record<string, { x: number; y: number }> = {};
+  (result.children || []).forEach(c => { positions[c.id] = { x: c.x || 0, y: c.y || 0 }; });
+  return positions;
+}
 
 // Every data object mastered by, or flowing in/out of, a given system - shared by the canvas
 // sidebar's System Details panel and the Inventory page's own copy of it.
@@ -256,7 +326,7 @@ type RawSystemRow = {
   id: string; label: string; x: number; y: number;
   layout_positions?: Record<string, { x: number; y: number }>;
   status?: string; criticality?: string;
-  business_capability?: string; tech_stack?: string[]; description?: string; time_zone?: string;
+  business_capability_id?: string; tech_stack?: string[]; description?: string; time_zone?: string;
   owner_ids?: string[];
 };
 type RawDataObjectRow = {
@@ -398,7 +468,7 @@ const INTEGRATION_PATTERN_OPTIONS: [string, string][] = [
 // A small anchored popover - used to tuck one-off creation forms (Add System, Add Object) behind
 // a single button instead of leaving their inputs permanently open in the header, which is what
 // made the toolbar feel cluttered on every page regardless of whether you were using it.
-function Popover({ trigger, children, align = 'left' }: {
+export function Popover({ trigger, children, align = 'left' }: {
   trigger: (props: { open: boolean; toggle: () => void }) => React.ReactNode;
   children: (close: () => void) => React.ReactNode;
   align?: 'left' | 'right';
@@ -440,14 +510,14 @@ function Popover({ trigger, children, align = 'left' }: {
 // stops being usable long before a real enterprise's system count does.
 type InventoryRow = {
   id: string; label: string; status: string; criticality: string;
-  business_capability: string; description: string; time_zone: string; owner_ids: string[];
+  business_capability_id: string; description: string; time_zone: string; owner_ids: string[];
 };
 
 // The system editor - shown in the canvas sidebar when a node is selected, and reused verbatim by
 // the Inventory page's own details panel so editing a system works identically from either place.
 function SystemDetailsPanel({
-  systemId, data, objectsInSystem, renameSystem, updateSystemField, setSystemObjectName, deleteObject, onDelete, readOnly,
-  teamRoster, canManageOwners,
+  systemId, data, objectsInSystem, renameSystem, updateSystemField, setSystemObjectName, deleteObject, onDelete, readOnly, canDelete,
+  teamRoster, canManageOwners, businessCapabilities,
 }: {
   systemId: string;
   data: SystemNodeData | undefined;
@@ -458,6 +528,11 @@ function SystemDetailsPanel({
   deleteObject: (objId: string) => void;
   onDelete: () => void;
   readOnly?: boolean;
+  businessCapabilities: ReferenceListItem[];
+  // Deliberately separate from `readOnly`: a System Owner can fully edit a system they own
+  // (readOnly=false), but deleting the whole system - which cascades into every edge/object it
+  // touches, including ones on systems they don't own - stays Admin/Editor-only regardless.
+  canDelete: boolean;
   teamRoster: TeamRosterUser[];
   canManageOwners: boolean;
 }) {
@@ -512,14 +587,15 @@ function SystemDetailsPanel({
 
       <div>
         <label className={labelClass}>{t('system.details.businessCapability')}</label>
-        <input
-          type="text"
+        <select
           className={inputClass}
-          placeholder="e.g. Order to Cash"
-          value={data?.businessCapability || ''}
+          value={data?.businessCapabilityId || ''}
           disabled={readOnly}
-          onChange={(e) => updateSystemField(systemId, 'businessCapability', e.target.value, `system-capability-${systemId}`)}
-        />
+          onChange={(e) => updateSystemField(systemId, 'businessCapabilityId', e.target.value)}
+        >
+          <option value="">{t('system.details.businessCapabilityNone')}</option>
+          {businessCapabilities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
       </div>
 
       <div>
@@ -650,7 +726,7 @@ function SystemDetailsPanel({
         )}
       </div>
 
-      {!readOnly && (
+      {canDelete && (
         <button className={`${buttonDangerClass} mt-8`} onClick={onDelete}>
           <Trash2 size={14} />{t('system.details.deleteSystem')}
         </button>
@@ -1047,9 +1123,10 @@ function ScheduleEditor({
 // a plain browser alert; with usages it forces a decision - replace every usage with one other
 // value in one go, or step through and resolve each flow individually - before the delete proceeds.
 function ReferenceItemDeleteDialog({
-  item, otherItems, usages, onCancel, onConfirm,
+  item, kind, otherItems, usages, onCancel, onConfirm,
 }: {
   item: ReferenceListItem;
+  kind: 'flow' | 'system';
   otherItems: ReferenceListItem[];
   usages: ReferenceItemUsage[];
   onCancel: () => void;
@@ -1080,7 +1157,7 @@ function ReferenceItemDeleteDialog({
         {!hasUsages ? (
           <>
             <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-              {t('refDelete.notUsed')}
+              {kind === 'system' ? t('refDelete.notUsedSystems') : t('refDelete.notUsed')}
             </p>
             <div className="flex justify-end gap-2 mt-2">
               <button className={buttonSecondaryClass} onClick={onCancel}>{t('common.cancel')}</button>
@@ -1092,12 +1169,14 @@ function ReferenceItemDeleteDialog({
         ) : mode === 'choose' ? (
           <>
             <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-              {t('refDelete.usedByFlows', { count: usages.length, flows: usages.length === 1 ? 'flow' : 'flows' })}
+              {kind === 'system'
+                ? t('refDelete.usedBySystems', { count: usages.length })
+                : t('refDelete.usedByFlows', { count: usages.length, flows: usages.length === 1 ? 'flow' : 'flows' })}
             </p>
             <div className="flex flex-col gap-1 max-h-32 overflow-y-auto">
               {usages.map(u => (
-                <div key={u.key} className={`${listItemCardClass} text-xs px-2 py-1`} style={{ color: 'var(--text-secondary)' }}>
-                  <span className="font-bold" style={{ color: 'var(--text-primary)' }}>{u.objectName}</span> on {u.edgeLabel}
+                <div key={u.key} className={`${listItemCardClass} text-xs px-2 py-1`} style={{ color: 'var(--text-primary)' }}>
+                  {u.label}
                 </div>
               ))}
             </div>
@@ -1111,7 +1190,7 @@ function ReferenceItemDeleteDialog({
                 {t('refDelete.replaceEverywhere')}
               </button>
               <button className={buttonSecondaryClass} onClick={() => setMode('individual')}>
-                {t('refDelete.resolveIndividually')}
+                {kind === 'system' ? t('refDelete.resolveIndividuallySystems') : t('refDelete.resolveIndividually')}
               </button>
               <button className={buttonSecondaryClass} onClick={onCancel}>{t('common.cancel')}</button>
             </div>
@@ -1119,7 +1198,9 @@ function ReferenceItemDeleteDialog({
         ) : mode === 'replaceAll' ? (
           <>
             <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-              {t('refDelete.replaceOnAllFlows', { name: item.name, count: usages.length, plural: usages.length === 1 ? '' : 's' })}
+              {kind === 'system'
+                ? t('refDelete.replaceOnAllSystems', { name: item.name, count: usages.length, plural: usages.length === 1 ? '' : 's' })
+                : t('refDelete.replaceOnAllFlows', { name: item.name, count: usages.length, plural: usages.length === 1 ? '' : 's' })}
             </p>
             <select className={inputClass} value={replaceAllId} onChange={(e) => setReplaceAllId(e.target.value)}>
               {otherItems.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
@@ -1138,20 +1219,20 @@ function ReferenceItemDeleteDialog({
         ) : (
           <>
             <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-              {t('refDelete.chooseReplacementEach', { name: item.name })}
+              {kind === 'system'
+                ? t('refDelete.chooseReplacementEachSystem', { name: item.name })
+                : t('refDelete.chooseReplacementEach', { name: item.name })}
             </p>
             <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
               {usages.map(u => (
                 <div key={u.key} className={`${listItemCardClass} flex flex-col gap-1 px-2 py-1.5`}>
-                  <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-                    <span className="font-bold" style={{ color: 'var(--text-primary)' }}>{u.objectName}</span> on {u.edgeLabel}
-                  </span>
+                  <span className="text-xs" style={{ color: 'var(--text-primary)' }}>{u.label}</span>
                   <select
                     className={`${inputClass} px-1.5 py-1 text-xs`}
                     value={perUsageChoice[u.key] || ''}
                     onChange={(e) => setPerUsageChoice(prev => ({ ...prev, [u.key]: e.target.value }))}
                   >
-                    <option value="">{t('refDelete.removeTag')}</option>
+                    <option value="">{kind === 'system' ? t('refDelete.removeTagSystem') : t('refDelete.removeTag')}</option>
                     {otherItems.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
                   </select>
                 </div>
@@ -1174,11 +1255,12 @@ function ReferenceItemDeleteDialog({
 }
 
 function ReferenceListsPanel({
-  integrationTypes, integrationSoftwareList, onAdd, onRename, onUpdateSoftwareTimeZone, canWrite,
+  integrationTypes, integrationSoftwareList, businessCapabilities, onAdd, onRename, onUpdateSoftwareTimeZone, canWrite,
   findReferenceItemUsage, onResolveAndDelete,
 }: {
   integrationTypes: ReferenceListItem[];
   integrationSoftwareList: ReferenceListItem[];
+  businessCapabilities: ReferenceListItem[];
   onAdd: (list: ReferenceListId, name: string) => void;
   onRename: (list: ReferenceListId, id: string, name: string) => void;
   onUpdateSoftwareTimeZone: (id: string, timeZone: string) => void;
@@ -1190,6 +1272,7 @@ function ReferenceListsPanel({
   const listItems: Record<ReferenceListId, ReferenceListItem[]> = {
     'integration-types': integrationTypes,
     'integration-software': integrationSoftwareList,
+    'business-capabilities': businessCapabilities,
   };
   const [deleteRequest, setDeleteRequest] = useState<{ list: ReferenceListId; item: ReferenceListItem } | null>(null);
 
@@ -1221,9 +1304,20 @@ function ReferenceListsPanel({
         onUpdateTimeZone={onUpdateSoftwareTimeZone}
         canWrite={canWrite}
       />
+      <ReferenceListCard
+        title={t('inventory.businessCapabilities.title')}
+        blurb={t('inventory.businessCapabilities.blurb')}
+        items={businessCapabilities}
+        list="business-capabilities"
+        onAdd={onAdd}
+        onRename={onRename}
+        onDelete={requestDelete}
+        canWrite={canWrite}
+      />
       {deleteRequest && (
         <ReferenceItemDeleteDialog
           item={deleteRequest.item}
+          kind={deleteRequest.list === 'business-capabilities' ? 'system' : 'flow'}
           otherItems={listItems[deleteRequest.list].filter(i => i.id !== deleteRequest.item.id)}
           usages={findReferenceItemUsage(deleteRequest.list, deleteRequest.item.id)}
           onCancel={() => setDeleteRequest(null)}
@@ -1240,8 +1334,8 @@ function ReferenceListsPanel({
 function InventoryView({
   onSelectSystem, onViewObject, dataObjects, getSystemLabel, nodes, edges,
   renameSystem, updateSystemField, setSystemObjectName, deleteObject, deleteSystem,
-  renameObjectGlobal, updateObjectField, canWrite,
-  integrationTypes, integrationSoftwareList, onAddReferenceItem, onRenameReferenceItem, onUpdateSoftwareTimeZone,
+  renameObjectGlobal, updateObjectField, canWrite, canWriteSystem, canWriteObject,
+  integrationTypes, integrationSoftwareList, businessCapabilities, onAddReferenceItem, onRenameReferenceItem, onUpdateSoftwareTimeZone,
   findReferenceItemUsage, onResolveAndDeleteReferenceItem,
   subView, setSubView, editingSystemId, setEditingSystemId, editingObjectId, setEditingObjectId,
   currentUserId, teamRoster,
@@ -1259,9 +1353,15 @@ function InventoryView({
   deleteSystem: (sysId: string) => void;
   renameObjectGlobal: (objId: string, newName: string) => void;
   updateObjectField: <K extends keyof DataObject>(objId: string, field: K, value: DataObject[K], debounceKey?: string) => void;
+  // "Blanket" (admin/editor/superadmin) - used for whole-system delete and the shared reference
+  // lists, which never get the System Owner ownership carve-out. Per-item write access to a
+  // specific system/object goes through canWriteSystem/canWriteObject instead.
   canWrite: boolean;
+  canWriteSystem: (systemId: string | null | undefined) => boolean;
+  canWriteObject: (object: DataObject | null | undefined) => boolean;
   integrationTypes: ReferenceListItem[];
   integrationSoftwareList: ReferenceListItem[];
+  businessCapabilities: ReferenceListItem[];
   onAddReferenceItem: (list: ReferenceListId, name: string) => void;
   onRenameReferenceItem: (list: ReferenceListId, id: string, name: string) => void;
   onUpdateSoftwareTimeZone: (id: string, timeZone: string) => void;
@@ -1284,6 +1384,7 @@ function InventoryView({
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [criticalityFilter, setCriticalityFilter] = useState('');
+  const [capabilityFilter, setCapabilityFilter] = useState('');
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [objectSearch, setObjectSearch] = useState('');
@@ -1358,7 +1459,7 @@ function InventoryView({
   // Reset to page 0 whenever a filter changes. Done during render (React's recommended pattern
   // for resetting derived state - see "Adjusting state when a prop changes") rather than in an
   // effect, which would cause an extra render pass.
-  const filterKey = `${search}|${statusFilter}|${criticalityFilter}`;
+  const filterKey = `${search}|${statusFilter}|${criticalityFilter}|${capabilityFilter}`;
   const [prevFilterKey, setPrevFilterKey] = useState(filterKey);
   if (filterKey !== prevFilterKey) {
     setPrevFilterKey(filterKey);
@@ -1372,6 +1473,7 @@ function InventoryView({
       if (search) params.set('search', search);
       if (statusFilter) params.set('status', statusFilter);
       if (criticalityFilter) params.set('criticality', criticalityFilter);
+      if (capabilityFilter) params.set('businessCapabilityId', capabilityFilter);
 
       apiFetch(`/systems?${params.toString()}`)
         .then(res => res.json())
@@ -1383,7 +1485,7 @@ function InventoryView({
         .finally(() => setLoading(false));
     }, 300);
     return () => clearTimeout(timeout);
-  }, [search, statusFilter, criticalityFilter, page]);
+  }, [search, statusFilter, criticalityFilter, capabilityFilter, page]);
 
   const from = total === 0 ? 0 : page * pageSize + 1;
   const to = Math.min(total, (page + 1) * pageSize);
@@ -1425,6 +1527,7 @@ function InventoryView({
             <ReferenceListsPanel
               integrationTypes={integrationTypes}
               integrationSoftwareList={integrationSoftwareList}
+              businessCapabilities={businessCapabilities}
               onAdd={onAddReferenceItem}
               onRename={onRenameReferenceItem}
               onUpdateSoftwareTimeZone={onUpdateSoftwareTimeZone}
@@ -1524,6 +1627,11 @@ function InventoryView({
               <option value="">{t('inventory.allCriticalities')}</option>
               {Object.entries(CRITICALITY_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
             </select>
+            <select className={`${inputClass} w-auto`} value={capabilityFilter} onChange={e => setCapabilityFilter(e.target.value)}>
+              <option value="">{t('inventory.allCapabilities')}</option>
+              <option value={UNCATEGORIZED}>{t('capability.uncategorized')}</option>
+              {businessCapabilities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
           </div>
 
           <div className={`${cardClass} overflow-x-auto`}>
@@ -1571,7 +1679,9 @@ function InventoryView({
                         {CRITICALITY_LABELS[r.criticality as Criticality] || r.criticality}
                       </span>
                     </td>
-                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>{r.business_capability || '—'}</td>
+                    <td className="px-4 py-2" style={{ color: 'var(--text-secondary)' }}>
+                      {businessCapabilities.find(c => c.id === r.business_capability_id)?.name || '—'}
+                    </td>
                     <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{r.time_zone || 'UTC'}</td>
                     <td className="px-4 py-2 truncate max-w-xs" style={{ color: 'var(--text-secondary)' }} title={formatSystemSet(systemRelations.connected.get(r.id))}>
                       {formatSystemSet(systemRelations.connected.get(r.id)) || '—'}
@@ -1643,9 +1753,11 @@ function InventoryView({
               setSystemObjectName={setSystemObjectName}
               deleteObject={deleteObject}
               onDelete={() => { deleteSystem(editingSystemId); setEditingSystemId(null); }}
-              readOnly={!canWrite}
+              readOnly={!canWriteSystem(editingSystemId)}
+              canDelete={canWrite}
               teamRoster={teamRoster}
               canManageOwners={canWrite || !!(currentUserId && (editingSystemData?.ownerIds || []).includes(currentUserId))}
+              businessCapabilities={businessCapabilities}
             />
           ) : editingObject ? (
             <ObjectDetailsPanel
@@ -1657,7 +1769,7 @@ function InventoryView({
               updateObjectField={updateObjectField}
               setSystemObjectName={setSystemObjectName}
               onDelete={() => { deleteObject(editingObject.id); setEditingObjectId(null); }}
-              readOnly={!canWrite}
+              readOnly={!canWriteObject(editingObject)}
             />
           ) : null}
         </div>
@@ -1812,7 +1924,7 @@ function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
 
 function ScheduleView({
   nodes, edges, dataObjects, edgeObjectDetails, systemDowntimes,
-  getSystemLabel, getSystemTimeZone, canWrite, onAddDowntime, onDeleteDowntime,
+  getSystemLabel, getSystemTimeZone, canWrite, canWriteSystem, onAddDowntime, onDeleteDowntime,
   subView, setSubView,
 }: {
   nodes: SystemNode[];
@@ -1822,7 +1934,11 @@ function ScheduleView({
   systemDowntimes: SystemDowntime[];
   getSystemLabel: (id: string | null | undefined) => string | undefined;
   getSystemTimeZone: (id: string | null | undefined) => string;
+  // Whether the add-downtime form shows at all (blanket editor, or a system_owner who owns at
+  // least one system). Which systems that form's picker offers, and which existing downtimes can
+  // be deleted, are scoped per-row via canWriteSystem instead.
   canWrite: boolean;
+  canWriteSystem: (systemId: string | null | undefined) => boolean;
   onAddDowntime: (systemId: string, startsAt: string, endsAt: string, reason: string) => void;
   onDeleteDowntime: (id: string) => void;
   subView: ScheduleTab;
@@ -1841,7 +1957,7 @@ function ScheduleView({
     [edges, dataObjects, edgeObjectDetails, systemDowntimes, getSystemLabel, getSystemTimeZone]
   );
 
-  const systemOptions = nodes.filter(isEaSystemNode);
+  const systemOptions = nodes.filter(isEaSystemNode).filter(n => canWriteSystem(n.id));
 
   const submitDowntime = () => {
     if (!dtSystemId || !dtStart || !dtEnd) return;
@@ -1892,7 +2008,7 @@ function ScheduleView({
                     {t('schedulePage.yourTime')}: {formatInTimeZone(new Date(dt.startsAt), userTimeZone, locale)} — {formatInTimeZone(new Date(dt.endsAt), userTimeZone, locale)} ({userTimeZone})
                   </span>
                 </div>
-                {canWrite && (
+                {canWriteSystem(dt.systemId) && (
                   <button
                     className="text-[10px] px-1.5 py-0.5 rounded-[var(--radius-input)] shrink-0 transition-colors"
                     style={{ background: 'var(--danger-container)', color: 'var(--on-danger-container)' }}
@@ -1941,15 +2057,18 @@ function ScheduleView({
   );
 }
 
-type AppView = 'canvas' | 'inventory' | 'schedule' | 'settings' | 'profile';
+type AppView = 'canvas' | 'inventory' | 'schedule' | 'approvals' | 'settings' | 'profile';
 type InventoryTab = 'systems' | 'objects' | 'lists';
 type ScheduleTab = 'runs' | 'calendar';
+
+type CanvasMode = 'technical' | 'stakeholder';
 
 type AppRoute = {
   view: AppView;
   canvasSystemId: string | null;
   canvasObjectId: string | null;
   canvasEdgePair: [string, string] | null;
+  canvasMode: CanvasMode;
   inventoryTab: InventoryTab;
   inventorySystemId: string | null;
   inventoryObjectId: string | null;
@@ -1964,18 +2083,20 @@ type AppRoute = {
 function parseRouteFromLocation(): AppRoute {
   const params = new URLSearchParams(window.location.search);
   const view = params.get('view');
-  const validView: AppView = view === 'inventory' || view === 'schedule' || view === 'settings' || view === 'profile' ? view : 'canvas';
+  const validView: AppView = view === 'inventory' || view === 'schedule' || view === 'approvals' || view === 'settings' || view === 'profile' ? view : 'canvas';
   const tab = params.get('tab');
   const validTab: InventoryTab = tab === 'objects' || tab === 'lists' ? tab : 'systems';
   const validScheduleTab: ScheduleTab = tab === 'calendar' ? 'calendar' : 'runs';
   const validSettingsTab: SettingsTab = SETTINGS_TABS.includes(tab as SettingsTab) ? (tab as SettingsTab) : 'releaseNotes';
   const edgeIds = params.get('edge')?.split(',');
+  const validCanvasMode: CanvasMode = params.get('mode') === 'stakeholder' ? 'stakeholder' : 'technical';
 
   return {
     view: validView,
     canvasSystemId: validView === 'canvas' ? params.get('system') : null,
     canvasObjectId: validView === 'canvas' ? params.get('object') : null,
     canvasEdgePair: validView === 'canvas' && edgeIds?.length === 2 ? [edgeIds[0], edgeIds[1]] : null,
+    canvasMode: validCanvasMode,
     inventoryTab: validTab,
     inventorySystemId: validView === 'inventory' && validTab === 'systems' ? params.get('system') : null,
     inventoryObjectId: validView === 'inventory' && validTab === 'objects' ? params.get('object') : null,
@@ -1992,6 +2113,7 @@ function syncRouteToLocation(route: AppRoute) {
   if (route.view !== 'canvas') params.set('view', route.view);
 
   if (route.view === 'canvas') {
+    if (route.canvasMode !== 'technical') params.set('mode', route.canvasMode);
     if (route.canvasSystemId) params.set('system', route.canvasSystemId);
     else if (route.canvasObjectId) params.set('object', route.canvasObjectId);
     else if (route.canvasEdgePair) params.set('edge', route.canvasEdgePair.join(','));
@@ -2016,7 +2138,14 @@ function AppContent() {
   const { tokens } = useTheme();
   const { user, logout } = useAuth();
   const { t } = useI18n();
-  const canWrite = canEdit(user?.role);
+  // "Blanket" editors (admin/editor/superadmin) can write anything, full stop - this is the old
+  // meaning `canWrite` used to have everywhere, kept under its own name for the handful of call
+  // sites (deleting a whole system, the shared reference lists, dragging nodes around) that must
+  // NOT get the System Owner ownership carve-out `canEdit` now also grants. Everywhere else, use
+  // the per-item helpers below (canWriteSystem/canWriteObject/canProposeEdgeChange), which resolve
+  // to `blanketCanEdit` for these roles too, plus ownership for a system_owner.
+  const blanketCanEdit = user?.role === 'admin' || user?.role === 'editor' || user?.role === 'superadmin';
+  const isSystemOwnerRole = user?.role === 'system_owner';
   // Parsed once on mount so a refresh - or a URL a teammate was sent - opens straight back into
   // the same page and selection, rather than always landing on the canvas.
   const [initialRoute] = useState(() => parseRouteFromLocation());
@@ -2025,9 +2154,18 @@ function AppContent() {
   const [dataObjects, setDataObjects] = useState<DataObject[]>([]);
   const [integrationTypes, setIntegrationTypes] = useState<ReferenceListItem[]>([]);
   const [integrationSoftwareList, setIntegrationSoftwareList] = useState<ReferenceListItem[]>([]);
+  const [businessCapabilities, setBusinessCapabilities] = useState<ReferenceListItem[]>([]);
   const [edgeObjectDetails, setEdgeObjectDetails] = useState<Record<string, EdgeObjectDetail>>({});
   const [systemDowntimes, setSystemDowntimes] = useState<SystemDowntime[]>([]);
   const [teamRoster, setTeamRoster] = useState<TeamRosterUser[]>([]);
+  // Every currently-pending change request touching an edge - fetched with scope=visible (every
+  // signed-in user can see these, not just admins/approvers) so an edge with a pending edit can be
+  // shown dashed on the canvas for anyone looking at it, matching "pending changes are visible to
+  // everyone, but unmistakably not active yet." Pending *new* connections (which have no row in
+  // `edges` yet to attach this styling to) are surfaced via the Approvals page and notifications
+  // instead of as a synthesized ghost edge on the canvas - a deliberate scope cut given how deeply
+  // `edges` is threaded through the junction/grouping logic below.
+  const [pendingEdgeChangeRequests, setPendingEdgeChangeRequests] = useState<{ id: string; action: string; resourceId: string }[]>([]);
   const [view, setView] = useState<AppView>(initialRoute.view);
   const [inventoryTab, setInventoryTab] = useState<InventoryTab>(initialRoute.inventoryTab);
   const [inventoryEditingSystemId, setInventoryEditingSystemId] = useState<string | null>(initialRoute.inventorySystemId);
@@ -2040,9 +2178,12 @@ function AppContent() {
   const [newObjectMaster, setNewObjectMaster] = useState('');
   const [addMenuMode, setAddMenuMode] = useState<'menu' | 'system' | 'object'>('menu');
 
-  // Load from DB on mount
-  React.useEffect(() => {
-    apiFetch(`/state`)
+  // Loads (or reloads) the entire landscape from the DB. Used on mount, and again after an
+  // Import/Export commit writes data outside any of the granular per-entity mutation helpers
+  // below, so the canvas/inventory/schedule views pick up whatever was just imported without
+  // needing a manual page refresh.
+  const loadState = useCallback(() => {
+    return apiFetch(`/state`)
       .then(res => res.json())
       .then(data => {
         if (data.systems) {
@@ -2056,7 +2197,7 @@ function AppContent() {
               ownerIds: s.owner_ids || [],
               status: (s.status as SystemStatus) || 'active',
               criticality: (s.criticality as Criticality) || 'medium',
-              businessCapability: s.business_capability || '',
+              businessCapabilityId: s.business_capability_id || '',
               techStack: s.tech_stack || [],
               description: s.description || '',
               timeZone: s.time_zone || 'UTC',
@@ -2093,6 +2234,7 @@ function AppContent() {
             id: s.id, name: s.name, timeZone: s.time_zone || 'UTC',
           })));
         }
+        if (data.businessCapabilities) setBusinessCapabilities(data.businessCapabilities);
         if (data.edgeObjectDetails) {
           const map: Record<string, EdgeObjectDetail> = {};
           data.edgeObjectDetails.forEach((d: RawEdgeObjectDetailRow) => {
@@ -2118,10 +2260,32 @@ function AppContent() {
         }
       })
       .catch(err => console.error('Failed to load state', err));
-    // Runs once on mount; the memo below recomputes real edge colors from the current theme on
-    // every render regardless, so `tokens` doesn't need to be a dependency here.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, tokens.edgeColor]);
+
+  React.useEffect(() => {
+    loadState();
+  }, [loadState]);
+
+  const loadPendingEdgeChangeRequests = useCallback(() => {
+    return apiFetch('/change-requests?scope=visible&status=pending&resourceType=edge')
+      .then(res => res.json())
+      .then(data => setPendingEdgeChangeRequests(
+        (data.changeRequests || []).map((cr: { id: string; action: string; resource_id: string }) => ({ id: cr.id, action: cr.action, resourceId: cr.resource_id }))
+      ))
+      .catch(err => console.error('Failed to load pending change requests', err));
+  }, []);
+
+  React.useEffect(() => {
+    loadPendingEdgeChangeRequests();
+  }, [loadPendingEdgeChangeRequests]);
+
+  // The ids of existing edges with a pending update or delete - a pending *create* has no row in
+  // `edges` yet, so it isn't in this set (see the scope-cut note on pendingEdgeChangeRequests
+  // above); those are surfaced elsewhere instead of on the canvas.
+  const pendingEdgeIds = useMemo(
+    () => new Set(pendingEdgeChangeRequests.filter(cr => cr.action !== 'create').map(cr => cr.resourceId)),
+    [pendingEdgeChangeRequests]
+  );
 
   // Every signed-in user needs the team roster to populate an owner picker (not just admins, since
   // a system/integration's own current owners can manage that one resource's owner list too).
@@ -2143,12 +2307,22 @@ function AppContent() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const saveSuccessTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const apiRequest = useCallback(async (path: string, options?: RequestInit) => {
+  // Returns the parsed response (rather than being purely fire-and-forget) so a caller that needs
+  // to know whether a system_owner's write applied directly or came back `{ pending: true }` (or
+  // was rejected outright) can react - see confirmPendingEdge/updateEdgeField/deleteSelectedEdge/
+  // toggleObjectOnEdge/updateEdgeObjectDetail below. Callers that don't care (the large majority,
+  // where the UI already prevents attempting a disallowed action) can keep ignoring it exactly as
+  // before - the returned promise is simply left unawaited, same as today.
+  const apiRequest = useCallback(async (path: string, options?: RequestInit): Promise<{ ok: boolean; status: number; data: unknown }> => {
     setPendingSaves(p => p + 1);
     try {
-      await apiFetch(path, options);
+      const res = await apiFetch(path, options);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) console.error(`API request failed: ${options?.method || 'GET'} ${path}`, (data as { error?: string })?.error || res.status);
+      return { ok: res.ok, status: res.status, data };
     } catch (err) {
       console.error(`API request failed: ${options?.method || 'GET'} ${path}`, err);
+      return { ok: false, status: 0, data: null };
     } finally {
       setPendingSaves(p => {
         const next = p - 1;
@@ -2191,6 +2365,23 @@ function AppContent() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(initialRoute.canvasSystemId);
   const [selectedObjectIdSidebar, setSelectedObjectIdSidebar] = useState<string | null>(initialRoute.canvasObjectId);
 
+  // Technical (detailed system/connection graph) vs Stakeholder (rolled up by Business
+  // Capability) - a sub-mode of the Canvas view, not a separate top-level view, so it keeps the
+  // existing Canvas nav entry/URL structure. Synced to `?mode=` the same way Schedule/Settings
+  // sync their own sub-tab.
+  const [canvasMode, setCanvasMode] = useState<CanvasMode>(initialRoute.canvasMode);
+  // Session-only "Auto-arrange" result for the Technical view - never persisted (confirmed
+  // decision), cleared by a manual drag or a full reload. Checked ahead of the normal
+  // layoutPositions chain in the processedNodes memo below.
+  const [autoArrangeOverride, setAutoArrangeOverride] = useState<Record<string, { x: number; y: number }> | null>(null);
+  const [autoArranging, setAutoArranging] = useState(false);
+  // Positions for the Stakeholder view's capability nodes - always freshly computed, never
+  // persisted (a capability has no independent stored position of its own).
+  const [stakeholderLayout, setStakeholderLayout] = useState<Record<string, { x: number; y: number }>>({});
+  // Bumped to trigger a `fitView()` after a mode switch or an auto-arrange run - see
+  // FitViewOnChange, rendered inside the canvas's own ReactFlowProvider below.
+  const [fitViewTrigger, setFitViewTrigger] = useState(0);
+
   // Keeps the address bar's query string in sync with whatever page/selection is currently open,
   // so refreshing - or copying the URL and sending it to a teammate with access - reopens it here.
   React.useEffect(() => {
@@ -2199,13 +2390,14 @@ function AppContent() {
       canvasSystemId: selectedNodeId,
       canvasObjectId: selectedObjectIdSidebar,
       canvasEdgePair: selectedEdgePair,
+      canvasMode,
       inventoryTab,
       inventorySystemId: inventoryEditingSystemId,
       inventoryObjectId: inventoryEditingObjectId,
       scheduleTab,
       settingsTab,
     });
-  }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId, scheduleTab, settingsTab]);
+  }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, canvasMode, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId, scheduleTab, settingsTab]);
   const [pendingEdge, setPendingEdge] = useState<Connection | null>(null);
   const [pendingEdgeObjectId, setPendingEdgeObjectId] = useState<string>('');
   const [pendingObjectFilter, setPendingObjectFilter] = useState<string>('');
@@ -2247,6 +2439,7 @@ function AppContent() {
 
   const [filterSystemId, setFilterSystemId] = useState<string>('');
   const [filterObjectId, setFilterObjectId] = useState<string>('');
+  const [filterBusinessCapabilityId, setFilterBusinessCapabilityId] = useState<string>('');
 
   // UI state for massive lists
   const [connectionObjectSearch, setConnectionObjectSearch] = useState('');
@@ -2267,7 +2460,7 @@ function AppContent() {
         ownerIds: user ? [user.id] : [],
         status: 'active',
         criticality: 'medium',
-        businessCapability: '',
+        businessCapabilityId: '',
         techStack: [],
         description: '',
         timeZone: user?.timeZone || detectBrowserTimeZone(),
@@ -2297,6 +2490,13 @@ function AppContent() {
     const masterName = newObjectMaster.trim();
     let masterNode = nodes.find(n => isEaSystemNode(n) && n.data.label.toLowerCase() === masterName.toLowerCase());
 
+    // A System Owner can never create a brand-new system (the master-system dropdown they see is
+    // already filtered to systems they own, so this shouldn't be reachable - defensive guard only).
+    if (!masterNode && isSystemOwnerRole) {
+      alert('You can only add objects to a system you own.');
+      return false;
+    }
+
     // Create master system if it doesn't exist
     if (!masterNode) {
       const position = { x: Math.random() * 400, y: Math.random() * 400 };
@@ -2307,7 +2507,7 @@ function AppContent() {
         data: {
           label: masterName,
           layoutPositions: { global: position },
-          ownerIds, status: 'active', criticality: 'medium', businessCapability: '', techStack: [], description: '',
+          ownerIds, status: 'active', criticality: 'medium', businessCapabilityId: '', techStack: [], description: '',
         },
         position,
       };
@@ -2328,7 +2528,7 @@ function AppContent() {
     setNewObjectName('');
     setNewObjectMaster('');
     return true;
-  }, [newObjectName, newObjectMaster, dataObjects, nodes, setNodes, apiPost, user]);
+  }, [newObjectName, newObjectMaster, dataObjects, nodes, setNodes, apiPost, user, isSystemOwnerRole]);
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -2363,7 +2563,7 @@ function AppContent() {
     };
   }, []);
 
-  const confirmPendingEdge = useCallback(() => {
+  const confirmPendingEdge = useCallback(async () => {
     if (!pendingEdge) return;
 
     const objectId = pendingEdgeObjectId;
@@ -2391,25 +2591,41 @@ function AppContent() {
       style: { stroke: tokens.edgeColor, strokeWidth: 2 },
     };
 
-    setEdges((eds) => addEdge(newEdge, eds));
-    apiPost('/edges', {
+    // Not added to canvas state until the server confirms it's actually active - a System Owner
+    // proposing a connection to a system they don't own gets it queued for approval instead of
+    // created outright, and that shouldn't flash onto the canvas as if it were already live.
+    const { ok, data } = await apiPost('/edges', {
       id: newEdge.id, source: newEdge.source, target: newEdge.target,
       dataObjectIds: newEdge.data!.dataObjectIds, ownerIds,
     });
+    const result = data as { pending?: boolean; error?: string };
+    if (!ok) {
+      alert(result?.error || t('connection.createFailed'));
+      return;
+    }
+
+    setPendingEdge(null);
+    setPendingEdgeObjectId('');
+    setPendingObjectFilter('');
+
+    if (result?.pending) {
+      alert(t('connection.submittedForApproval'));
+      loadPendingEdgeChangeRequests();
+      return;
+    }
+
+    setEdges((eds) => addEdge(newEdge, eds));
     if (objectId) {
       // Frequency is mandatory per flow, so this new (edge, object) pairing gets a default the
       // moment it exists rather than being left unconfigured until someone opens the panel.
       setEdgeObjectDetails(prev => ({ ...prev, [edgeObjectDetailKey(newEdge.id, objectId)]: { schedule: DEFAULT_SCHEDULE } }));
       apiPatch(`/edges/${newEdge.id}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE });
     }
-    setPendingEdge(null);
-    setPendingEdgeObjectId('');
-    setPendingObjectFilter('');
 
     // Optionally open the right sidebar for this edge
     setSelectedEdgePair([newEdge.source, newEdge.target].sort() as [string, string]);
     setSelectedNodeId(null);
-  }, [pendingEdge, pendingEdgeObjectId, nodes, getClosestHandles, setEdges, setEdgeObjectDetails, apiPost, apiPatch, tokens.edgeColor, user]);
+  }, [pendingEdge, pendingEdgeObjectId, nodes, getClosestHandles, setEdges, setEdgeObjectDetails, apiPost, apiPatch, tokens.edgeColor, user, t, loadPendingEdgeChangeRequests]);
 
   const closeObjectWizard = useCallback(() => {
     setShowObjectWizard(false);
@@ -2447,6 +2663,18 @@ function AppContent() {
     closeObjectWizard();
   }, [pendingEdge, wizardName, wizardDescription, wizardClassification, dataObjects, setDataObjects, apiPost, t, closeObjectWizard]);
 
+  // A patch that comes back `{ pending: true }` means a system_owner's edit touched a system they
+  // don't own and was queued for approval instead of applied - the optimistic update just above
+  // already showed it as changed, so reconcile with what's actually true in the DB (a no-op for
+  // everyone else, since this only ever fires on that one queued path).
+  const reconcileIfPending = useCallback((result: { ok: boolean; data: unknown }) => {
+    if ((result.data as { pending?: boolean })?.pending) {
+      alert(t('connection.submittedForApproval'));
+      loadPendingEdgeChangeRequests();
+      loadState();
+    }
+  }, [t, loadPendingEdgeChangeRequests, loadState]);
+
   const toggleObjectOnEdge = useCallback((edgeId: string, objectId: string) => {
     setEdges((eds) =>
       eds.map((e) => {
@@ -2456,7 +2684,7 @@ function AppContent() {
           const newIds = isRemoving
             ? currentIds.filter((id) => id !== objectId)
             : [...currentIds, objectId];
-          apiPatch(`/edges/${edgeId}`, { dataObjectIds: newIds });
+          apiPatch(`/edges/${edgeId}`, { dataObjectIds: newIds }).then(reconcileIfPending);
           if (isRemoving) {
             // The object's per-flow details (pattern/frequency/type/software) belong to this
             // specific (edge, object) pairing, so they're meaningless once the object is no
@@ -2474,14 +2702,14 @@ function AppContent() {
             // moment it exists rather than being left unconfigured until someone opens the panel.
             const key = edgeObjectDetailKey(edgeId, objectId);
             setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], schedule: prev[key]?.schedule || DEFAULT_SCHEDULE } }));
-            apiPatch(`/edges/${edgeId}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE });
+            apiPatch(`/edges/${edgeId}/objects/${objectId}`, { schedule: DEFAULT_SCHEDULE }).then(reconcileIfPending);
           }
           return { ...e, data: { ...e.data, dataObjectIds: newIds } };
         }
         return e;
       })
     );
-  }, [setEdges, setEdgeObjectDetails, apiPatch, apiDelete]);
+  }, [setEdges, setEdgeObjectDetails, apiPatch, apiDelete, reconcileIfPending]);
 
   const getEdgeObjectDetail = useCallback((edgeId: string, objectId: string): EdgeObjectDetail => {
     return edgeObjectDetails[edgeObjectDetailKey(edgeId, objectId)] || {};
@@ -2492,50 +2720,41 @@ function AppContent() {
   ) => {
     const key = edgeObjectDetailKey(edgeId, objectId);
     setEdgeObjectDetails(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
-    apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: value });
-  }, [apiPatch]);
+    apiPatch(`/edges/${edgeId}/objects/${objectId}`, { [field]: value }).then(reconcileIfPending);
+  }, [apiPatch, reconcileIfPending]);
 
   const deleteSelectedEdge = useCallback(() => {
     if (selectedEdgeGroup.length > 0) {
       const idsToRemove = new Set(selectedEdgeGroup.map(e => e.id));
-      idsToRemove.forEach(id => apiDelete(`/edges/${id}`));
+      idsToRemove.forEach(id => apiDelete(`/edges/${id}`).then(reconcileIfPending));
       setEdges((eds) => eds.filter(e => !idsToRemove.has(e.id)));
       setSelectedEdgePair(null);
     }
-  }, [selectedEdgeGroup, setEdges, apiDelete]);
+  }, [selectedEdgeGroup, setEdges, apiDelete, reconcileIfPending]);
 
-  const deleteObject = useCallback((objId: string) => {
+  const deleteObject = useCallback(async (objId: string) => {
     const obj = dataObjects.find(o => o.id === objId);
     if (!window.confirm(`Are you sure you want to permanently delete the Data Object "${obj?.name}"? All connections exclusively using this object will also be deleted.`)) {
       return;
     }
 
-    // Remove object
+    // Optimistic local trim - the server does the authoritative cleanup (stripping this object out
+    // of any edge that carried it, deleting an edge entirely if it becomes empty) as part of this
+    // same DELETE, with its own authority, rather than via separate edge PATCH/DELETE calls that
+    // would now be evaluated as the caller's own edge permissions (see DELETE
+    // /api/data-objects/:id in server/index.js). loadState() below reconciles this local guess
+    // with whatever the server actually did.
     setDataObjects(objs => objs.filter(o => o.id !== objId));
-    apiDelete(`/data-objects/${objId}`);
+    setEdges(eds => eds
+      .map(e => ({ ...e, data: { ...e.data, dataObjectIds: e.data?.dataObjectIds?.filter(id => id !== objId) || [] } }))
+      .filter(e => e.data.dataObjectIds.length > 0));
 
-    // Remove object from edges. If an edge has no objects left, delete the edge entirely;
-    // otherwise persist its trimmed-down object list.
-    setEdges(eds => {
-      const updated = eds.map(e => ({
-        ...e,
-        data: {
-          ...e.data,
-          dataObjectIds: e.data?.dataObjectIds?.filter(id => id !== objId) || []
-        }
-      }));
-      updated.forEach((e, i) => {
-        const original = eds[i];
-        if (!original.data?.dataObjectIds?.includes(objId)) return;
-        if (e.data.dataObjectIds.length === 0) {
-          apiDelete(`/edges/${e.id}`);
-        } else {
-          apiPatch(`/edges/${e.id}`, { dataObjectIds: e.data.dataObjectIds });
-        }
-      });
-      return updated.filter(e => e.data.dataObjectIds.length > 0);
-    });
-  }, [dataObjects, setDataObjects, setEdges, apiDelete, apiPatch]);
+    const { ok, data } = await apiDelete(`/data-objects/${objId}`);
+    if (!ok) {
+      alert((data as { error?: string })?.error || 'Failed to delete this object.');
+    }
+    await loadState();
+  }, [dataObjects, setDataObjects, setEdges, apiDelete, loadState]);
 
   const deleteSystem = useCallback((sysId: string) => {
     // Remove system node, its edges, and any data objects it masters - mirrors the
@@ -2591,9 +2810,9 @@ function AppContent() {
 
   const updateEdgeField = useCallback(<K extends keyof IntegrationEdgeData>(edgeId: string, field: K, value: IntegrationEdgeData[K], debounceKey?: string) => {
     setEdges(eds => eds.map(e => e.id === edgeId ? { ...e, data: { ...(e.data as IntegrationEdgeData), [field]: value } } : e));
-    const doPatch = () => apiPatch(`/edges/${edgeId}`, { [field]: value });
+    const doPatch = () => apiPatch(`/edges/${edgeId}`, { [field]: value }).then(reconcileIfPending);
     if (debounceKey) scheduleSave(debounceKey, doPatch); else doPatch();
-  }, [setEdges, apiPatch, scheduleSave]);
+  }, [setEdges, apiPatch, scheduleSave, reconcileIfPending]);
 
   // Shared CRUD for the two admin-maintainable reference lists (Integration Types, Integration
   // Software) - both are simple {id, name} tables managed from the Inventory page.
@@ -2647,6 +2866,7 @@ function AppContent() {
   const referenceListSetters = useMemo((): Record<ReferenceListId, [React.Dispatch<React.SetStateAction<ReferenceListItem[]>>, string]> => ({
     'integration-types': [setIntegrationTypes, 'itype'],
     'integration-software': [setIntegrationSoftwareList, 'isw'],
+    'business-capabilities': [setBusinessCapabilities, 'bcap'],
   }), []);
 
   const handleAddReferenceItem = useCallback((list: ReferenceListId, name: string) => {
@@ -2767,27 +2987,85 @@ function AppContent() {
     return (isEaSystemNode(node) ? node.data.timeZone : undefined) || 'UTC';
   }, [nodes]);
 
-  // Every (edge, object) flow currently tagged with a given reference-list item - what gates the
-  // Integration Lists tab's delete flow from silently leaving a flow pointing at a deleted id.
+  // ---------------------------------------------------------------------------
+  // Per-item write permissions - the System Owner role can write, but only within what it owns,
+  // so a single blanket boolean (see blanketCanEdit above) can no longer describe the whole app's
+  // permission surface. These mirror the server's own ownership checks (see isResourceOwner/
+  // resolveEdgeAuthority in server/index.js) closely enough to keep the UI honest about what a
+  // save will actually do, but the server remains the source of truth either way.
+  // ---------------------------------------------------------------------------
+  const isSystemOwnedByMe = useCallback((systemId: string | null | undefined) => {
+    if (!systemId || !user) return false;
+    const node = nodes.find(n => n.id === systemId);
+    return isEaSystemNode(node) ? (node.data.ownerIds || []).includes(user.id) : false;
+  }, [nodes, user]);
+
+  // Full field access to a system's own data - status/criticality/description/etc. Never needs
+  // approval (it only ever touches the one system), so this alone decides read-only-ness.
+  const canWriteSystem = useCallback((systemId: string | null | undefined) =>
+    blanketCanEdit || isSystemOwnedByMe(systemId),
+  [blanketCanEdit, isSystemOwnedByMe]);
+
+  // Full field access to an object mastered by an owned system - same reasoning as canWriteSystem.
+  const canWriteObject = useCallback((object: DataObject | null | undefined) =>
+    blanketCanEdit || isSystemOwnedByMe(object?.masterSystemId),
+  [blanketCanEdit, isSystemOwnedByMe]);
+
+  // Whether there's any standing to touch this edge at all (own at least one endpoint) - governs
+  // whether its fields are enabled/a delete button shows, NOT whether saving will apply directly
+  // or come back pending (the server decides that per resolveEdgeAuthority; a System Owner who
+  // owns only one endpoint should still be able to attempt the edit, just expect it to need
+  // approval).
+  const canProposeEdgeChange = useCallback((edge: IntegrationEdge | null | undefined) =>
+    blanketCanEdit || isSystemOwnedByMe(edge?.source) || isSystemOwnedByMe(edge?.target),
+  [blanketCanEdit, isSystemOwnedByMe]);
+
+  // Whether this edge is fully self-serve (owns both endpoints) - used only to decide how to label
+  // a save ("Save" vs "Propose change"), never to hide/disable anything canProposeEdgeChange
+  // already allows.
+  const canWriteEdgeSelfServe = useCallback((edge: IntegrationEdge | null | undefined) =>
+    blanketCanEdit || (isSystemOwnedByMe(edge?.source) && isSystemOwnedByMe(edge?.target)),
+  [blanketCanEdit, isSystemOwnedByMe]);
+
+  // Plain-data views of nodes/edges for the Import/Export settings page - kept independent of
+  // SystemNode/IntegrationEdge (React Flow's node/edge shapes) so that file has no dependency on
+  // this one, since it's rendered from here via SettingsView.
+  const importExportSystems = useMemo(
+    () => nodes.filter(isEaSystemNode).map(n => ({
+      id: n.id, label: n.data.label,
+      businessCapabilityName: businessCapabilities.find(c => c.id === n.data.businessCapabilityId)?.name,
+    })),
+    [nodes, businessCapabilities]
+  );
+  const importExportEdges = useMemo(
+    () => edges.map(e => ({ id: e.id, source: e.source, target: e.target, description: e.data?.description, objectIds: e.data?.dataObjectIds || [] })),
+    [edges]
+  );
+
+  // Every (edge, object) flow or system currently tagged with a given reference-list item - what
+  // gates the Reference Lists tab's delete flow from silently leaving something pointing at a
+  // deleted id. Business Capabilities tags a system directly rather than a flow, so it's looked up
+  // over `nodes` instead of `edgeObjectDetails`.
   const findReferenceItemUsage = useCallback((list: ReferenceListId, itemId: string): ReferenceItemUsage[] => {
-    const field = REFERENCE_LIST_FIELD[list];
+    if (list === 'business-capabilities') {
+      return nodes.filter(isEaSystemNode).filter(n => n.data.businessCapabilityId === itemId)
+        .map(n => ({ key: n.id, label: n.data.label, systemId: n.id }));
+    }
+    const field = REFERENCE_LIST_FIELD[list]!;
     const usages: ReferenceItemUsage[] = [];
     Object.entries(edgeObjectDetails).forEach(([key, detail]) => {
       if (detail[field] !== itemId) return;
       const [edgeId, objectId] = key.split('::');
       const edge = edges.find(e => e.id === edgeId);
       const obj = dataObjects.find(o => o.id === objectId);
-      usages.push({
-        key, edgeId, objectId,
-        edgeLabel: edge ? `${getSystemLabel(edge.source) || edge.source} → ${getSystemLabel(edge.target) || edge.target}` : edgeId,
-        objectName: obj?.name || objectId,
-      });
+      const edgeLabel = edge ? `${getSystemLabel(edge.source) || edge.source} → ${getSystemLabel(edge.target) || edge.target}` : edgeId;
+      usages.push({ key, edgeId, objectId, label: `${obj?.name || objectId} on ${edgeLabel}` });
     });
     return usages;
-  }, [edgeObjectDetails, edges, dataObjects, getSystemLabel]);
+  }, [edgeObjectDetails, edges, dataObjects, getSystemLabel, nodes]);
 
   // Applies each usage's resolution (a replacement item, or plain removal) before deleting the
-  // reference-list item itself, so no connection is left tagged with an id that no longer exists.
+  // reference-list item itself, so nothing is left tagged with an id that no longer exists.
   const handleResolveAndDeleteReferenceItem = useCallback((
     list: ReferenceListId,
     itemId: string,
@@ -2795,24 +3073,43 @@ function AppContent() {
     resolutions: Record<string, string | null>
   ) => {
     if (usages.length > 0) {
-      const field = REFERENCE_LIST_FIELD[list];
-      const nextDetails = { ...edgeObjectDetails };
-      usages.forEach(u => {
-        const replacement = resolutions[u.key] || '';
-        nextDetails[u.key] = { ...nextDetails[u.key], [field]: replacement };
-        apiPatch(`/edges/${u.edgeId}/objects/${u.objectId}`, { [field]: replacement });
-      });
-      setEdgeObjectDetails(nextDetails);
+      if (list === 'business-capabilities') {
+        usages.forEach(u => {
+          if (u.systemId) updateSystemField(u.systemId, 'businessCapabilityId', resolutions[u.key] || '');
+        });
+      } else {
+        const field = REFERENCE_LIST_FIELD[list]!;
+        const nextDetails = { ...edgeObjectDetails };
+        usages.forEach(u => {
+          const replacement = resolutions[u.key] || '';
+          nextDetails[u.key] = { ...nextDetails[u.key], [field]: replacement };
+          if (u.edgeId && u.objectId) apiPatch(`/edges/${u.edgeId}/objects/${u.objectId}`, { [field]: replacement });
+        });
+        setEdgeObjectDetails(nextDetails);
+      }
     }
 
     const [setList] = referenceListSetters[list];
     deleteReferenceListItem(list, setList, itemId);
-  }, [edgeObjectDetails, apiPatch, referenceListSetters, deleteReferenceListItem]);
+  }, [edgeObjectDetails, apiPatch, referenceListSetters, deleteReferenceListItem, updateSystemField]);
 
   const { processedNodes, processedEdges } = useMemo(() => {
     let finalNodes: Node[] = [...nodes.filter(n => n.type !== 'junction')]; // Base system nodes
     let finalEdges: Edge[] = [];
     const hiddenOriginalEdges = new Set<string>();
+
+    // Shared by both the junction-spoke and standard-edge passes below, so a "conflicting" edge
+    // (carries an object with more than one master) and a "pending approval" edge compose into one
+    // consistent visual instead of two independent, duplicated color/dash decisions: conflict still
+    // wins the base color (it's the more urgent signal), pending always adds a dashed stroke and a
+    // label suffix on top, whichever color was chosen.
+    const resolveEdgeVisualState = (groupEdges: IntegrationEdge[]) => {
+      const hasConflict = groupEdges.some(e => e.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
+      const hasPending = groupEdges.some(e => pendingEdgeIds.has(e.id));
+      const color = hasConflict ? tokens.edgeConflictColor : hasPending ? tokens.edgePendingColor : tokens.edgeColor;
+      const strokeWidth = hasConflict ? 3 : 2;
+      return { hasConflict, hasPending, color, strokeWidth, strokeDasharray: hasPending ? '6 4' : undefined };
+    };
 
     // 1. Apply Junction Pattern if a node is selected
     if (selectedNodeId) {
@@ -2896,12 +3193,10 @@ function AppContent() {
             finalNodes.push(juncNode);
 
             // Base color logic
-            const hasConflict = groupEdges.some(e => e.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
-            const color = hasConflict ? tokens.edgeConflictColor : tokens.edgeColor;
-            const strokeWidth = hasConflict ? 3 : 2;
+            const { color, strokeWidth, strokeDasharray } = resolveEdgeVisualState(groupEdges);
             const baseEdgeStyle = {
               type: 'smoothstep',
-              style: { stroke: color, strokeWidth },
+              style: { stroke: color, strokeWidth, strokeDasharray },
               labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
               labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
               labelBgPadding: [6, 3] as [number, number],
@@ -2994,10 +3289,9 @@ function AppContent() {
     pairwiseEdges.forEach((group, pairKey) => {
       const e = group[0];
       const groupObjIds = group.flatMap(ge => ge.data?.dataObjectIds || []);
-      const hasConflict = group.some(ge => ge.data?.dataObjectIds?.some(id => objectsWithMultipleMasters.has(id)));
+      const { hasConflict, hasPending, color, strokeWidth, strokeDasharray } = resolveEdgeVisualState(group);
       const recordType = !hasConflict ? getRecordTypeGroup(groupObjIds, [e.source, e.target]) : undefined;
-      const color = hasConflict ? tokens.edgeConflictColor : tokens.edgeColor;
-      const strokeWidth = hasConflict ? 3 : 2;
+      const pendingSuffix = hasPending ? ` (${t('connection.pendingApproval')})` : '';
 
       const sNode = finalNodes.find(n => n.id === e.source);
       const tNode = finalNodes.find(n => n.id === e.target);
@@ -3011,14 +3305,14 @@ function AppContent() {
 
       if (group.length === 1) {
         const labels = e.data?.dataObjectIds?.map(id => getSystemObjectName(id, e.source)).join(', ') || '';
-        const displayLabel = recordType ? `${labels} → ${recordType}` : labels;
+        const displayLabel = (recordType ? `${labels} → ${recordType}` : labels) + pendingSuffix;
         finalEdges.push({
           ...e,
           sourceHandle: sHandle,
           targetHandle: tHandle,
           label: displayLabel,
           type: 'smoothstep',
-          style: { stroke: color, strokeWidth },
+          style: { stroke: color, strokeWidth, strokeDasharray },
           labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
           labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
           labelBgPadding: [6, 3] as [number, number],
@@ -3038,7 +3332,7 @@ function AppContent() {
 
         const labels = Array.from(allLabels).filter(Boolean);
         const joinedLabels = labels.length > 3 ? `${labels.length} flows` : labels.join(', ');
-        const displayLabel = recordType ? `${joinedLabels} → ${recordType}` : joinedLabels;
+        const displayLabel = (recordType ? `${joinedLabels} → ${recordType}` : joinedLabels) + pendingSuffix;
 
         const markerEnd = hasForward ? { type: MarkerType.ArrowClosed, color } : undefined;
         const markerStart = hasBackward ? { type: MarkerType.ArrowClosed, color, orient: 'auto-start-reverse' } : undefined;
@@ -3050,7 +3344,7 @@ function AppContent() {
           targetHandle: tHandle,
           label: displayLabel,
           type: 'smoothstep',
-          style: { stroke: color, strokeWidth },
+          style: { stroke: color, strokeWidth, strokeDasharray },
           labelStyle: { fill: color, fontWeight: 700, fontSize: 11 },
           labelBgStyle: { fill: tokens.labelBg, fillOpacity: 0.9, stroke: color, strokeWidth: 1 },
           labelBgPadding: [6, 3] as [number, number],
@@ -3113,6 +3407,21 @@ function AppContent() {
       finalNodes = finalNodes.filter(n => visibleNodeIds.has(n.id));
     }
 
+    // Business Capability filter (Technical view toolbar, or a Stakeholder-view drill-down) - a
+    // true subgraph, unlike the system/object filters above: only systems in the chosen capability
+    // survive, and only edges where *both* ends are in it, not just anything touching one of them.
+    if (filterBusinessCapabilityId) {
+      const inCapability = new Set(
+        nodes.filter(isEaSystemNode).filter(n =>
+          filterBusinessCapabilityId === UNCATEGORIZED
+            ? !n.data.businessCapabilityId
+            : n.data.businessCapabilityId === filterBusinessCapabilityId
+        ).map(n => n.id)
+      );
+      finalEdges = finalEdges.filter(e => inCapability.has(e.source) && inCapability.has(e.target));
+      finalNodes = finalNodes.filter(n => inCapability.has(n.id));
+    }
+
     // Apply context-specific positions and highlighting
     finalNodes = finalNodes.map(n => {
       if (!isEaSystemNode(n)) return n;
@@ -3120,8 +3429,12 @@ function AppContent() {
       const contextKey = selectedNodeId || 'global';
       const layoutPositions = n.data.layoutPositions || {};
 
+      // A session-only "Auto-arrange" result (never persisted - see autoArrangeOverride's own
+      // comment) wins over the normal stored-layout chain whenever it's active.
       let position = n.position;
-      if (contextKey !== 'global' && layoutPositions[contextKey]) {
+      if (autoArrangeOverride?.[n.id]) {
+        position = autoArrangeOverride[n.id];
+      } else if (contextKey !== 'global' && layoutPositions[contextKey]) {
         position = layoutPositions[contextKey];
       } else if (layoutPositions['global']) {
         position = layoutPositions['global'];
@@ -3138,7 +3451,114 @@ function AppContent() {
     }) as SystemNode[];
 
     return { processedNodes: finalNodes, processedEdges: finalEdges as IntegrationEdge[] };
-  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, selectedNodeId, getSystemObjectName, getRecordTypeGroup, getClosestHandles, tokens]);
+  }, [nodes, edges, dataObjects, objectsWithMultipleMasters, filterSystemId, filterObjectId, filterBusinessCapabilityId, selectedNodeId, getSystemObjectName, getRecordTypeGroup, getClosestHandles, tokens, pendingEdgeIds, t, autoArrangeOverride]);
+
+  // Stakeholder view's raw (unpositioned) graph - completely separate from the junction/spoke
+  // aggregation above, which is Technical-view-only. One node per Business Capability actually in
+  // use (plus a synthetic "Uncategorized" bucket for systems with none - confirmed decision:
+  // grouped and shown, never silently hidden), and one edge per pair of capabilities with at least
+  // one real system-to-system connection between them, labeled with how many back it.
+  const stakeholderGraph = useMemo(() => {
+    const systemNodes = nodes.filter(isEaSystemNode);
+    const groupOf = (systemId: string) => {
+      const n = systemNodes.find(sn => sn.id === systemId);
+      return n?.data.businessCapabilityId || UNCATEGORIZED;
+    };
+    const systemCountByGroup = new Map<string, number>();
+    systemNodes.forEach(n => {
+      const g = groupOf(n.id);
+      systemCountByGroup.set(g, (systemCountByGroup.get(g) || 0) + 1);
+    });
+
+    const capNodes: { id: string; data: CapabilityNodeData }[] = [...systemCountByGroup.entries()].map(([groupId, count]) => ({
+      id: groupId,
+      data: {
+        label: groupId === UNCATEGORIZED ? t('capability.uncategorized') : (businessCapabilities.find(c => c.id === groupId)?.name || groupId),
+        systemCount: count,
+        isUncategorized: groupId === UNCATEGORIZED,
+      },
+    }));
+
+    const pairCounts = new Map<string, number>();
+    edges.forEach(e => {
+      const a = groupOf(e.source);
+      const b = groupOf(e.target);
+      if (a === b) return; // intra-capability - not meaningful at this rolled-up level
+      const key = [a, b].sort().join('|');
+      pairCounts.set(key, (pairCounts.get(key) || 0) + 1);
+    });
+    const capEdges: { id: string; source: string; target: string; count: number }[] = [...pairCounts.entries()].map(([key, count]) => {
+      const [source, target] = key.split('|');
+      return { id: `cap-edge-${key}`, source, target, count };
+    });
+
+    return { capNodes, capEdges };
+  }, [nodes, edges, businessCapabilities, t]);
+
+  // Always fresh, never persisted - a capability node has no stored position of its own. Recomputed
+  // whenever the underlying graph changes; cheap given how few capabilities there typically are
+  // compared to individual systems.
+  useEffect(() => {
+    let cancelled = false;
+    computeAutoLayout(
+      stakeholderGraph.capNodes.map(n => ({ id: n.id, width: 190, height: 90 })),
+      stakeholderGraph.capEdges
+    ).then(positions => {
+      if (cancelled) return;
+      setStakeholderLayout(positions);
+      // The layout is computed asynchronously, so a fitView() triggered by switching into this
+      // mode fires before positions are known (everything briefly sits at 0,0) - re-fit once the
+      // real positions land instead of leaving the viewport zoomed to that stale point. Only while
+      // actually looking at this view - this effect also runs quietly in the background whenever
+      // the underlying data changes while on the Technical view, and shouldn't yank that view's
+      // pan/zoom around.
+      if (canvasMode === 'stakeholder') setFitViewTrigger(x => x + 1);
+    });
+    return () => { cancelled = true; };
+  }, [stakeholderGraph, canvasMode]);
+
+  const stakeholderNodes = useMemo((): Node[] => stakeholderGraph.capNodes.map(n => ({
+    id: n.id,
+    type: 'capability',
+    position: stakeholderLayout[n.id] || { x: 0, y: 0 },
+    data: n.data as unknown as Record<string, unknown>,
+  })), [stakeholderGraph, stakeholderLayout]);
+
+  const stakeholderEdges = useMemo((): IntegrationEdge[] => stakeholderGraph.capEdges.map(e => ({
+    id: e.id,
+    source: e.source,
+    target: e.target,
+    data: { dataObjectIds: [] },
+    label: t('capability.connectionCount', { count: e.count, plural: e.count === 1 ? '' : 's' }),
+    style: { stroke: tokens.edgeColor, strokeWidth: Math.min(1 + e.count, 8) },
+    markerEnd: { type: MarkerType.ArrowClosed, color: tokens.edgeColor },
+  })), [stakeholderGraph, t, tokens.edgeColor]);
+
+  // Auto-arrange (Technical view only, session-only per confirmed decision - see
+  // autoArrangeOverride's own comment) runs the same layout engine over whichever nodes/edges are
+  // currently visible (so it respects the active system/object/capability filters), never touching
+  // the database.
+  const runAutoArrange = useCallback(async () => {
+    setAutoArranging(true);
+    try {
+      // Laid out from the raw system-to-system `edges`/`nodes` state, not `processedEdges` -
+      // junction hub/spoke edges synthesize a spoke endpoint id (the junction dot) that doesn't
+      // exist as a real node ELK could place, and junction *nodes* have no position of their own
+      // to arrange anyway (their position is always re-derived from their connected systems'
+      // current positions on every render, junction or not). Restricted to whichever systems are
+      // currently visible, so Auto-arrange respects the active system/object/capability filters.
+      const visibleSystemIds = new Set(processedNodes.filter(n => n.type === 'eaSystem').map(n => n.id));
+      const layoutNodes = [...visibleSystemIds].map(id => ({ id, width: 170, height: 70 }));
+      const layoutEdges = edges
+        .filter(e => e.source !== e.target && visibleSystemIds.has(e.source) && visibleSystemIds.has(e.target))
+        .map(e => ({ id: e.id, source: e.source, target: e.target }));
+      const positions = await computeAutoLayout(layoutNodes, layoutEdges);
+      setAutoArrangeOverride(positions);
+      setFitViewTrigger(x => x + 1);
+    } finally {
+      setAutoArranging(false);
+    }
+  }, [processedNodes, edges]);
 
   const primaryEdge = selectedEdgeGroup[0];
   const selectedSystemNode = nodes.find(n => n.id === selectedNodeId);
@@ -3197,6 +3617,11 @@ function AppContent() {
   }, [view, inventoryTab]);
 
   const onContextAwareNodesChange = useCallback((changes: NodeChange[]) => {
+    // A manual drag while a session-only Auto-arrange override is active reverts *everyone* to
+    // normal persisted-layout behavior rather than leaving one node manually placed on top of an
+    // otherwise auto-arranged graph - a mixed state would be confusing to look at.
+    if (autoArrangeOverride && changes.some(c => c.type === 'position')) setAutoArrangeOverride(null);
+
     setNodes((prevNodes) => {
       // First, handle position changes specially for context-awareness
       const positionChanges = changes.filter((c): c is NodeChange & { type: 'position' } => c.type === 'position');
@@ -3241,7 +3666,7 @@ function AppContent() {
 
       return updatedNodes;
     });
-  }, [selectedNodeId, setNodes, scheduleSave, apiPatch]);
+  }, [selectedNodeId, setNodes, scheduleSave, apiPatch, autoArrangeOverride]);
 
   const objectsInPendingSource = useMemo(() => {
     if (!pendingEdge) return [];
@@ -3475,6 +3900,15 @@ function AppContent() {
           >
             <Calendar size={14} />{t('nav.schedule')}
           </button>
+          {(isSystemOwnerRole || user?.role === 'admin' || user?.role === 'superadmin') && (
+            <button
+              className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+              style={view === 'approvals' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
+              onClick={() => setView('approvals')}
+            >
+              <CheckCircle2 size={14} />{t('nav.approvals')}
+            </button>
+          )}
           <button
             className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
             style={view === 'settings' ? { background: 'var(--bg-surface)', color: 'var(--primary)' } : { color: 'var(--text-on-header)' }}
@@ -3486,6 +3920,7 @@ function AppContent() {
 
         {user && (
           <div className="flex items-center gap-2 pl-2 text-sm" style={{ color: 'var(--text-on-header)' }}>
+            <NotificationsBell onNavigate={(linkView) => { if (linkView === 'approvals') setView('approvals'); }} />
             <button
               className="flex items-center gap-1.5 opacity-90 rounded-[var(--radius-button)] pl-1 pr-1.5 -mx-1 py-1 transition-colors hover:opacity-100"
               style={view === 'profile' ? { background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' } : undefined}
@@ -3514,7 +3949,29 @@ function AppContent() {
           className="px-5 py-2.5 flex items-center gap-2 flex-wrap border-b"
           style={{ background: 'var(--bg-surface-alt)', borderColor: 'var(--border)' }}
         >
-          {canWrite && (
+          <div
+            className="flex gap-1 items-center p-1 rounded-[var(--radius-card)]"
+            style={{ background: 'var(--bg-surface)' }}
+          >
+            <button
+              className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+              style={canvasMode === 'technical' ? { background: 'var(--primary)', color: 'var(--on-primary)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => { setCanvasMode('technical'); setFitViewTrigger(x => x + 1); }}
+            >
+              <Workflow size={14} />{t('canvas.mode.technical')}
+            </button>
+            <button
+              className="flex items-center gap-1.5 px-3 py-1 rounded-[var(--radius-button)] text-sm transition-colors"
+              style={canvasMode === 'stakeholder' ? { background: 'var(--primary)', color: 'var(--on-primary)' } : { color: 'var(--text-secondary)' }}
+              onClick={() => { setCanvasMode('stakeholder'); setSelectedNodeId(null); setSelectedEdgePair(null); setFitViewTrigger(x => x + 1); }}
+            >
+              <Network size={14} />{t('canvas.mode.stakeholder')}
+            </button>
+          </div>
+
+          <div className="w-px h-5 mx-1" style={{ background: 'var(--border)' }} />
+
+          {canvasMode === 'technical' && (blanketCanEdit || isSystemOwnerRole) && (
             <>
               <Popover
                 trigger={({ toggle }) => (
@@ -3530,13 +3987,15 @@ function AppContent() {
                   if (addMenuMode === 'menu') {
                     return (
                       <div className="flex flex-col gap-1">
-                        <button
-                          className="flex items-center gap-2 px-2 py-1.5 rounded-[var(--radius-button)] text-sm text-left transition-colors hover:opacity-80"
-                          style={{ color: 'var(--text-primary)' }}
-                          onClick={() => setAddMenuMode('system')}
-                        >
-                          <Workflow size={14} />{t('canvas.addSystem')}
-                        </button>
+                        {!isSystemOwnerRole && (
+                          <button
+                            className="flex items-center gap-2 px-2 py-1.5 rounded-[var(--radius-button)] text-sm text-left transition-colors hover:opacity-80"
+                            style={{ color: 'var(--text-primary)' }}
+                            onClick={() => setAddMenuMode('system')}
+                          >
+                            <Workflow size={14} />{t('canvas.addSystem')}
+                          </button>
+                        )}
                         <button
                           className="flex items-center gap-2 px-2 py-1.5 rounded-[var(--radius-button)] text-sm text-left transition-colors hover:opacity-80"
                           style={{ color: 'var(--text-primary)' }}
@@ -3581,7 +4040,7 @@ function AppContent() {
                         onChange={(e) => setNewObjectMaster(e.target.value)}
                       >
                         <option value="" disabled>{t('canvas.masterSystemPlaceholder')}</option>
-                        {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
+                        {nodes.filter(isEaSystemNode).filter(n => canWriteSystem(n.id)).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
                       </select>
                       <button className={buttonPrimaryClass} onClick={() => { if (addObject()) close(); }}>
                         <Plus size={14} />{t('canvas.addObject')}
@@ -3595,45 +4054,68 @@ function AppContent() {
             </>
           )}
 
-          <div className="relative">
-            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
-            <input
-              className={`${inputClass} pl-8 w-40`}
-              value={filterSystemId}
-              onChange={(e) => setFilterSystemId(e.target.value)}
-              placeholder={t('canvas.filterBySystem')}
-              list="filter-systems-list"
-            />
-            <datalist id="filter-systems-list">
-              {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
-            </datalist>
-          </div>
+          {canvasMode === 'technical' && (
+            <>
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+                <input
+                  className={`${inputClass} pl-8 w-40`}
+                  value={filterSystemId}
+                  onChange={(e) => setFilterSystemId(e.target.value)}
+                  placeholder={t('canvas.filterBySystem')}
+                  list="filter-systems-list"
+                />
+                <datalist id="filter-systems-list">
+                  {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.id}>{n.data.label}</option>)}
+                </datalist>
+              </div>
 
-          <div className="relative">
-            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
-            <input
-              className={`${inputClass} pl-8 w-40`}
-              value={filterObjectId}
-              onChange={(e) => setFilterObjectId(e.target.value)}
-              placeholder={t('canvas.filterByObject')}
-              list="filter-objects-list"
-            />
-            <datalist id="filter-objects-list">
-              {dataObjects.map(o => {
-                const systemNames = Object.values(o.systemObjectNames || {}).map(e => e.name).filter(Boolean).join(', ');
-                return <option key={o.id} value={o.id}>{o.name} {systemNames ? `(${systemNames})` : ''}</option>;
-              })}
-            </datalist>
-          </div>
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-muted)' }} />
+                <input
+                  className={`${inputClass} pl-8 w-40`}
+                  value={filterObjectId}
+                  onChange={(e) => setFilterObjectId(e.target.value)}
+                  placeholder={t('canvas.filterByObject')}
+                  list="filter-objects-list"
+                />
+                <datalist id="filter-objects-list">
+                  {dataObjects.map(o => {
+                    const systemNames = Object.values(o.systemObjectNames || {}).map(e => e.name).filter(Boolean).join(', ');
+                    return <option key={o.id} value={o.id}>{o.name} {systemNames ? `(${systemNames})` : ''}</option>;
+                  })}
+                </datalist>
+              </div>
 
-          {(filterSystemId || filterObjectId) && (
-            <button
-              className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-[var(--radius-button)] transition-colors"
-              style={{ color: 'var(--text-secondary)' }}
-              onClick={() => { setFilterSystemId(''); setFilterObjectId(''); }}
-            >
-              <X size={12} />Clear filters
-            </button>
+              <select
+                className={`${inputClass} w-auto`}
+                value={filterBusinessCapabilityId}
+                onChange={(e) => setFilterBusinessCapabilityId(e.target.value)}
+              >
+                <option value="">{t('canvas.filterByCapability')}</option>
+                <option value={UNCATEGORIZED}>{t('capability.uncategorized')}</option>
+                {businessCapabilities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+
+              {(filterSystemId || filterObjectId || filterBusinessCapabilityId) && (
+                <button
+                  className="flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-[var(--radius-button)] transition-colors"
+                  style={{ color: 'var(--text-secondary)' }}
+                  onClick={() => { setFilterSystemId(''); setFilterObjectId(''); setFilterBusinessCapabilityId(''); }}
+                >
+                  <X size={12} />{t('canvas.clearFilters')}
+                </button>
+              )}
+
+              <button
+                className={buttonSecondaryClass}
+                disabled={autoArranging}
+                title={t('canvas.autoArrangeHint')}
+                onClick={runAutoArrange}
+              >
+                <Shuffle size={14} />{autoArranging ? t('common.loading') : t('canvas.autoArrange')}
+              </button>
+            </>
           )}
         </div>
       )}
@@ -3653,9 +4135,12 @@ function AppContent() {
           deleteSystem={deleteSystem}
           renameObjectGlobal={renameObjectGlobal}
           updateObjectField={updateObjectField}
-          canWrite={canWrite}
+          canWrite={blanketCanEdit}
+          canWriteSystem={canWriteSystem}
+          canWriteObject={canWriteObject}
           integrationTypes={integrationTypes}
           integrationSoftwareList={integrationSoftwareList}
+          businessCapabilities={businessCapabilities}
           onAddReferenceItem={handleAddReferenceItem}
           onRenameReferenceItem={handleRenameReferenceItem}
           onUpdateSoftwareTimeZone={handleUpdateSoftwareTimeZone}
@@ -3679,53 +4164,86 @@ function AppContent() {
           systemDowntimes={systemDowntimes}
           getSystemLabel={getSystemLabel}
           getSystemTimeZone={getSystemTimeZone}
-          canWrite={canWrite}
+          canWrite={blanketCanEdit || isSystemOwnerRole}
+          canWriteSystem={canWriteSystem}
           onAddDowntime={addDowntime}
           onDeleteDowntime={deleteDowntime}
           subView={scheduleTab}
           setSubView={setScheduleTab}
         />
       ) : view === 'settings' ? (
-        <SettingsView tab={settingsTab} setTab={setSettingsTab} />
+        <SettingsView
+          tab={settingsTab}
+          setTab={setSettingsTab}
+          importExportSystems={importExportSystems}
+          importExportObjects={dataObjects}
+          importExportEdges={importExportEdges}
+          getSystemLabel={getSystemLabel}
+          reloadState={loadState}
+        />
+      ) : view === 'approvals' ? (
+        <ApprovalsView getSystemLabel={getSystemLabel} edges={edges} dataObjects={dataObjects} />
       ) : view === 'profile' ? (
         <ProfileView />
       ) : (
       <div className="flex flex-1 overflow-hidden">
         {/* Canvas */}
         <div className="flex-1 relative" style={{ background: 'var(--bg-canvas)' }}>
-          <ReactFlow
-            nodes={processedNodes}
-            edges={processedEdges}
-            nodeTypes={nodeTypes}
-            onNodesChange={onContextAwareNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onEdgeClick={(_, edge) => {
-              const pair = resolveEdgePair(edge);
-              if (!pair) return; // a junction's aggregate hub edge fans into several remotes at once - nothing single to open
-              setSelectedEdgePair(pair);
-              setSelectedNodeId(null);
-              setSelectedObjectIdSidebar(null);
-            }}
-            onNodeClick={(_, node) => {
-              if (node.type === 'junction') return;
-              setSelectedNodeId(node.id);
-              setSelectedEdgePair(null);
-              setSelectedObjectIdSidebar(null);
-            }}
-            onPaneClick={() => {
-              setSelectedEdgePair(null);
-              setSelectedNodeId(null);
-              setSelectedObjectIdSidebar(null);
-            }}
-            connectionMode={ConnectionMode.Loose}
-            nodesDraggable={canWrite}
-            nodesConnectable={canWrite}
-            fitView
-          >
-            <Controls />
-            <Background color={tokens.canvasDotColor} gap={16} />
-          </ReactFlow>
+            <ReactFlow
+              // Forces a full remount (rather than fighting the timing of React Flow's own
+              // internal nodes/edges sync with an imperative fitView() call, which proved
+              // unreliable) whenever the visible graph changes shape enough to need a fresh fit:
+              // switching Technical/Stakeholder, changing the capability filter (including the
+              // Stakeholder drill-down), or a completed Auto-arrange/Stakeholder-layout run
+              // (fitViewTrigger). The static `fitView` prop below then re-fits on every such mount,
+              // exactly as it already does on the page's very first load.
+              key={`${canvasMode}-${filterBusinessCapabilityId}-${fitViewTrigger}`}
+              nodes={canvasMode === 'technical' ? processedNodes : stakeholderNodes}
+              edges={canvasMode === 'technical' ? processedEdges : stakeholderEdges}
+              nodeTypes={nodeTypes}
+              onNodesChange={canvasMode === 'technical' ? onContextAwareNodesChange : undefined}
+              onEdgesChange={canvasMode === 'technical' ? onEdgesChange : undefined}
+              onConnect={canvasMode === 'technical' ? onConnect : undefined}
+              onEdgeClick={(_, edge) => {
+                if (canvasMode !== 'technical') return; // a Stakeholder edge is a rollup, not one real connection to open
+                const pair = resolveEdgePair(edge);
+                if (!pair) return; // a junction's aggregate hub edge fans into several remotes at once - nothing single to open
+                setSelectedEdgePair(pair);
+                setSelectedNodeId(null);
+                setSelectedObjectIdSidebar(null);
+              }}
+              onNodeClick={(_, node) => {
+                if (node.type === 'junction') return;
+                if (node.type === 'capability') {
+                  // Drill-down: jump to the Technical view filtered to exactly this capability's
+                  // systems/connections, per the confirmed decision.
+                  setCanvasMode('technical');
+                  setFilterBusinessCapabilityId(node.id);
+                  setFilterSystemId('');
+                  setFilterObjectId('');
+                  setSelectedNodeId(null);
+                  setSelectedEdgePair(null);
+                  setSelectedObjectIdSidebar(null);
+                  setFitViewTrigger(x => x + 1);
+                  return;
+                }
+                setSelectedNodeId(node.id);
+                setSelectedEdgePair(null);
+                setSelectedObjectIdSidebar(null);
+              }}
+              onPaneClick={() => {
+                setSelectedEdgePair(null);
+                setSelectedNodeId(null);
+                setSelectedObjectIdSidebar(null);
+              }}
+              connectionMode={ConnectionMode.Loose}
+              nodesDraggable={canvasMode === 'technical' && (blanketCanEdit || isSystemOwnerRole)}
+              nodesConnectable={canvasMode === 'technical' && (blanketCanEdit || isSystemOwnerRole)}
+              fitView
+            >
+              <Controls />
+              <Background color={tokens.canvasDotColor} gap={16} />
+            </ReactFlow>
         </div>
 
         {/* Right Sidebar */}
@@ -3737,6 +4255,11 @@ function AppContent() {
           {selectedEdgePair && primaryEdge ? (
             <>
               <h2 className={panelHeadingClass}>{t('connection.data')}</h2>
+              {isSystemOwnerRole && canProposeEdgeChange(primaryEdge) && !canWriteEdgeSelfServe(primaryEdge) && (
+                <p className="text-xs px-2 py-1.5 rounded-[var(--radius-input)]" style={{ background: 'var(--warning-container)', color: 'var(--on-warning-container)' }}>
+                  {t('connection.needsApprovalHint')}
+                </p>
+              )}
               {selectedEdgeGroup.length > 1 && (
                 <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
                   This connection is backed by {selectedEdgeGroup.length} separate integration records; the description below is the first one's.
@@ -3749,7 +4272,7 @@ function AppContent() {
                   className={inputClass}
                   rows={2}
                   value={primaryEdge.data?.description || ''}
-                  disabled={!canWrite}
+                  disabled={!canProposeEdgeChange(primaryEdge)}
                   onChange={(e) => updateEdgeField(primaryEdge.id, 'description', e.target.value, `edge-desc-${primaryEdge.id}`)}
                   placeholder={t('connection.description')}
                 />
@@ -3758,7 +4281,7 @@ function AppContent() {
               <OwnerPicker
                 ownerIds={primaryEdge.data?.ownerIds || []}
                 roster={teamRoster}
-                canManage={canWrite || !!(user && (primaryEdge.data?.ownerIds || []).includes(user.id))}
+                canManage={blanketCanEdit || !!(user && (primaryEdge.data?.ownerIds || []).includes(user.id))}
                 onChange={(ids) => updateEdgeField(primaryEdge.id, 'ownerIds', ids)}
               />
 
@@ -3806,7 +4329,7 @@ function AppContent() {
                         <input
                           type="checkbox"
                           checked={isActive || false}
-                          disabled={!canWrite}
+                          disabled={!canProposeEdgeChange(owningEdge)}
                           onChange={() => toggleObjectOnEdge(owningEdgeId, obj.id)}
                         />
                         <span className="truncate font-semibold text-sm" title={obj.name}>{obj.name}</span>
@@ -3818,7 +4341,7 @@ function AppContent() {
                             <input
                               type="checkbox"
                               checked={detail.atRisk || false}
-                              disabled={!canWrite}
+                              disabled={!canProposeEdgeChange(owningEdge)}
                               onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'atRisk', e.target.checked)}
                             />
                             <AlertTriangle size={13} />
@@ -3833,7 +4356,7 @@ function AppContent() {
                               <select
                                 className={`${inputClass} px-1.5 py-1 text-xs`}
                                 value={detail.sourcePattern || ''}
-                                disabled={!canWrite}
+                                disabled={!canProposeEdgeChange(owningEdge)}
                                 onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'sourcePattern', e.target.value)}
                               >
                                 <option value="">{t('common.unspecified')}</option>
@@ -3847,7 +4370,7 @@ function AppContent() {
                               <select
                                 className={`${inputClass} px-1.5 py-1 text-xs`}
                                 value={detail.targetPattern || ''}
-                                disabled={!canWrite}
+                                disabled={!canProposeEdgeChange(owningEdge)}
                                 onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'targetPattern', e.target.value)}
                               >
                                 <option value="">{t('common.unspecified')}</option>
@@ -3862,7 +4385,7 @@ function AppContent() {
                             </label>
                             <ScheduleEditor
                               schedule={detail.schedule || DEFAULT_SCHEDULE}
-                              canWrite={canWrite}
+                              canWrite={canProposeEdgeChange(owningEdge)}
                               onChange={(schedule) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'schedule', schedule)}
                             />
                           </div>
@@ -3872,7 +4395,7 @@ function AppContent() {
                             <select
                               className={`${inputClass} px-1.5 py-1 text-xs`}
                               value={detail.integrationTypeId || ''}
-                              disabled={!canWrite}
+                              disabled={!canProposeEdgeChange(owningEdge)}
                               onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'integrationTypeId', e.target.value)}
                             >
                               <option value="">{t('common.unspecified')}</option>
@@ -3888,7 +4411,7 @@ function AppContent() {
                             <select
                               className={`${inputClass} px-1.5 py-1 text-xs`}
                               value={detail.integrationSoftwareId || ''}
-                              disabled={!canWrite}
+                              disabled={!canProposeEdgeChange(owningEdge)}
                               onChange={(e) => updateEdgeObjectDetail(owningEdgeId, obj.id, 'integrationSoftwareId', e.target.value)}
                             >
                               <option value="">{t('common.unspecified')}</option>
@@ -3905,7 +4428,7 @@ function AppContent() {
                 })}
               </div>
 
-              {canWrite && (
+              {canProposeEdgeChange(primaryEdge) && (
                 <button
                   className={`${buttonDangerClass} mt-8`}
                   onClick={deleteSelectedEdge}
@@ -3924,9 +4447,11 @@ function AppContent() {
               setSystemObjectName={setSystemObjectName}
               deleteObject={deleteObject}
               onDelete={() => { deleteSystem(selectedNodeId); setSelectedNodeId(null); }}
-              readOnly={!canWrite}
+              readOnly={!canWriteSystem(selectedNodeId)}
+              canDelete={blanketCanEdit}
               teamRoster={teamRoster}
-              canManageOwners={canWrite || !!(user && (selectedSystemData?.ownerIds || []).includes(user.id))}
+              canManageOwners={blanketCanEdit || !!(user && (selectedSystemData?.ownerIds || []).includes(user.id))}
+              businessCapabilities={businessCapabilities}
             />
           ) : selectedObject ? (
             <ObjectDetailsPanel
@@ -3938,7 +4463,7 @@ function AppContent() {
               updateObjectField={updateObjectField}
               setSystemObjectName={setSystemObjectName}
               onDelete={() => { deleteObject(selectedObject.id); setSelectedObjectIdSidebar(null); }}
-              readOnly={!canWrite}
+              readOnly={!canWriteObject(selectedObject)}
             />
           ) : (
             <div className="flex flex-col items-center text-center gap-2 mt-12 px-4">

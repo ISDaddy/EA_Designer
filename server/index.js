@@ -80,6 +80,14 @@ async function initDB() {
       name VARCHAR(255) NOT NULL
     );
 
+    -- A system's business capability (e.g. "Payroll", "Treasury") as a managed list rather than
+    -- free text, so the Stakeholder canvas view can group systems by it reliably. See the
+    -- business_capability_id migration below for how existing free-text values move into this.
+    CREATE TABLE IF NOT EXISTS business_capabilities (
+      id VARCHAR(255) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL
+    );
+
     -- A planned or unplanned window where a system is unavailable - the Schedule page cross-
     -- references these against computed run times to flag which integrations they'd impact.
     CREATE TABLE IF NOT EXISTS system_downtimes (
@@ -249,6 +257,44 @@ async function initDB() {
       ip_address VARCHAR(64),
       user_agent TEXT
     );
+
+    -- A System Owner's proposed edge/edge-object-detail create/update/delete, when it touches a
+    -- system they don't own - held here instead of being written straight to the real tables until
+    -- an eligible approver (an admin, or an owner of affected_system_ids) decides it. "payload" is
+    -- the exact body the live endpoint would have received; "before_snapshot" is only set for
+    -- update/delete, both for display and so the decision endpoint can confirm the resource hasn't
+    -- since changed out from under the request before applying it.
+    CREATE TABLE IF NOT EXISTS change_requests (
+      id VARCHAR(255) PRIMARY KEY,
+      requested_by VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      action VARCHAR(20) NOT NULL,
+      resource_type VARCHAR(50) NOT NULL,
+      resource_id VARCHAR(255),
+      secondary_id VARCHAR(255),
+      payload JSONB NOT NULL,
+      before_snapshot JSONB,
+      affected_system_ids JSONB NOT NULL DEFAULT '[]',
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      decided_by VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+      decided_at TIMESTAMPTZ,
+      decision_reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- In-app notification inbox, one row per (user, event) - always written regardless of the
+    -- recipient's email preference (see notify() below), since only the email half of a
+    -- notification is ever opt-out-able.
+    CREATE TABLE IF NOT EXISTS notifications (
+      id VARCHAR(255) PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type VARCHAR(50) NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT DEFAULT '',
+      link_view VARCHAR(50) DEFAULT '',
+      link_id VARCHAR(255) DEFAULT '',
+      read_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
 
   await pool.query(`
@@ -256,6 +302,9 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_user_id);
     CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource_type, resource_id);
     CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+    CREATE INDEX IF NOT EXISTS idx_change_requests_status ON change_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_change_requests_requested_by ON change_requests(requested_by);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
   `);
 
   await pool.query(`
@@ -296,6 +345,29 @@ async function initDB() {
   await addColumnIfMissing('systems', "description TEXT DEFAULT ''");
   await addColumnIfMissing('systems', "time_zone VARCHAR(100) NOT NULL DEFAULT 'UTC'");
   await addColumnIfMissing('systems', "owner_ids JSONB DEFAULT '[]'");
+  // Business capability used to be free text (see business_capability above) - now a real,
+  // admin-managed list (business_capabilities table) so the Stakeholder canvas view can group
+  // systems by it reliably. The old column is left in place (untouched, unused) rather than
+  // dropped, both for history and so this migration stays safely re-runnable.
+  await addColumnIfMissing('systems', "business_capability_id VARCHAR(255) DEFAULT ''");
+
+  // One-time migration: move each system's old free-text business_capability into a matching row
+  // in business_capabilities (creating it if this exact name hasn't been seen yet), then point
+  // business_capability_id at it. Safe to re-run - only touches systems that haven't migrated yet
+  // (business_capability_id still empty), so it's a no-op after the first successful run.
+  const { rows: unmigratedCapabilities } = await pool.query(
+    `SELECT DISTINCT business_capability AS name FROM systems
+     WHERE business_capability_id = '' AND business_capability <> ''`
+  );
+  for (const { name } of unmigratedCapabilities) {
+    const { rows: existing } = await pool.query('SELECT id FROM business_capabilities WHERE name = $1', [name]);
+    const capabilityId = existing[0]?.id || `bcap-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    if (!existing[0]) await pool.query('INSERT INTO business_capabilities (id, name) VALUES ($1, $2)', [capabilityId, name]);
+    await pool.query(
+      `UPDATE systems SET business_capability_id = $1 WHERE business_capability_id = '' AND business_capability = $2`,
+      [capabilityId, name]
+    );
+  }
 
   // One-time migration: Owner used to be free text (e.g. "Finance IT Team"), not a real account,
   // so it couldn't drive an email notification when it changed or receive one itself. It's been
@@ -327,6 +399,11 @@ async function initDB() {
   await addColumnIfMissing('users', 'totp_secret VARCHAR(64)');
   await addColumnIfMissing('users', 'totp_enabled BOOLEAN NOT NULL DEFAULT false');
   await addColumnIfMissing('users', 'totp_backup_codes JSONB');
+
+  // Per-notification-type email opt-out (see notify() below) - a map like { "owner_added": false }
+  // where a missing key or explicit `true` means email stays on for that type; in-app notifications
+  // are never opt-out-able, only the emailed copy is.
+  await addColumnIfMissing('users', "notification_email_prefs JSONB DEFAULT '{}'");
 
   // Enough to show a person a human-readable list of their own active sessions (Profile >
   // Sessions) - which browser/device and roughly where from - without storing anything more
@@ -504,14 +581,18 @@ initDB().then(loadServerSettings).catch(console.error);
 
 // ---------------------------------------------------------------------------
 // Auth - opaque session tokens stored server-side (not JWTs), so a session can be revoked just by
-// deleting its row. Four roles: 'superadmin' (everything an admin can, plus Server Settings -
+// deleting its row. Five roles: 'superadmin' (everything an admin can, plus Server Settings -
 // email + Google sign-in - and granting/revoking super admin itself), 'admin' (manage the
-// landscape and the team), 'editor' (manage the landscape), 'viewer' (read-only). ROLES is what
-// normal team management (invites, the Members table's role picker) can assign - superadmin is
-// deliberately excluded from it; it's only ever granted via PATCH /api/users/:id by an existing
+// landscape and the team), 'editor' (manage the landscape), 'system_owner' (like a viewer
+// everywhere, but full write access to systems/objects/downtimes they own, and can create/edit/
+// delete edges to or from an owned system - subject to approval whenever the other end of that
+// edge is a system they don't own; see resolveEdgeAuthority below), 'viewer' (read-only). ROLES is
+// what normal team management (invites, the Members table's role picker) can assign - superadmin
+// is deliberately excluded from it; it's only ever granted via PATCH /api/users/:id by an existing
 // superadmin, or through the superadmin-recovery process below when none can log in.
-const ROLES = ['admin', 'editor', 'viewer'];
+const ROLES = ['admin', 'editor', 'system_owner', 'viewer'];
 const ALL_ROLES = ['superadmin', ...ROLES];
+const isPrivilegedRole = (role) => role === 'admin' || role === 'superadmin';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // The locales currently offered, per the admin-managed `languages` table - looked up fresh rather
@@ -563,6 +644,7 @@ function toApiUser(row) {
     themePrefs: row.theme_prefs || null,
     avatarUrl: row.avatar_url || null,
     totpEnabled: row.totp_enabled || false,
+    notificationEmailPrefs: row.notification_email_prefs || {},
   };
 }
 
@@ -622,7 +704,7 @@ async function getSessionUser(req) {
   if (!token) return null;
   const result = await pool.query(
     `SELECT u.id, u.email, u.name, u.role, u.language, u.time_zone, u.nda_accepted_version, u.theme_prefs,
-            u.avatar_url, u.totp_enabled
+            u.avatar_url, u.totp_enabled, u.notification_email_prefs
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1 AND s.expires_at > now()`,
     [token]
@@ -791,16 +873,42 @@ async function notifyUser(user, { subject, html }) {
   }
 }
 
+// The general-purpose notification entry point every event in the app should go through: always
+// writes an in-app inbox row (never opt-out-able), and additionally emails the user via
+// notifyUser unless they've turned email off for this specific `type` in their
+// notification_email_prefs (a missing entry or explicit `true` means email stays on - opting out
+// is the exception, not the default). `user` must include `notification_email_prefs` for the
+// opt-out check to see it; callers that only fetched id/email/name should re-select it.
+async function notify(user, { type, title, body = '', linkView = '', linkId = '', emailSubject, emailHtml }) {
+  if (!user?.id) return;
+  const id = `notif-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  try {
+    await pool.query(
+      `INSERT INTO notifications (id, user_id, type, title, body, link_view, link_id) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [id, user.id, type, title, body, linkView, linkId]
+    );
+  } catch (err) {
+    console.error('Failed to write in-app notification:', err.message);
+  }
+  const prefs = user.notification_email_prefs || {};
+  if (prefs[type] !== false) {
+    await notifyUser(user, { subject: emailSubject || title, html: emailHtml || `<p>${body}</p>` });
+  }
+}
+
 async function warnAdminsOfSoleOwner(resourceLabel, soleOwnerId) {
   const [{ rows: admins }, { rows: ownerRows }] = await Promise.all([
-    pool.query(`SELECT id, email, name FROM users WHERE role = 'admin'`),
+    pool.query(`SELECT id, email, name, notification_email_prefs FROM users WHERE role IN ('admin', 'superadmin')`),
     pool.query('SELECT name, email FROM users WHERE id = $1', [soleOwnerId]),
   ]);
   const ownerName = ownerRows[0]?.name || ownerRows[0]?.email || 'someone no longer in the system';
   for (const admin of admins) {
-    await notifyUser(admin, {
-      subject: `Single owner: ${resourceLabel}`,
-      html: `<p><strong>${resourceLabel}</strong> now has only one owner (${ownerName}). Consider adding a backup owner in case they become unavailable.</p>`,
+    await notify(admin, {
+      type: 'single_owner_warning',
+      title: `Single owner: ${resourceLabel}`,
+      body: `${resourceLabel} now has only one owner (${ownerName}). Consider adding a backup owner in case they become unavailable.`,
+      emailSubject: `Single owner: ${resourceLabel}`,
+      emailHtml: `<p><strong>${resourceLabel}</strong> now has only one owner (${ownerName}). Consider adding a backup owner in case they become unavailable.</p>`,
     });
   }
 }
@@ -817,27 +925,33 @@ async function notifyOwnerChange(resourceLabel, oldIds, newIds) {
 
   const allIds = [...new Set([...added, ...removed, ...remaining])];
   const userRows = allIds.length > 0
-    ? (await pool.query('SELECT id, email, name FROM users WHERE id = ANY($1)', [allIds])).rows
+    ? (await pool.query('SELECT id, email, name, notification_email_prefs FROM users WHERE id = ANY($1)', [allIds])).rows
     : [];
   const byId = Object.fromEntries(userRows.map(u => [u.id, u]));
   const nameOf = (id) => byId[id]?.name || byId[id]?.email || id;
 
   for (const id of added) {
-    await notifyUser(byId[id], {
-      subject: `You're now an owner of ${resourceLabel}`,
-      html: `<p>You've been added as an owner of <strong>${resourceLabel}</strong>.</p>`,
+    await notify(byId[id], {
+      type: 'owner_added',
+      title: `You're now an owner of ${resourceLabel}`,
+      body: `You've been added as an owner of ${resourceLabel}.`,
+      emailHtml: `<p>You've been added as an owner of <strong>${resourceLabel}</strong>.</p>`,
     });
   }
   for (const id of removed) {
-    await notifyUser(byId[id], {
-      subject: `You've been removed as an owner of ${resourceLabel}`,
-      html: `<p>You're no longer an owner of <strong>${resourceLabel}</strong>.</p>`,
+    await notify(byId[id], {
+      type: 'owner_removed',
+      title: `You've been removed as an owner of ${resourceLabel}`,
+      body: `You're no longer an owner of ${resourceLabel}.`,
+      emailHtml: `<p>You're no longer an owner of <strong>${resourceLabel}</strong>.</p>`,
     });
   }
   for (const id of remaining) {
-    await notifyUser(byId[id], {
-      subject: `Owner list changed for ${resourceLabel}`,
-      html: `<p>The owners of <strong>${resourceLabel}</strong> changed.</p><p>Added: ${added.map(nameOf).join(', ') || 'none'}<br>Removed: ${removed.map(nameOf).join(', ') || 'none'}</p>`,
+    await notify(byId[id], {
+      type: 'owner_list_changed',
+      title: `Owner list changed for ${resourceLabel}`,
+      body: `Added: ${added.map(nameOf).join(', ') || 'none'}. Removed: ${removed.map(nameOf).join(', ') || 'none'}.`,
+      emailHtml: `<p>The owners of <strong>${resourceLabel}</strong> changed.</p><p>Added: ${added.map(nameOf).join(', ') || 'none'}<br>Removed: ${removed.map(nameOf).join(', ') || 'none'}</p>`,
     });
   }
 
@@ -853,6 +967,197 @@ async function isOwnerManagingOwnersOnly(table, id, userId, body) {
   const { rows } = await pool.query(`SELECT owner_ids FROM ${table} WHERE id = $1`, [id]);
   const current = rows[0]?.owner_ids || [];
   return current.includes(userId);
+}
+
+// Plain "is this user currently listed as an owner of this row" check, unlike
+// isOwnerManagingOwnersOnly above (which also requires the request to touch nothing but
+// ownerIds) - used by the system_owner role's full-field self-serve checks, where owning the
+// resource grants real edit rights, not just the ability to manage who else owns it.
+async function isResourceOwner(table, id, userId) {
+  if (!id) return false;
+  const { rows } = await pool.query(`SELECT owner_ids FROM ${table} WHERE id = $1`, [id]);
+  return (rows[0]?.owner_ids || []).includes(userId);
+}
+
+// ---------------------------------------------------------------------------
+// System Owner approval gating - a system_owner can act on an edge (or a per-object detail on
+// one) directly only when they own every system it touches; when they own exactly one endpoint,
+// the change is held as a change_requests row until an eligible approver (an admin/superadmin, or
+// an owner of the other endpoint) decides it; owning neither endpoint means they have no standing
+// to propose it at all. A system with no owner at all still resolves to 'pending', never
+// 'self-serve' - an ownerless system stays protected by default, decided by an admin instead.
+// ---------------------------------------------------------------------------
+async function resolveEdgeAuthority(userId, source, target) {
+  const ids = [...new Set([source, target].filter(Boolean))];
+  const { rows } = await pool.query('SELECT id, owner_ids FROM systems WHERE id = ANY($1)', [ids]);
+  const ownerMap = new Map(rows.map(r => [r.id, r.owner_ids || []]));
+  if (ids.some(id => !ownerMap.has(id))) return { mode: 'blocked', affectedSystemIds: [] };
+
+  const owns = (id) => (ownerMap.get(id) || []).includes(userId);
+  if (!owns(source) && !owns(target)) return { mode: 'blocked', affectedSystemIds: [] };
+
+  const affectedSystemIds = [...new Set([source, target])].filter(id => !owns(id));
+  return { mode: affectedSystemIds.length > 0 ? 'pending' : 'self-serve', affectedSystemIds };
+}
+
+// Stores a system_owner's proposed change instead of writing it directly, and notifies every
+// eligible approver (every admin/superadmin, plus every current owner of each affected system)
+// that it needs a decision. Returns the new change_requests row's id.
+async function createChangeRequest(req, { action, resourceType, resourceId, secondaryId = null, payload, beforeSnapshot = null, affectedSystemIds }) {
+  const id = `cr-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  await pool.query(
+    `INSERT INTO change_requests (id, requested_by, action, resource_type, resource_id, secondary_id, payload, before_snapshot, affected_system_ids)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [id, req.user.id, action, resourceType, resourceId, secondaryId, JSON.stringify(payload),
+      beforeSnapshot ? JSON.stringify(beforeSnapshot) : null, JSON.stringify(affectedSystemIds)]
+  );
+
+  const { rows: systemRows } = await pool.query('SELECT id, label, owner_ids FROM systems WHERE id = ANY($1)', [affectedSystemIds]);
+  const approverIds = new Set();
+  const { rows: adminRows } = await pool.query(`SELECT id FROM users WHERE role IN ('admin', 'superadmin')`);
+  adminRows.forEach(r => approverIds.add(r.id));
+  systemRows.forEach(s => (s.owner_ids || []).forEach(uid => approverIds.add(uid)));
+  approverIds.delete(req.user.id);
+
+  const systemLabel = systemRows.map(s => s.label).join(', ') || affectedSystemIds.join(', ');
+  const requesterName = req.user.name || req.user.email;
+  if (approverIds.size > 0) {
+    const { rows: approvers } = await pool.query(
+      'SELECT id, email, name, notification_email_prefs FROM users WHERE id = ANY($1)', [[...approverIds]]
+    );
+    for (const approver of approvers) {
+      notify(approver, {
+        type: 'change_request_needs_approval',
+        title: `${requesterName} proposed a change affecting ${systemLabel}`,
+        body: `A pending ${resourceType === 'edge' ? 'connection' : 'flow detail'} change needs your approval.`,
+        linkView: 'approvals',
+        linkId: id,
+        emailSubject: `Approval needed: change affecting ${systemLabel}`,
+        emailHtml: `<p><strong>${requesterName}</strong> proposed a change affecting <strong>${systemLabel}</strong>, which you own or administer.</p><p>Review it in EA Designer's Approvals page.</p>`,
+      }).catch(err => console.error('Approval-request notification failed:', err.message));
+    }
+  }
+
+  await logAudit(req, {
+    action: 'create', resourceType: 'change_request', resourceId: id,
+    resourceLabel: `${resourceType === 'edge' ? 'Connection' : 'Flow detail'} change affecting ${systemLabel}`,
+    after: payload,
+  });
+  return id;
+}
+
+// ---------------------------------------------------------------------------
+// Edge/edge-object-detail mutations, extracted out of their route handlers so the exact same SQL
+// runs whether a change is applied directly (self-serve) or after a pending change_requests row
+// is approved. `actor` lets the approval path attribute the resulting audit entry to the original
+// requester rather than the approver (who gets their own separate 'approve' audit entry instead).
+// ---------------------------------------------------------------------------
+async function applyEdgeCreate(req, e, actor) {
+  const ownerIds = Array.isArray(e.ownerIds) && e.ownerIds.length > 0 ? e.ownerIds : [(actor || req.user).id];
+  await pool.query(
+    `INSERT INTO edges (id, source, target, data_object_ids, description, owner_ids)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [e.id, e.source, e.target, JSON.stringify(e.dataObjectIds || []), e.description || '', JSON.stringify(ownerIds)]
+  );
+  const { rows } = await pool.query('SELECT id, label FROM systems WHERE id = ANY($1)', [[e.source, e.target]]);
+  const labels = Object.fromEntries(rows.map(r => [r.id, r.label]));
+  if (ownerIds.length === 1) {
+    warnAdminsOfSoleOwner(`${labels[e.source] || e.source} → ${labels[e.target] || e.target}`, ownerIds[0])
+      .catch(err => console.error('Owner notification failed:', err.message));
+  }
+  await logAudit(req, {
+    action: 'create', resourceType: 'edge', resourceId: e.id,
+    resourceLabel: `${labels[e.source] || e.source} → ${labels[e.target] || e.target}`,
+    after: { ...e, ownerIds }, actor,
+  });
+}
+
+async function applyEdgeUpdate(req, id, body, actor) {
+  const { sets, values } = buildUpdate('edges', EDGE_COLUMNS, body);
+  if (sets.length === 0) return { ok: false, status: 400, error: 'No updatable fields provided' };
+
+  const { rows: beforeRows } = await pool.query(
+    `SELECT e.*, s1.label AS source_label, s2.label AS target_label
+     FROM edges e JOIN systems s1 ON s1.id = e.source JOIN systems s2 ON s2.id = e.target
+     WHERE e.id = $1`,
+    [id]
+  );
+  if (beforeRows.length === 0) return { ok: false, status: 404, error: 'Not found' };
+  const beforeRow = beforeRows[0];
+  const previousOwnerIds = body.ownerIds !== undefined ? (beforeRow.owner_ids || []) : null;
+  const edgeLabel = `${beforeRow.source_label} → ${beforeRow.target_label}`;
+
+  values.push(id);
+  await pool.query(`UPDATE edges SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
+
+  if (previousOwnerIds !== null) {
+    notifyOwnerChange(edgeLabel, previousOwnerIds, body.ownerIds || [])
+      .catch(err => console.error('Owner-change notification failed:', err.message));
+  }
+
+  const beforeSnapshot = {};
+  for (const key of Object.keys(EDGE_COLUMNS)) {
+    if (key in body) beforeSnapshot[key] = beforeRow[EDGE_COLUMNS[key]];
+  }
+  await logAudit(req, { action: 'update', resourceType: 'edge', resourceId: id, resourceLabel: edgeLabel, before: beforeSnapshot, after: body, actor });
+  return { ok: true };
+}
+
+async function applyEdgeDelete(req, id, actor) {
+  const { rows: beforeRows } = await pool.query(
+    `SELECT e.*, s1.label AS source_label, s2.label AS target_label
+     FROM edges e JOIN systems s1 ON s1.id = e.source JOIN systems s2 ON s2.id = e.target
+     WHERE e.id = $1`,
+    [id]
+  );
+  await pool.query('DELETE FROM edges WHERE id = $1', [id]);
+  await logAudit(req, {
+    action: 'delete', resourceType: 'edge', resourceId: id,
+    resourceLabel: beforeRows[0] ? `${beforeRows[0].source_label} → ${beforeRows[0].target_label}` : id,
+    before: beforeRows[0] || null, actor,
+  });
+}
+
+async function applyEdgeObjectDetailUpsert(req, edgeId, objectId, body, actor) {
+  const { rows: beforeRows } = await pool.query(
+    'SELECT * FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2', [edgeId, objectId]
+  );
+  await pool.query(
+    `INSERT INTO edge_object_details (edge_id, data_object_id) VALUES ($1, $2)
+     ON CONFLICT (edge_id, data_object_id) DO NOTHING`,
+    [edgeId, objectId]
+  );
+  const { sets, values } = buildUpdate('edge_object_details', EDGE_OBJECT_DETAIL_COLUMNS, body);
+  if (sets.length > 0) {
+    values.push(edgeId, objectId);
+    await pool.query(
+      `UPDATE edge_object_details SET ${sets.join(', ')} WHERE edge_id = $${values.length - 1} AND data_object_id = $${values.length}`,
+      values
+    );
+  }
+  const beforeRow = beforeRows[0] || {};
+  const beforeSnapshot = {};
+  for (const key of Object.keys(EDGE_OBJECT_DETAIL_COLUMNS)) {
+    if (key in body) beforeSnapshot[key] = beforeRow[EDGE_OBJECT_DETAIL_COLUMNS[key]];
+  }
+  await logAudit(req, {
+    action: beforeRows.length > 0 ? 'update' : 'create', resourceType: 'integration_flow', resourceId: `${edgeId}:${objectId}`,
+    resourceLabel: `${edgeId} / ${objectId}`, before: beforeRows.length > 0 ? beforeSnapshot : null, after: body, actor,
+  });
+}
+
+async function applyEdgeObjectDetailDelete(req, edgeId, objectId, actor) {
+  const { rows: beforeRows } = await pool.query(
+    'SELECT * FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2', [edgeId, objectId]
+  );
+  await pool.query(
+    'DELETE FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2',
+    [edgeId, objectId]
+  );
+  await logAudit(req, {
+    action: 'delete', resourceType: 'integration_flow', resourceId: `${edgeId}:${objectId}`,
+    resourceLabel: `${edgeId} / ${objectId}`, before: beforeRows[0] || null, actor,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +1220,7 @@ const SYSTEM_COLUMNS = {
   layoutPositions: 'layout_positions',
   status: 'status',
   criticality: 'criticality',
-  businessCapability: 'business_capability',
+  businessCapabilityId: 'business_capability_id',
   techStack: 'tech_stack',
   description: 'description',
   timeZone: 'time_zone',
@@ -1274,7 +1579,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 // themselves doesn't need an admin's involvement any more than picking their own language does.
 app.patch('/api/auth/me', requireAuth, async (req, res) => {
   try {
-    const { language, timeZone, name, email, themePrefs, avatarUrl } = req.body;
+    const { language, timeZone, name, email, themePrefs, avatarUrl, notificationEmailPrefs } = req.body;
     if (language !== undefined && !(await getLanguageCodes()).includes(language)) {
       return res.status(400).json({ error: 'Unsupported language.' });
     }
@@ -1301,6 +1606,12 @@ app.patch('/api/auth/me', requireAuth, async (req, res) => {
     if (email !== undefined) { sets.push(`email = $${i++}`); values.push(email.toLowerCase().trim()); }
     if (themePrefs !== undefined) { sets.push(`theme_prefs = $${i++}`); values.push(themePrefs ? JSON.stringify(themePrefs) : null); }
     if (avatarUrl !== undefined) { sets.push(`avatar_url = $${i++}`); values.push(avatarUrl); }
+    // Merged into the existing JSONB (||), not replaced - so toggling one notification type off
+    // from one tab/session doesn't clobber every other type's preference set elsewhere.
+    if (notificationEmailPrefs !== undefined && typeof notificationEmailPrefs === 'object' && notificationEmailPrefs !== null) {
+      sets.push(`notification_email_prefs = COALESCE(notification_email_prefs, '{}'::jsonb) || $${i++}::jsonb`);
+      values.push(JSON.stringify(notificationEmailPrefs));
+    }
     if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
     values.push(req.user.id);
     const result = await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
@@ -1468,7 +1779,7 @@ app.get('/api/auth/me/export', requireAuth, async (req, res) => {
   try {
     const ownerMatch = JSON.stringify([req.user.id]);
     const [systemsResult, edgesResult] = await Promise.all([
-      pool.query(`SELECT id, label, status, criticality, business_capability, description, owner_ids FROM systems WHERE owner_ids @> $1::jsonb`, [ownerMatch]),
+      pool.query(`SELECT id, label, status, criticality, business_capability_id, description, owner_ids FROM systems WHERE owner_ids @> $1::jsonb`, [ownerMatch]),
       pool.query(`SELECT id, source, target, owner_ids FROM edges WHERE owner_ids @> $1::jsonb`, [ownerMatch]),
     ]);
     res.setHeader('Content-Disposition', 'attachment; filename="ea-designer-my-data.json"');
@@ -2021,6 +2332,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
     const edgesRes = await pool.query('SELECT * FROM edges');
     const integrationTypesRes = await pool.query('SELECT * FROM integration_types ORDER BY name');
     const integrationSoftwareRes = await pool.query('SELECT * FROM integration_software ORDER BY name');
+    const businessCapabilitiesRes = await pool.query('SELECT * FROM business_capabilities ORDER BY name');
     const edgeObjectDetailsRes = await pool.query('SELECT * FROM edge_object_details');
     const systemDowntimesRes = await pool.query('SELECT * FROM system_downtimes ORDER BY starts_at');
 
@@ -2030,6 +2342,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
       edges: edgesRes.rows,
       integrationTypes: integrationTypesRes.rows,
       integrationSoftware: integrationSoftwareRes.rows,
+      businessCapabilities: businessCapabilitiesRes.rows,
       edgeObjectDetails: edgeObjectDetailsRes.rows,
       systemDowntimes: systemDowntimesRes.rows,
     });
@@ -2046,7 +2359,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
 // view), rather than trying to render thousands of boxes on one canvas.
 app.get('/api/systems', requireAuth, async (req, res) => {
   try {
-    const { search, status, criticality, limit = '50', offset = '0' } = req.query;
+    const { search, status, criticality, businessCapabilityId, limit = '50', offset = '0' } = req.query;
     const clauses = [];
     const values = [];
     let i = 1;
@@ -2054,8 +2367,10 @@ app.get('/api/systems', requireAuth, async (req, res) => {
     if (search) {
       // Owner is a list of user ids now, not free text - matching by owner means matching one of
       // those users' name/email via a correlated subquery rather than a plain column ILIKE.
+      // Business capability is now a managed list (business_capabilities) rather than free text,
+      // so matching by it means matching the joined row's name, not the systems column itself.
       clauses.push(`(
-        label ILIKE $${i} OR business_capability ILIKE $${i} OR EXISTS (
+        systems.label ILIKE $${i} OR bc.name ILIKE $${i} OR EXISTS (
           SELECT 1 FROM users u
           WHERE u.id IN (SELECT jsonb_array_elements_text(systems.owner_ids))
           AND (u.name ILIKE $${i} OR u.email ILIKE $${i})
@@ -2065,25 +2380,38 @@ app.get('/api/systems', requireAuth, async (req, res) => {
       i++;
     }
     if (status) {
-      clauses.push(`status = $${i}`);
+      clauses.push(`systems.status = $${i}`);
       values.push(status);
       i++;
     }
     if (criticality) {
-      clauses.push(`criticality = $${i}`);
+      clauses.push(`systems.criticality = $${i}`);
       values.push(criticality);
       i++;
+    }
+    if (businessCapabilityId) {
+      // The Inventory/canvas "Uncategorized" filter option sends this sentinel for systems with
+      // no capability assigned, since an empty string can't be told apart from "no filter" in a
+      // query param - matches the same convention as the Stakeholder view's uncategorized bucket.
+      if (businessCapabilityId === '__uncategorized__') {
+        clauses.push(`(systems.business_capability_id IS NULL OR systems.business_capability_id = '')`);
+      } else {
+        clauses.push(`systems.business_capability_id = $${i}`);
+        values.push(businessCapabilityId);
+        i++;
+      }
     }
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const safeLimit = Math.min(parseInt(limit, 10) || 50, 500);
     const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
+    const fromClause = `FROM systems LEFT JOIN business_capabilities bc ON bc.id = systems.business_capability_id`;
 
     const rows = await pool.query(
-      `SELECT * FROM systems ${where} ORDER BY label LIMIT $${i} OFFSET $${i + 1}`,
+      `SELECT systems.* ${fromClause} ${where} ORDER BY systems.label LIMIT $${i} OFFSET $${i + 1}`,
       [...values, safeLimit, safeOffset]
     );
-    const count = await pool.query(`SELECT COUNT(*) FROM systems ${where}`, values);
+    const count = await pool.query(`SELECT COUNT(*) ${fromClause} ${where}`, values);
 
     res.json({ systems: rows.rows, total: parseInt(count.rows[0].count, 10) });
   } catch (err) {
@@ -2099,13 +2427,13 @@ app.post('/api/systems', requireAuth, requireRole('admin', 'editor'), async (req
     // to add a backup rather than a bug.
     const ownerIds = Array.isArray(s.ownerIds) && s.ownerIds.length > 0 ? s.ownerIds : [req.user.id];
     await pool.query(
-      `INSERT INTO systems (id, label, x, y, layout_positions, status, criticality, business_capability, tech_stack, description, time_zone, owner_ids)
+      `INSERT INTO systems (id, label, x, y, layout_positions, status, criticality, business_capability_id, tech_stack, description, time_zone, owner_ids)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         s.id, s.label, s.x, s.y,
         JSON.stringify(s.layoutPositions || {}),
         s.status || 'active', s.criticality || 'medium',
-        s.businessCapability || '', JSON.stringify(s.techStack || []), s.description || '', s.timeZone || 'UTC',
+        s.businessCapabilityId || '', JSON.stringify(s.techStack || []), s.description || '', s.timeZone || 'UTC',
         JSON.stringify(ownerIds)
       ]
     );
@@ -2120,11 +2448,16 @@ app.post('/api/systems', requireAuth, requireRole('admin', 'editor'), async (req
 });
 
 // Not gated to admin/editor alone: a system's own current owners can also update its owner_ids
-// (and only that field) from here, per isOwnerManagingOwnersOnly - everything else stays
-// admin/editor-only.
+// (and only that field) from here, per isOwnerManagingOwnersOnly. A system_owner who owns this
+// system gets full-field access instead (never just ownerIds) - editing a system's own fields
+// only ever touches that one system, so it's always self-serve, never queued for approval.
 app.patch('/api/systems/:id', requireAuth, async (req, res) => {
   try {
-    if (!['admin', 'editor'].includes(req.user.role)) {
+    if (req.user.role === 'system_owner') {
+      if (!(await isResourceOwner('systems', req.params.id, req.user.id))) {
+        return res.status(403).json({ error: 'You do not have permission to do this' });
+      }
+    } else if (!['admin', 'editor'].includes(req.user.role)) {
       const allowed = await isOwnerManagingOwnersOnly('systems', req.params.id, req.user.id, req.body);
       if (!allowed) return res.status(403).json({ error: 'You do not have permission to do this' });
     }
@@ -2208,9 +2541,15 @@ app.get('/api/data-objects', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/data-objects', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+// A system_owner may only create an object mastered by a system they own - unlike edges, this
+// never needs approval, since creating an object only ever touches the one system that masters
+// it, never another one.
+app.post('/api/data-objects', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const o = req.body;
+    if (req.user.role === 'system_owner' && !(await isResourceOwner('systems', o.masterSystemId, req.user.id))) {
+      return res.status(403).json({ error: 'You can only create objects mastered by a system you own.' });
+    }
     await pool.query(
       `INSERT INTO data_objects (id, name, master_system_id, system_object_names, description, classification)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -2223,8 +2562,24 @@ app.post('/api/data-objects', requireAuth, requireRole('admin', 'editor'), async
   }
 });
 
-app.patch('/api/data-objects/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+// A system_owner may edit any field of an object whose CURRENT master system they own, full
+// self-serve (no approval - it only touches that one system). Reassigning masterSystemId to a
+// system they don't own is simply blocked, not queued for approval - a rare enough case that it's
+// out of scope for the approval workflow.
+app.patch('/api/data-objects/:id', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
+    if (req.user.role === 'system_owner') {
+      const { rows: currentRows } = await pool.query('SELECT master_system_id FROM data_objects WHERE id = $1', [req.params.id]);
+      if (currentRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      if (!(await isResourceOwner('systems', currentRows[0].master_system_id, req.user.id))) {
+        return res.status(403).json({ error: 'You do not have permission to do this' });
+      }
+      if (req.body.masterSystemId && req.body.masterSystemId !== currentRows[0].master_system_id
+        && !(await isResourceOwner('systems', req.body.masterSystemId, req.user.id))) {
+        return res.status(403).json({ error: 'You can only reassign this object to a system you own.' });
+      }
+    }
+
     const { sets, values } = buildUpdate('data_objects', DATA_OBJECT_COLUMNS, req.body);
     if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
     const { rows: beforeRows } = await pool.query('SELECT * FROM data_objects WHERE id = $1', [req.params.id]);
@@ -2242,10 +2597,40 @@ app.patch('/api/data-objects/:id', requireAuth, requireRole('admin', 'editor'), 
   }
 });
 
-app.delete('/api/data-objects/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.delete('/api/data-objects/:id', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const { rows: beforeRows } = await pool.query('SELECT * FROM data_objects WHERE id = $1', [req.params.id]);
+    if (beforeRows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (req.user.role === 'system_owner' && !(await isResourceOwner('systems', beforeRows[0].master_system_id, req.user.id))) {
+      return res.status(403).json({ error: 'You do not have permission to do this' });
+    }
+
     await pool.query('DELETE FROM data_objects WHERE id = $1', [req.params.id]);
+
+    // data_object_ids on an edge is a plain JSONB array, not a foreign key, so deleting the object
+    // doesn't cascade into it - strip it out of every edge that carried it here, with this route's
+    // own authority, rather than as separate client-issued edge PATCH/DELETE calls. Those would be
+    // evaluated as the caller's own edge permissions once edges are ownership/approval-gated, which
+    // could 403 or spawn a surprise approval for what is meant to be plain, self-serve object
+    // deletion.
+    const { rows: affectedEdges } = await pool.query(
+      `SELECT e.id, e.data_object_ids, s1.label AS source_label, s2.label AS target_label
+       FROM edges e JOIN systems s1 ON s1.id = e.source JOIN systems s2 ON s2.id = e.target
+       WHERE e.data_object_ids @> $1::jsonb`,
+      [JSON.stringify([req.params.id])]
+    );
+    for (const edge of affectedEdges) {
+      const remaining = (edge.data_object_ids || []).filter(id => id !== req.params.id);
+      const edgeLabel = `${edge.source_label} → ${edge.target_label}`;
+      if (remaining.length === 0) {
+        await pool.query('DELETE FROM edges WHERE id = $1', [edge.id]);
+        await logAudit(req, { action: 'delete', resourceType: 'edge', resourceId: edge.id, resourceLabel: edgeLabel, metadata: { cascadedFromObjectDelete: req.params.id } });
+      } else {
+        await pool.query('UPDATE edges SET data_object_ids = $1 WHERE id = $2', [JSON.stringify(remaining), edge.id]);
+        await logAudit(req, { action: 'update', resourceType: 'edge', resourceId: edge.id, resourceLabel: edgeLabel, after: { dataObjectIds: remaining }, metadata: { cascadedFromObjectDelete: req.params.id } });
+      }
+    }
+
     await logAudit(req, { action: 'delete', resourceType: 'data_object', resourceId: req.params.id, resourceLabel: beforeRows[0]?.name || req.params.id, before: beforeRows[0] || null });
     res.json({ success: true });
   } catch (err) {
@@ -2282,150 +2667,909 @@ app.get('/api/edges', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/edges', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.post('/api/edges', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const e = req.body;
-    // Default to the creator as the sole initial owner, same reasoning as new systems - it trips
-    // the single-owner admin warning immediately rather than silently starting ownerless.
-    const ownerIds = Array.isArray(e.ownerIds) && e.ownerIds.length > 0 ? e.ownerIds : [req.user.id];
-    await pool.query(
-      `INSERT INTO edges (id, source, target, data_object_ids, description, owner_ids)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [e.id, e.source, e.target, JSON.stringify(e.dataObjectIds || []), e.description || '', JSON.stringify(ownerIds)]
-    );
-    if (ownerIds.length === 1) {
-      const { rows } = await pool.query('SELECT id, label FROM systems WHERE id = ANY($1)', [[e.source, e.target]]);
-      const labels = Object.fromEntries(rows.map(r => [r.id, r.label]));
-      await warnAdminsOfSoleOwner(`${labels[e.source] || e.source} → ${labels[e.target] || e.target}`, ownerIds[0])
-        .catch(err => console.error('Owner notification failed:', err.message));
+    if (req.user.role === 'system_owner') {
+      const gate = await resolveEdgeAuthority(req.user.id, e.source, e.target);
+      if (gate.mode === 'blocked') return res.status(403).json({ error: 'You must own at least one end of this connection to propose it.' });
+      if (gate.mode === 'pending') {
+        const changeRequestId = await createChangeRequest(req, {
+          action: 'create', resourceType: 'edge', resourceId: e.id, payload: e, affectedSystemIds: gate.affectedSystemIds,
+        });
+        return res.status(202).json({ success: true, pending: true, changeRequestId });
+      }
     }
-    const { rows: endpointRows } = await pool.query('SELECT id, label FROM systems WHERE id = ANY($1)', [[e.source, e.target]]);
-    const endpointLabels = Object.fromEntries(endpointRows.map(r => [r.id, r.label]));
-    await logAudit(req, {
-      action: 'create', resourceType: 'edge', resourceId: e.id,
-      resourceLabel: `${endpointLabels[e.source] || e.source} → ${endpointLabels[e.target] || e.target}`,
-      after: { ...e, ownerIds },
-    });
-    res.status(201).json({ success: true });
+    await applyEdgeCreate(req, e);
+    res.status(201).json({ success: true, pending: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Not gated to admin/editor alone: an integration's own current owners can also update its
-// owner_ids (and only that field) from here, per isOwnerManagingOwnersOnly - everything else
-// stays admin/editor-only.
+// Not gated to a fixed role list alone: an integration's own current owners can also update its
+// owner_ids (and only that field) from here, per isOwnerManagingOwnersOnly - a system_owner gets
+// richer access than that (full-field edit, subject to approval) via resolveEdgeAuthority instead;
+// everyone else stays admin/editor-only.
 app.patch('/api/edges/:id', requireAuth, async (req, res) => {
   try {
-    if (!['admin', 'editor'].includes(req.user.role)) {
+    if (req.user.role === 'system_owner') {
+      const { rows: currentRows } = await pool.query('SELECT source, target FROM edges WHERE id = $1', [req.params.id]);
+      if (currentRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      const gate = await resolveEdgeAuthority(req.user.id, currentRows[0].source, currentRows[0].target);
+      if (gate.mode === 'blocked') return res.status(403).json({ error: 'You do not have permission to do this' });
+      if (gate.mode === 'pending') {
+        const changeRequestId = await createChangeRequest(req, {
+          action: 'update', resourceType: 'edge', resourceId: req.params.id, payload: req.body, affectedSystemIds: gate.affectedSystemIds,
+        });
+        return res.status(202).json({ success: true, pending: true, changeRequestId });
+      }
+      // self-serve (owns both endpoints) - fall through to apply directly below
+    } else if (!['admin', 'editor'].includes(req.user.role)) {
       const allowed = await isOwnerManagingOwnersOnly('edges', req.params.id, req.user.id, req.body);
       if (!allowed) return res.status(403).json({ error: 'You do not have permission to do this' });
     }
 
-    const { sets, values } = buildUpdate('edges', EDGE_COLUMNS, req.body);
-    if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
-
-    // Always fetched (not just when ownerIds changes) - it's both the owner-notification baseline
-    // and the audit trail's "before" snapshot of whichever fields this request actually touches.
-    const { rows: beforeRows } = await pool.query(
-      `SELECT e.*, s1.label AS source_label, s2.label AS target_label
-       FROM edges e JOIN systems s1 ON s1.id = e.source JOIN systems s2 ON s2.id = e.target
-       WHERE e.id = $1`,
-      [req.params.id]
-    );
-    const beforeRow = beforeRows[0] || {};
-    const previousOwnerIds = req.body.ownerIds !== undefined ? (beforeRow.owner_ids || []) : null;
-    const edgeLabel = beforeRows[0] ? `${beforeRow.source_label} → ${beforeRow.target_label}` : req.params.id;
-
-    values.push(req.params.id);
-    await pool.query(`UPDATE edges SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
-
-    if (previousOwnerIds !== null) {
-      notifyOwnerChange(edgeLabel, previousOwnerIds, req.body.ownerIds || [])
-        .catch(err => console.error('Owner-change notification failed:', err.message));
-    }
-
-    const beforeSnapshot = {};
-    for (const key of Object.keys(EDGE_COLUMNS)) {
-      if (key in req.body) beforeSnapshot[key] = beforeRow[EDGE_COLUMNS[key]];
-    }
-    await logAudit(req, { action: 'update', resourceType: 'edge', resourceId: req.params.id, resourceLabel: edgeLabel, before: beforeSnapshot, after: req.body });
-
-    res.json({ success: true });
+    const result = await applyEdgeUpdate(req, req.params.id, req.body);
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ success: true, pending: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/api/edges/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.delete('/api/edges/:id', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
-    const { rows: beforeRows } = await pool.query(
-      `SELECT e.*, s1.label AS source_label, s2.label AS target_label
-       FROM edges e JOIN systems s1 ON s1.id = e.source JOIN systems s2 ON s2.id = e.target
-       WHERE e.id = $1`,
-      [req.params.id]
-    );
-    await pool.query('DELETE FROM edges WHERE id = $1', [req.params.id]);
-    await logAudit(req, {
-      action: 'delete', resourceType: 'edge', resourceId: req.params.id,
-      resourceLabel: beforeRows[0] ? `${beforeRows[0].source_label} → ${beforeRows[0].target_label}` : req.params.id,
-      before: beforeRows[0] || null,
-    });
-    res.json({ success: true });
+    if (req.user.role === 'system_owner') {
+      const { rows: currentRows } = await pool.query('SELECT source, target FROM edges WHERE id = $1', [req.params.id]);
+      if (currentRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      const gate = await resolveEdgeAuthority(req.user.id, currentRows[0].source, currentRows[0].target);
+      if (gate.mode === 'blocked') return res.status(403).json({ error: 'You do not have permission to do this' });
+      if (gate.mode === 'pending') {
+        const changeRequestId = await createChangeRequest(req, {
+          action: 'delete', resourceType: 'edge', resourceId: req.params.id, payload: {}, affectedSystemIds: gate.affectedSystemIds,
+        });
+        return res.status(202).json({ success: true, pending: true, changeRequestId });
+      }
+    }
+    await applyEdgeDelete(req, req.params.id);
+    res.json({ success: true, pending: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // How one specific data object moves over one specific edge - upserted lazily the first time any
-// of its fields is set, since most (edge, object) pairs never get more than the defaults.
-app.patch('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+// of its fields is set, since most (edge, object) pairs never get more than the defaults. Gated by
+// the parent edge's own ownership, not any ownership of its own - it has none.
+app.patch('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const { edgeId, objectId } = req.params;
-    const { rows: beforeRows } = await pool.query(
-      'SELECT * FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2', [edgeId, objectId]
-    );
-    await pool.query(
-      `INSERT INTO edge_object_details (edge_id, data_object_id) VALUES ($1, $2)
-       ON CONFLICT (edge_id, data_object_id) DO NOTHING`,
-      [edgeId, objectId]
-    );
-    const { sets, values } = buildUpdate('edge_object_details', EDGE_OBJECT_DETAIL_COLUMNS, req.body);
-    if (sets.length > 0) {
-      values.push(edgeId, objectId);
-      await pool.query(
-        `UPDATE edge_object_details SET ${sets.join(', ')} WHERE edge_id = $${values.length - 1} AND data_object_id = $${values.length}`,
-        values
+    if (req.user.role === 'system_owner') {
+      const { rows: edgeRows } = await pool.query('SELECT source, target FROM edges WHERE id = $1', [edgeId]);
+      if (edgeRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      const gate = await resolveEdgeAuthority(req.user.id, edgeRows[0].source, edgeRows[0].target);
+      if (gate.mode === 'blocked') return res.status(403).json({ error: 'You do not have permission to do this' });
+      if (gate.mode === 'pending') {
+        const changeRequestId = await createChangeRequest(req, {
+          action: 'update', resourceType: 'edge_object_detail', resourceId: edgeId, secondaryId: objectId,
+          payload: req.body, affectedSystemIds: gate.affectedSystemIds,
+        });
+        return res.status(202).json({ success: true, pending: true, changeRequestId });
+      }
+    }
+    await applyEdgeObjectDetailUpsert(req, edgeId, objectId, req.body);
+    res.json({ success: true, pending: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
+  try {
+    const { edgeId, objectId } = req.params;
+    if (req.user.role === 'system_owner') {
+      const { rows: edgeRows } = await pool.query('SELECT source, target FROM edges WHERE id = $1', [edgeId]);
+      if (edgeRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      const gate = await resolveEdgeAuthority(req.user.id, edgeRows[0].source, edgeRows[0].target);
+      if (gate.mode === 'blocked') return res.status(403).json({ error: 'You do not have permission to do this' });
+      if (gate.mode === 'pending') {
+        const changeRequestId = await createChangeRequest(req, {
+          action: 'delete', resourceType: 'edge_object_detail', resourceId: edgeId, secondaryId: objectId,
+          payload: {}, affectedSystemIds: gate.affectedSystemIds,
+        });
+        return res.status(202).json({ success: true, pending: true, changeRequestId });
+      }
+    }
+    await applyEdgeObjectDetailDelete(req, edgeId, objectId);
+    res.json({ success: true, pending: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Import / Export - move a hand-picked slice of the landscape (not necessarily all of it) between
+// environments as a single self-contained JSON bundle, e.g. from a local dev instance to the NAS.
+// Three-step flow, split across three endpoints because conflicts (an id that already exists in
+// the target environment) must be resolved by a person in the UI before anything is written:
+//   1. POST /api/export           - pick systems/objects/edges, get back a bundle.
+//   2. POST /api/import/preview   - upload that bundle, get back a new-vs-conflict diff.
+//   3. POST /api/import/commit    - upload the bundle again plus how every conflict was resolved.
+// ---------------------------------------------------------------------------
+
+const EXPORT_FORMAT_VERSION = 1;
+
+// An exported bundle must be importable on its own, so a selection is expanded to include
+// everything it structurally depends on: an edge pulls in its two endpoint systems and every
+// object it carries, and an object pulls in its master system. This only ever adds rows a
+// selected row already points to - selecting a system on its own does NOT pull in its edges, so
+// "export just these two systems" stays exactly that.
+async function resolveExportClosure(systemIds, dataObjectIds, edgeIds) {
+  const systems = new Set(systemIds);
+  const objects = new Set(dataObjectIds);
+  const edgeSet = new Set(edgeIds);
+
+  if (edgeSet.size > 0) {
+    const { rows } = await pool.query('SELECT id, source, target, data_object_ids FROM edges WHERE id = ANY($1)', [[...edgeSet]]);
+    for (const e of rows) {
+      if (e.source) systems.add(e.source);
+      if (e.target) systems.add(e.target);
+      (e.data_object_ids || []).forEach(id => objects.add(id));
+    }
+  }
+  if (objects.size > 0) {
+    const { rows } = await pool.query('SELECT id, master_system_id FROM data_objects WHERE id = ANY($1)', [[...objects]]);
+    for (const o of rows) {
+      if (o.master_system_id) systems.add(o.master_system_id);
+    }
+  }
+
+  return { systemIds: [...systems], dataObjectIds: [...objects], edgeIds: [...edgeSet] };
+}
+
+// Read-only, and everything in the bundle is already visible to any signed-in role via the
+// regular GET endpoints - exporting it as one file doesn't expose anything new, so this only
+// requires being signed in, not admin/editor.
+// A system_owner may only export systems they own, edges touching one, and objects mastered by
+// (or carried by an edge touching) one - "anything to do with the system he owns," not the whole
+// landscape. Defense-in-depth behind the frontend picker, which should only ever offer them this
+// same set to begin with.
+async function computeSystemOwnerExportAllowlist(userId) {
+  const { rows: ownedRows } = await pool.query('SELECT id FROM systems WHERE owner_ids @> $1::jsonb', [JSON.stringify([userId])]);
+  const ownedSystemIds = ownedRows.map(r => r.id);
+  const { rows: edgeRows } = ownedSystemIds.length
+    ? await pool.query('SELECT id, data_object_ids FROM edges WHERE source = ANY($1) OR target = ANY($1)', [ownedSystemIds])
+    : { rows: [] };
+  const allowedObjectIds = new Set();
+  edgeRows.forEach(e => (e.data_object_ids || []).forEach(id => allowedObjectIds.add(id)));
+  const { rows: objectRows } = ownedSystemIds.length
+    ? await pool.query('SELECT id FROM data_objects WHERE master_system_id = ANY($1)', [ownedSystemIds])
+    : { rows: [] };
+  objectRows.forEach(o => allowedObjectIds.add(o.id));
+  return {
+    allowedSystemIds: new Set(ownedSystemIds),
+    allowedEdgeIds: new Set(edgeRows.map(e => e.id)),
+    allowedObjectIds,
+  };
+}
+
+app.post('/api/export', requireAuth, async (req, res) => {
+  try {
+    const systemIds = Array.isArray(req.body.systemIds) ? req.body.systemIds : [];
+    const dataObjectIds = Array.isArray(req.body.dataObjectIds) ? req.body.dataObjectIds : [];
+    const edgeIds = Array.isArray(req.body.edgeIds) ? req.body.edgeIds : [];
+    if (systemIds.length === 0 && dataObjectIds.length === 0 && edgeIds.length === 0) {
+      return res.status(400).json({ error: 'Select at least one system, data object, or edge to export.' });
+    }
+
+    if (req.user.role === 'system_owner') {
+      const allow = await computeSystemOwnerExportAllowlist(req.user.id);
+      const disallowed = [
+        ...systemIds.filter(id => !allow.allowedSystemIds.has(id)),
+        ...dataObjectIds.filter(id => !allow.allowedObjectIds.has(id)),
+        ...edgeIds.filter(id => !allow.allowedEdgeIds.has(id)),
+      ];
+      if (disallowed.length > 0) {
+        return res.status(400).json({ error: 'You can only export systems, objects, and edges related to a system you own.' });
+      }
+    }
+
+    const closure = await resolveExportClosure(systemIds, dataObjectIds, edgeIds);
+
+    const [systemsRes, objectsRes, edgesRes] = await Promise.all([
+      closure.systemIds.length ? pool.query('SELECT * FROM systems WHERE id = ANY($1) ORDER BY label', [closure.systemIds]) : Promise.resolve({ rows: [] }),
+      closure.dataObjectIds.length ? pool.query('SELECT * FROM data_objects WHERE id = ANY($1) ORDER BY name', [closure.dataObjectIds]) : Promise.resolve({ rows: [] }),
+      closure.edgeIds.length ? pool.query('SELECT * FROM edges WHERE id = ANY($1)', [closure.edgeIds]) : Promise.resolve({ rows: [] }),
+    ]);
+
+    const edgeObjectDetailsRes = closure.edgeIds.length
+      ? await pool.query('SELECT * FROM edge_object_details WHERE edge_id = ANY($1)', [closure.edgeIds])
+      : { rows: [] };
+
+    const typeIds = [...new Set(edgeObjectDetailsRes.rows.map(d => d.integration_type_id).filter(Boolean))];
+    const softwareIds = [...new Set(edgeObjectDetailsRes.rows.map(d => d.integration_software_id).filter(Boolean))];
+    const capabilityIds = [...new Set(systemsRes.rows.map(s => s.business_capability_id).filter(Boolean))];
+    const [typesRes, softwareRes, capabilitiesRes] = await Promise.all([
+      typeIds.length ? pool.query('SELECT * FROM integration_types WHERE id = ANY($1)', [typeIds]) : Promise.resolve({ rows: [] }),
+      softwareIds.length ? pool.query('SELECT * FROM integration_software WHERE id = ANY($1)', [softwareIds]) : Promise.resolve({ rows: [] }),
+      capabilityIds.length ? pool.query('SELECT * FROM business_capabilities WHERE id = ANY($1)', [capabilityIds]) : Promise.resolve({ rows: [] }),
+    ]);
+
+    await logAudit(req, {
+      action: 'export', resourceType: 'import_export',
+      resourceLabel: `${systemsRes.rows.length} systems, ${objectsRes.rows.length} objects, ${edgesRes.rows.length} edges`,
+      after: { systemIds: closure.systemIds, dataObjectIds: closure.dataObjectIds, edgeIds: closure.edgeIds },
+    });
+
+    res.json({
+      formatVersion: EXPORT_FORMAT_VERSION,
+      exportedAt: new Date().toISOString(),
+      exportedBy: { id: req.user.id, name: req.user.name, email: req.user.email },
+      systems: systemsRes.rows,
+      dataObjects: objectsRes.rows,
+      edges: edgesRes.rows,
+      edgeObjectDetails: edgeObjectDetailsRes.rows,
+      integrationTypes: typesRes.rows,
+      integrationSoftware: softwareRes.rows,
+      businessCapabilities: capabilitiesRes.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Summarizes one entity's fields for side-by-side display in the conflict-resolution UI - not the
+// full row, just enough for a person to tell whether the incoming version is the same thing, an
+// update, or a completely different entity that happens to reuse the same id.
+const summarizeSystem = (s, labelOf) => ({
+  label: s.label, status: s.status, criticality: s.criticality,
+  businessCapability: labelOf.capability(s.business_capability_id) || '', description: s.description || '',
+});
+const summarizeObject = (o, labelOf) => ({
+  name: o.name, masterSystem: labelOf.system(o.master_system_id) || o.master_system_id || '',
+  classification: o.classification, description: o.description || '',
+});
+const summarizeEdge = (e, labelOf) => ({
+  source: labelOf.system(e.source) || e.source, target: labelOf.system(e.target) || e.target,
+  description: e.description || '', objects: (e.data_object_ids || []).map(id => labelOf.object(id) || id).join(', '),
+});
+
+async function diffEntity(table, incomingRows, summarize) {
+  const ids = incomingRows.map(r => r.id).filter(Boolean);
+  const existingRows = ids.length ? (await pool.query(`SELECT * FROM ${table} WHERE id = ANY($1)`, [ids])).rows : [];
+  const existingById = new Map(existingRows.map(r => [r.id, r]));
+  const result = { new: [], conflicts: [] };
+  for (const incoming of incomingRows) {
+    const existing = existingById.get(incoming.id);
+    if (!existing) {
+      result.new.push({ id: incoming.id, summary: summarize(incoming) });
+    } else {
+      result.conflicts.push({
+        id: incoming.id,
+        incoming: summarize(incoming),
+        existing: summarize(existing),
+        identical: JSON.stringify(incoming) === JSON.stringify(existing),
+      });
+    }
+  }
+  return result;
+}
+
+app.post('/api/import/preview', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+  try {
+    const bundle = req.body.bundle;
+    if (!bundle || typeof bundle !== 'object') return res.status(400).json({ error: 'That file is not a valid EA Designer export.' });
+    const incomingSystems = Array.isArray(bundle.systems) ? bundle.systems : [];
+    const incomingObjects = Array.isArray(bundle.dataObjects) ? bundle.dataObjects : [];
+    const incomingEdges = Array.isArray(bundle.edges) ? bundle.edges : [];
+
+    // A label lookup that knows about both what's already here and what's in the bundle, so an
+    // edge between two brand-new systems (or an object mastered by one) still shows real names
+    // instead of raw ids in the preview - not just whichever half happens to exist locally yet.
+    const systemLabelById = new Map((await pool.query('SELECT id, label FROM systems')).rows.map(r => [r.id, r.label]));
+    incomingSystems.forEach(s => { if (!systemLabelById.has(s.id)) systemLabelById.set(s.id, s.label); });
+    const objectNameById = new Map((await pool.query('SELECT id, name FROM data_objects')).rows.map(r => [r.id, r.name]));
+    incomingObjects.forEach(o => { if (!objectNameById.has(o.id)) objectNameById.set(o.id, o.name); });
+    const incomingCapabilities = Array.isArray(bundle.businessCapabilities) ? bundle.businessCapabilities : [];
+    const capabilityNameById = new Map((await pool.query('SELECT id, name FROM business_capabilities')).rows.map(r => [r.id, r.name]));
+    incomingCapabilities.forEach(c => { if (!capabilityNameById.has(c.id)) capabilityNameById.set(c.id, c.name); });
+    const labelOf = {
+      system: (id) => systemLabelById.get(id), object: (id) => objectNameById.get(id),
+      capability: (id) => capabilityNameById.get(id),
+    };
+
+    const [systems, dataObjects, edges] = await Promise.all([
+      diffEntity('systems', incomingSystems, (s) => summarizeSystem(s, labelOf)),
+      diffEntity('data_objects', incomingObjects, (o) => summarizeObject(o, labelOf)),
+      diffEntity('edges', incomingEdges, (e) => summarizeEdge(e, labelOf)),
+    ]);
+
+    res.json({ systems, dataObjects, edges });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Applies a bundle, honoring a resolution ('override' | 'skip' | 'rename', with an optional
+// newLabel/newName for 'rename') supplied per conflicting id. Anything not already present locally
+// is simply new and gets inserted regardless of what (if anything) `resolutions` says about it -
+// only an actual id collision needs a decision, and the UI is expected to have collected one for
+// every conflict before calling this. Any conflict left unresolved anyway defaults to 'skip', the
+// only non-destructive option, rather than silently overwriting existing data.
+app.post('/api/import/commit', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const bundle = req.body.bundle;
+    const resolutions = req.body.resolutions || {};
+    if (!bundle || typeof bundle !== 'object') return res.status(400).json({ error: 'That file is not a valid EA Designer export.' });
+    const isSystemOwnerImport = req.user.role === 'system_owner';
+
+    const incomingSystems = Array.isArray(bundle.systems) ? bundle.systems : [];
+    const incomingObjects = Array.isArray(bundle.dataObjects) ? bundle.dataObjects : [];
+    const incomingEdges = Array.isArray(bundle.edges) ? bundle.edges : [];
+    const incomingDetails = Array.isArray(bundle.edgeObjectDetails) ? bundle.edgeObjectDetails : [];
+    const incomingTypes = Array.isArray(bundle.integrationTypes) ? bundle.integrationTypes : [];
+    const incomingSoftware = Array.isArray(bundle.integrationSoftware) ? bundle.integrationSoftware : [];
+    const incomingCapabilities = Array.isArray(bundle.businessCapabilities) ? bundle.businessCapabilities : [];
+
+    const freshId = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+
+    // Works out, for one entity type, the final id every incoming row should be written under (or
+    // null if it's being skipped entirely) and which final ids are an UPDATE of an existing row
+    // rather than a plain INSERT. A row whose id doesn't already exist locally is never a conflict
+    // and only ever supports 'skip' (the UI lets a person exclude a "new" row from the import
+    // without it needing to collide with anything first) - 'override'/'rename' only mean something
+    // once there's an existing row to override or rename away from.
+    const planEntity = (rows, existingIds, resKind, prefix) => {
+      const idMap = new Map();
+      const overwrite = new Set();
+      const relabel = new Map();
+      for (const row of rows) {
+        const decision = resolutions[resKind]?.[row.id];
+        if (!existingIds.has(row.id)) {
+          idMap.set(row.id, decision?.action === 'skip' ? null : row.id);
+          continue;
+        }
+        if (decision?.action === 'override') {
+          idMap.set(row.id, row.id);
+          overwrite.add(row.id);
+        } else if (decision?.action === 'rename') {
+          const newId = freshId(prefix);
+          idMap.set(row.id, newId);
+          if (decision.newLabel) relabel.set(newId, decision.newLabel);
+        } else {
+          idMap.set(row.id, null);
+        }
+      }
+      return { idMap, overwrite, relabel };
+    };
+    // Resolves a reference to another entity in the bundle (e.g. an edge's source system id) to
+    // wherever that entity actually ended up: unchanged for a new/overridden row, remapped for a
+    // renamed one, and unchanged for anything skipped or outside the bundle entirely - both of
+    // those cases mean "this id already exists locally under its original id", which is exactly
+    // what falling through to the original id gives us.
+    const remap = (plan, id) => (id ? (plan.idMap.get(id) ?? id) : id);
+
+    const existingSystemIds = new Set((await client.query('SELECT id FROM systems')).rows.map(r => r.id));
+    const existingObjectIds = new Set((await client.query('SELECT id FROM data_objects')).rows.map(r => r.id));
+    const existingEdgeIds = new Set((await client.query('SELECT id FROM edges')).rows.map(r => r.id));
+
+    // System Owner pre-pass, computed entirely from committed DB state and done BEFORE BEGIN -
+    // forces `resolutions` toward 'skip' for anything not permitted, and pulls any edge that needs
+    // approval out of the direct-write path entirely (queued in pendingEdgeQueue, turned into real
+    // change_requests rows only after COMMIT succeeds below). This has to happen up front, not by
+    // catching a foreign-key error mid-transaction: letting a not-permitted row reach an INSERT
+    // would roll back every other row in the same commit, including ones that were legitimately
+    // allowed (see the FK-violation comment on the catch block at the end of this route).
+    const pendingEdgeQueue = []; // { edge, isNew, affectedSystemIds, details }
+    if (isSystemOwnerImport) {
+      // System Owners can never provision brand-new systems via import (nor edit an existing one
+      // through it - system fields are edited directly, not imported) - skip every 'systems' row
+      // unconditionally, regardless of what the client's own resolution said.
+      resolutions.systems = Object.fromEntries(incomingSystems.map(s => [s.id, { action: 'skip' }]));
+
+      const { rows: ownedRows } = await client.query('SELECT id FROM systems WHERE owner_ids @> $1::jsonb', [JSON.stringify([req.user.id])]);
+      const ownedSystemIds = new Set(ownedRows.map(r => r.id));
+
+      const { rows: currentObjectRows } = incomingObjects.length
+        ? await client.query('SELECT id, master_system_id FROM data_objects WHERE id = ANY($1)', [incomingObjects.map(o => o.id)])
+        : { rows: [] };
+      const currentObjectMaster = new Map(currentObjectRows.map(r => [r.id, r.master_system_id]));
+      resolutions.dataObjects = resolutions.dataObjects || {};
+      for (const o of incomingObjects) {
+        const relevantMaster = existingObjectIds.has(o.id) ? currentObjectMaster.get(o.id) : o.master_system_id;
+        if (!ownedSystemIds.has(relevantMaster)) resolutions.dataObjects[o.id] = { action: 'skip' };
+      }
+
+      const { rows: currentEdgeRows } = incomingEdges.length
+        ? await client.query('SELECT id, source, target FROM edges WHERE id = ANY($1)', [incomingEdges.map(e => e.id)])
+        : { rows: [] };
+      const currentEdgeById = new Map(currentEdgeRows.map(r => [r.id, r]));
+      resolutions.edges = resolutions.edges || {};
+      for (const e of incomingEdges) {
+        const current = currentEdgeById.get(e.id);
+        const source = current ? current.source : e.source;
+        const target = current ? current.target : e.target;
+        const gate = await resolveEdgeAuthority(req.user.id, source, target);
+        if (gate.mode === 'blocked') {
+          resolutions.edges[e.id] = { action: 'skip' };
+        } else if (gate.mode === 'pending') {
+          resolutions.edges[e.id] = { action: 'skip' }; // never written directly in this pass
+          pendingEdgeQueue.push({
+            edge: e,
+            isNew: !existingEdgeIds.has(e.id),
+            affectedSystemIds: gate.affectedSystemIds,
+            details: incomingDetails.filter(d => d.edge_id === e.id),
+          });
+        }
+        // 'self-serve' (owns both endpoints): leave resolutions.edges[e.id] exactly as the client
+        // sent it (or unset, meaning "create normally") - no override needed.
+      }
+    }
+
+    const systemPlan = planEntity(incomingSystems, existingSystemIds, 'systems', 'sys');
+    const objectPlan = planEntity(incomingObjects, existingObjectIds, 'dataObjects', 'obj');
+    const edgePlan = planEntity(incomingEdges, existingEdgeIds, 'edges', 'edge');
+
+    const auditEntries = [];
+    const created = { systems: 0, dataObjects: 0, edges: 0 };
+    const updated = { systems: 0, dataObjects: 0, edges: 0 };
+    const skipped = { systems: 0, dataObjects: 0, edges: 0 };
+    // Populated as systems are written below, so the edges loop can show real labels (e.g. in its
+    // own audit entry) for every endpoint, not just ones that happened to be renamed.
+    const systemLabelByFinalId = new Map();
+
+    await client.query('BEGIN');
+
+    // Integration Type/Software/Business Capability are shared admin-maintained tag lists, not
+    // entities with real identity of their own, so they don't go through the same conflict UI - an
+    // incoming tag is matched to a local one by id first, then by name (case-insensitively), and
+    // only creates a new row if neither matches. This is a merge, never an overwrite: an existing
+    // tag's name is never changed by an import. Run before the systems loop below (unlike
+    // type/software, which only need to be resolved once the edges/details loops reach them further
+    // down) since a system row itself needs its business_capability_id remapped through this merge.
+    const mergeReferenceList = async (table, incomingRows) => {
+      const idMap = new Map();
+      for (const row of incomingRows) {
+        if (!row?.id) continue;
+        const byId = await client.query(`SELECT id FROM ${table} WHERE id = $1`, [row.id]);
+        if (byId.rows.length > 0) { idMap.set(row.id, row.id); continue; }
+        const byName = await client.query(`SELECT id FROM ${table} WHERE lower(name) = lower($1)`, [row.name]);
+        if (byName.rows.length > 0) { idMap.set(row.id, byName.rows[0].id); continue; }
+        if (table === 'integration_software') {
+          await client.query('INSERT INTO integration_software (id, name, time_zone) VALUES ($1, $2, $3)', [row.id, row.name, row.time_zone || 'UTC']);
+        } else {
+          await client.query(`INSERT INTO ${table} (id, name) VALUES ($1, $2)`, [row.id, row.name]);
+        }
+        idMap.set(row.id, row.id);
+      }
+      return idMap;
+    };
+    const typeIdMap = await mergeReferenceList('integration_types', incomingTypes);
+    const softwareIdMap = await mergeReferenceList('integration_software', incomingSoftware);
+    const capabilityIdMap = await mergeReferenceList('business_capabilities', incomingCapabilities);
+
+    for (const s of incomingSystems) {
+      const finalId = systemPlan.idMap.get(s.id);
+      if (!finalId) { skipped.systems++; continue; }
+      const label = systemPlan.relabel.get(finalId) || s.label;
+      systemLabelByFinalId.set(finalId, label);
+      const capabilityId = s.business_capability_id ? (capabilityIdMap.get(s.business_capability_id) || s.business_capability_id) : '';
+      const values = [
+        finalId, label, s.x || 0, s.y || 0, JSON.stringify(s.layout_positions || {}),
+        s.status || 'active', s.criticality || 'medium', capabilityId,
+        JSON.stringify(s.tech_stack || []), s.description || '', s.time_zone || 'UTC',
+      ];
+      if (systemPlan.overwrite.has(finalId)) {
+        await client.query(
+          `UPDATE systems SET label=$2, x=$3, y=$4, layout_positions=$5, status=$6, criticality=$7,
+                              business_capability_id=$8, tech_stack=$9, description=$10, time_zone=$11
+           WHERE id=$1`,
+          values
+        );
+        updated.systems++;
+        auditEntries.push({ action: 'update', resourceType: 'system', resourceId: finalId, resourceLabel: label, after: s });
+      } else {
+        await client.query(
+          `INSERT INTO systems (id, label, x, y, layout_positions, status, criticality, business_capability_id, tech_stack, description, time_zone, owner_ids)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'[]')`,
+          values
+        );
+        created.systems++;
+        auditEntries.push({ action: 'create', resourceType: 'system', resourceId: finalId, resourceLabel: label, after: s });
+      }
+    }
+
+    for (const o of incomingObjects) {
+      const finalId = objectPlan.idMap.get(o.id);
+      if (!finalId) { skipped.dataObjects++; continue; }
+      const name = objectPlan.relabel.get(finalId) || o.name;
+      const masterSystemId = remap(systemPlan, o.master_system_id) || null;
+      const values = [
+        finalId, name, masterSystemId, JSON.stringify(o.system_object_names || {}),
+        o.description || '', o.classification || 'internal',
+      ];
+      if (objectPlan.overwrite.has(finalId)) {
+        await client.query(
+          `UPDATE data_objects SET name=$2, master_system_id=$3, system_object_names=$4, description=$5, classification=$6 WHERE id=$1`,
+          values
+        );
+        updated.dataObjects++;
+        auditEntries.push({ action: 'update', resourceType: 'data_object', resourceId: finalId, resourceLabel: name, after: o });
+      } else {
+        await client.query(
+          `INSERT INTO data_objects (id, name, master_system_id, system_object_names, description, classification)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          values
+        );
+        created.dataObjects++;
+        auditEntries.push({ action: 'create', resourceType: 'data_object', resourceId: finalId, resourceLabel: name, after: o });
+      }
+    }
+
+    for (const e of incomingEdges) {
+      const finalId = edgePlan.idMap.get(e.id);
+      if (!finalId) { skipped.edges++; continue; }
+      const source = remap(systemPlan, e.source);
+      const target = remap(systemPlan, e.target);
+      const objectIds = (e.data_object_ids || []).map(id => remap(objectPlan, id)).filter(Boolean);
+      const label = `${systemLabelByFinalId.get(source) || source} → ${systemLabelByFinalId.get(target) || target}`;
+      const values = [finalId, source, target, JSON.stringify(objectIds), e.description || ''];
+      if (edgePlan.overwrite.has(finalId)) {
+        await client.query(`UPDATE edges SET source=$2, target=$3, data_object_ids=$4, description=$5 WHERE id=$1`, values);
+        updated.edges++;
+        auditEntries.push({ action: 'update', resourceType: 'edge', resourceId: finalId, resourceLabel: label, after: e });
+      } else {
+        await client.query(
+          `INSERT INTO edges (id, source, target, data_object_ids, description, owner_ids) VALUES ($1,$2,$3,$4,$5,'[]')`,
+          values
+        );
+        created.edges++;
+        auditEntries.push({ action: 'create', resourceType: 'edge', resourceId: finalId, resourceLabel: label, after: e });
+      }
+    }
+
+    // Detail rows follow their parent edge/object: if either was skipped, the detail is left alone
+    // too rather than grafting new integration-mechanics data onto an edge/object the user chose
+    // not to touch.
+    for (const d of incomingDetails) {
+      const edgeFinal = edgePlan.idMap.get(d.edge_id);
+      const objectFinal = objectPlan.idMap.get(d.data_object_id);
+      if (!edgeFinal || !objectFinal) continue;
+      const typeId = (d.integration_type_id && typeIdMap.get(d.integration_type_id)) || d.integration_type_id || '';
+      const softwareId = (d.integration_software_id && softwareIdMap.get(d.integration_software_id)) || d.integration_software_id || '';
+      await client.query(
+        `INSERT INTO edge_object_details (edge_id, data_object_id, source_pattern, target_pattern, schedule, integration_type_id, integration_software_id, at_risk)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (edge_id, data_object_id) DO UPDATE SET
+           source_pattern = EXCLUDED.source_pattern, target_pattern = EXCLUDED.target_pattern, schedule = EXCLUDED.schedule,
+           integration_type_id = EXCLUDED.integration_type_id, integration_software_id = EXCLUDED.integration_software_id,
+           at_risk = EXCLUDED.at_risk`,
+        [edgeFinal, objectFinal, d.source_pattern || '', d.target_pattern || '',
+          JSON.stringify(d.schedule || { kind: 'daily', time: '02:00' }), typeId, softwareId, !!d.at_risk]
       );
     }
-    const beforeRow = beforeRows[0] || {};
-    const beforeSnapshot = {};
-    for (const key of Object.keys(EDGE_OBJECT_DETAIL_COLUMNS)) {
-      if (key in req.body) beforeSnapshot[key] = beforeRow[EDGE_OBJECT_DETAIL_COLUMNS[key]];
+
+    await client.query('COMMIT');
+
+    for (const entry of auditEntries) await logAudit(req, entry);
+
+    // Edges that needed approval never touched the transaction above - turn them into real
+    // change_requests rows now that the rest of the import has safely landed. Each one folds its
+    // own edge_object_details (if any) into the same request rather than creating a second one,
+    // remapping their integration type/software ids through the merge that already ran above.
+    const queuedForApproval = { edges: 0 };
+    for (const item of pendingEdgeQueue) {
+      // Converted to the camelCase shape applyEdgeCreate/applyEdgeUpdate expect (a live
+      // POST/PATCH body) - the bundle's own edge rows are the raw snake_case DB export shape.
+      const payload = {
+        id: item.edge.id,
+        source: item.edge.source,
+        target: item.edge.target,
+        dataObjectIds: item.edge.data_object_ids || [],
+        description: item.edge.description || '',
+      };
+      if (item.details.length > 0) {
+        // Converted to the camelCase shape applyEdgeObjectDetailUpsert/buildUpdate expect (a live
+        // PATCH body) - the bundle's own rows are the raw snake_case DB export shape instead.
+        payload.edgeObjectDetails = item.details.map(d => ({
+          dataObjectId: d.data_object_id,
+          sourcePattern: d.source_pattern || '',
+          targetPattern: d.target_pattern || '',
+          schedule: d.schedule || { kind: 'daily', time: '02:00' },
+          integrationTypeId: (d.integration_type_id && typeIdMap.get(d.integration_type_id)) || d.integration_type_id || '',
+          integrationSoftwareId: (d.integration_software_id && softwareIdMap.get(d.integration_software_id)) || d.integration_software_id || '',
+          atRisk: !!d.at_risk,
+        }));
+      }
+      await createChangeRequest(req, {
+        action: item.isNew ? 'create' : 'update',
+        resourceType: 'edge',
+        resourceId: item.edge.id,
+        payload,
+        affectedSystemIds: item.affectedSystemIds,
+      });
+      queuedForApproval.edges++;
     }
+
     await logAudit(req, {
-      action: beforeRows.length > 0 ? 'update' : 'create', resourceType: 'integration_flow', resourceId: `${edgeId}:${objectId}`,
-      resourceLabel: `${edgeId} / ${objectId}`, before: beforeRows.length > 0 ? beforeSnapshot : null, after: req.body,
+      action: 'import', resourceType: 'import_export',
+      resourceLabel: `${created.systems + updated.systems} systems, ${created.dataObjects + updated.dataObjects} objects, ${created.edges + updated.edges} edges`,
+      after: { created, updated, skipped, queuedForApproval },
     });
+
+    res.json({ success: true, created, updated, skipped, queuedForApproval });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    // Postgres error code 23503 = foreign_key_violation - by far the most likely way this
+    // transaction can fail, since skipping a "new" row is otherwise unconstrained: nothing stops a
+    // person from keeping a new edge/object while skipping the new system or object it points to.
+    // The raw constraint-name error ("...violates foreign key constraint \"edges_target_fkey\"")
+    // is meaningless to whoever's importing, so translate it into what actually needs fixing.
+    const message = err.code === '23503'
+      ? 'Import failed: something you kept references something else you chose to skip. Include that item too, or skip the one that depends on it.'
+      : err.message;
+    res.status(500).json({ error: message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Change requests - the approval queue a system_owner's cross-system edge/edge-object-detail
+// change lands in (see createChangeRequest/resolveEdgeAuthority above). Visible to anyone signed
+// in (matches "pending changes are visible to everyone"), but only an eligible approver - an
+// admin/superadmin, or an owner of one of the request's affected_system_ids - can decide one.
+// ---------------------------------------------------------------------------
+async function canDecideChangeRequest(user, changeRequest) {
+  if (isPrivilegedRole(user.role)) return true;
+  const affected = changeRequest.affected_system_ids || [];
+  if (affected.length === 0) return false;
+  const { rows } = await pool.query('SELECT owner_ids FROM systems WHERE id = ANY($1)', [affected]);
+  return rows.some(r => (r.owner_ids || []).includes(user.id));
+}
+
+app.get('/api/change-requests', requireAuth, async (req, res) => {
+  try {
+    const { status = 'pending', scope = 'mine', resourceType, limit = '50', offset = '0' } = req.query;
+    const clauses = [];
+    const values = [];
+    let i = 1;
+
+    if (status && status !== 'all') { clauses.push(`cr.status = $${i++}`); values.push(status); }
+    if (resourceType) { clauses.push(`cr.resource_type = $${i++}`); values.push(resourceType); }
+
+    if (scope === 'mine') {
+      clauses.push(`cr.requested_by = $${i++}`);
+      values.push(req.user.id);
+    } else if (scope === 'awaitingMe') {
+      if (!isPrivilegedRole(req.user.role)) {
+        const { rows: ownedRows } = await pool.query('SELECT id FROM systems WHERE owner_ids @> $1::jsonb', [JSON.stringify([req.user.id])]);
+        const ownedIds = ownedRows.map(r => r.id);
+        if (ownedIds.length === 0) return res.json({ changeRequests: [], total: 0 });
+        clauses.push(`cr.affected_system_ids ?| $${i++}`);
+        values.push(ownedIds);
+      }
+    } else if (scope === 'all') {
+      if (!isPrivilegedRole(req.user.role)) return res.status(403).json({ error: 'You do not have permission to do this' });
+    } else if (scope === 'visible') {
+      // Every pending change is meant to be visible to anyone signed in (shown dashed/badged on
+      // the canvas so it's unmistakably "not active yet") - unlike 'all', this isn't admin-only,
+      // but it's only ever used for that canvas-wide read, not for the Approvals page's own lists.
+    } else {
+      return res.status(400).json({ error: 'Invalid scope' });
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const safeLimit = Math.min(parseInt(limit, 10) || 50, 200);
+    const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
+    const rows = await pool.query(
+      `SELECT cr.*, u.name AS requested_by_name, u.email AS requested_by_email
+       FROM change_requests cr JOIN users u ON u.id = cr.requested_by
+       ${where} ORDER BY cr.created_at DESC LIMIT $${i} OFFSET $${i + 1}`,
+      [...values, safeLimit, safeOffset]
+    );
+    const count = await pool.query(`SELECT COUNT(*) FROM change_requests cr ${where}`, values);
+    res.json({ changeRequests: rows.rows, total: parseInt(count.rows[0].count, 10) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/change-requests/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT cr.*, u.name AS requested_by_name, u.email AS requested_by_email
+       FROM change_requests cr JOIN users u ON u.id = cr.requested_by WHERE cr.id = $1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const cr = rows[0];
+    const { rows: systemRows } = await pool.query('SELECT id, label FROM systems WHERE id = ANY($1)', [cr.affected_system_ids || []]);
+    res.json({ changeRequest: cr, affectedSystems: systemRows, canDecide: await canDecideChangeRequest(req.user, cr) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/change-requests/:id/approve', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM change_requests WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const cr = rows[0];
+    if (!(await canDecideChangeRequest(req.user, cr))) return res.status(403).json({ error: 'You do not have permission to do this' });
+
+    // Conditional UPDATE (not read-then-write) so two approvers deciding at nearly the same
+    // moment can't both succeed - whichever request wins the race gets rowCount 1, the other 0.
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE change_requests SET status = 'approved', decided_by = $1, decided_at = now() WHERE id = $2 AND status = 'pending' RETURNING *`,
+      [req.user.id, req.params.id]
+    );
+    if (updatedRows.length === 0) return res.status(409).json({ error: 'This request was already decided.' });
+
+    const { rows: requesterRows } = await pool.query('SELECT id, email, name, role, notification_email_prefs FROM users WHERE id = $1', [cr.requested_by]);
+    const requester = requesterRows[0];
+
+    // Re-verify the underlying resource is still in the state this request assumed before
+    // replaying it - if it was deleted or changed out from under the request in the meantime,
+    // applying a stale payload could resurrect something or clobber an unrelated edit. Auto-reject
+    // instead of applying blindly (full field-level diffing against before_snapshot is out of
+    // scope for now - this only checks the resource still exists).
+    let stillValid = true;
+    if (cr.action === 'update' || cr.action === 'delete') {
+      if (cr.resource_type === 'edge') {
+        stillValid = (await pool.query('SELECT id FROM edges WHERE id = $1', [cr.resource_id])).rows.length > 0;
+      } else if (cr.resource_type === 'edge_object_detail') {
+        stillValid = (await pool.query(
+          'SELECT edge_id FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2', [cr.resource_id, cr.secondary_id]
+        )).rows.length > 0;
+      }
+    }
+
+    if (!stillValid) {
+      await pool.query(`UPDATE change_requests SET status = 'rejected', decision_reason = $1 WHERE id = $2`,
+        ['Automatically rejected: the underlying item no longer exists.', req.params.id]);
+      if (requester) {
+        await notify(requester, {
+          type: 'change_request_rejected',
+          title: 'Your proposed change could not be applied',
+          body: 'The item it would have changed no longer exists.',
+          linkView: 'approvals', linkId: req.params.id,
+          emailSubject: 'Your proposed change could not be applied',
+          emailHtml: `<p>Your proposed change could not be applied because the underlying item no longer exists.</p>`,
+        });
+      }
+      await logAudit(req, { action: 'reject', resourceType: 'change_request', resourceId: req.params.id, resourceLabel: `${cr.resource_type} ${cr.action}`, metadata: { autoRejected: true } });
+      return res.json({ success: true, applied: false, autoRejected: true });
+    }
+
+    if (cr.resource_type === 'edge') {
+      if (cr.action === 'create') await applyEdgeCreate(req, cr.payload, requester);
+      else if (cr.action === 'update') await applyEdgeUpdate(req, cr.resource_id, cr.payload, requester);
+      else if (cr.action === 'delete') await applyEdgeDelete(req, cr.resource_id, requester);
+      // A request that originated from a system_owner's import folds that edge's per-object flow
+      // mechanics into this same payload (see the import/commit route) rather than spawning a
+      // second change request - apply them now that the edge itself exists/is updated.
+      if (cr.action !== 'delete' && Array.isArray(cr.payload?.edgeObjectDetails)) {
+        for (const d of cr.payload.edgeObjectDetails) {
+          await applyEdgeObjectDetailUpsert(req, cr.resource_id, d.dataObjectId, d, requester);
+        }
+      }
+    } else if (cr.resource_type === 'edge_object_detail') {
+      if (cr.action === 'delete') await applyEdgeObjectDetailDelete(req, cr.resource_id, cr.secondary_id, requester);
+      else await applyEdgeObjectDetailUpsert(req, cr.resource_id, cr.secondary_id, cr.payload, requester);
+    }
+
+    if (requester) {
+      await notify(requester, {
+        type: 'change_request_approved',
+        title: 'Your proposed change was approved',
+        body: `${req.user.name || req.user.email} approved your change - it's now active.`,
+        linkView: 'approvals', linkId: req.params.id,
+        emailSubject: 'Your proposed change was approved',
+        emailHtml: `<p><strong>${req.user.name || req.user.email}</strong> approved your proposed change - it's now active.</p>`,
+      });
+    }
+    await logAudit(req, { action: 'approve', resourceType: 'change_request', resourceId: req.params.id, resourceLabel: `${cr.resource_type} ${cr.action}` });
+    res.json({ success: true, applied: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/change-requests/:id/reject', requireAuth, async (req, res) => {
+  try {
+    const reason = (req.body?.reason || '').trim();
+    if (!reason) return res.status(400).json({ error: 'A reason is required.' });
+    const { rows } = await pool.query('SELECT * FROM change_requests WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const cr = rows[0];
+    if (!(await canDecideChangeRequest(req.user, cr))) return res.status(403).json({ error: 'You do not have permission to do this' });
+
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE change_requests SET status = 'rejected', decided_by = $1, decided_at = now(), decision_reason = $2 WHERE id = $3 AND status = 'pending' RETURNING *`,
+      [req.user.id, reason, req.params.id]
+    );
+    if (updatedRows.length === 0) return res.status(409).json({ error: 'This request was already decided.' });
+
+    const { rows: requesterRows } = await pool.query('SELECT id, email, name, notification_email_prefs FROM users WHERE id = $1', [cr.requested_by]);
+    if (requesterRows[0]) {
+      await notify(requesterRows[0], {
+        type: 'change_request_rejected',
+        title: 'Your proposed change was rejected',
+        body: reason,
+        linkView: 'approvals', linkId: req.params.id,
+        emailSubject: 'Your proposed change was rejected',
+        emailHtml: `<p><strong>${req.user.name || req.user.email}</strong> rejected your proposed change.</p><p>Reason: ${reason}</p>`,
+      });
+    }
+    await logAudit(req, { action: 'reject', resourceType: 'change_request', resourceId: req.params.id, resourceLabel: `${cr.resource_type} ${cr.action}`, metadata: { reason } });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/api/edges/:edgeId/objects/:objectId', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.post('/api/change-requests/:id/withdraw', requireAuth, async (req, res) => {
   try {
-    const { rows: beforeRows } = await pool.query(
-      'SELECT * FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2', [req.params.edgeId, req.params.objectId]
+    const { rows } = await pool.query('SELECT * FROM change_requests WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const cr = rows[0];
+    if (cr.requested_by !== req.user.id && !isPrivilegedRole(req.user.role)) {
+      return res.status(403).json({ error: 'You do not have permission to do this' });
+    }
+
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE change_requests SET status = 'withdrawn', decided_by = $1, decided_at = now() WHERE id = $2 AND status = 'pending' RETURNING *`,
+      [req.user.id, req.params.id]
     );
-    await pool.query(
-      'DELETE FROM edge_object_details WHERE edge_id = $1 AND data_object_id = $2',
-      [req.params.edgeId, req.params.objectId]
+    if (updatedRows.length === 0) return res.status(409).json({ error: 'This request was already decided.' });
+    await logAudit(req, { action: 'withdraw', resourceType: 'change_request', resourceId: req.params.id, resourceLabel: `${cr.resource_type} ${cr.action}` });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Notifications - the in-app inbox every notify() call writes to (see above). Own rows only; the
+// email half of a notification is opt-out-able per type via PATCH /api/auth/me, but the in-app row
+// here always gets written regardless.
+// ---------------------------------------------------------------------------
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const { unreadOnly, limit = '30', offset = '0' } = req.query;
+    const clauses = ['user_id = $1'];
+    const values = [req.user.id];
+    let i = 2;
+    if (unreadOnly === 'true') clauses.push('read_at IS NULL');
+    const where = `WHERE ${clauses.join(' AND ')}`;
+    const safeLimit = Math.min(parseInt(limit, 10) || 30, 100);
+    const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
+    const rows = await pool.query(
+      `SELECT * FROM notifications ${where} ORDER BY created_at DESC LIMIT $${i} OFFSET $${i + 1}`,
+      [...values, safeLimit, safeOffset]
     );
-    await logAudit(req, {
-      action: 'delete', resourceType: 'integration_flow', resourceId: `${req.params.edgeId}:${req.params.objectId}`,
-      resourceLabel: `${req.params.edgeId} / ${req.params.objectId}`, before: beforeRows[0] || null,
-    });
+    const unread = await pool.query('SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL', [req.user.id]);
+    res.json({ notifications: rows.rows, unreadCount: parseInt(unread.rows[0].count, 10) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE notifications SET read_at = now() WHERE id = $1 AND user_id = $2 AND read_at IS NULL', [req.params.id, req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL', [req.user.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2658,6 +3802,7 @@ function registerReferenceListRoutes(path, table, idPrefix, columns = REFERENCE_
 
 registerReferenceListRoutes('integration-types', 'integration_types', 'itype');
 registerReferenceListRoutes('integration-software', 'integration_software', 'isw', SOFTWARE_LIST_COLUMNS);
+registerReferenceListRoutes('business-capabilities', 'business_capabilities', 'bcap');
 
 // ---------------------------------------------------------------------------
 // System downtimes - planned or unplanned windows a system is unavailable, cross-referenced on
@@ -2672,9 +3817,14 @@ app.get('/api/system-downtimes', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/system-downtimes', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+// A system_owner may only schedule/edit/remove downtimes for a system they own - self-serve,
+// never queued for approval, since a downtime only ever affects the one system it's declared on.
+app.post('/api/system-downtimes', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const d = req.body;
+    if (req.user.role === 'system_owner' && !(await isResourceOwner('systems', d.systemId, req.user.id))) {
+      return res.status(403).json({ error: 'You can only schedule downtime for a system you own.' });
+    }
     const id = d.id || `downtime-${Date.now()}`;
     await pool.query(
       `INSERT INTO system_downtimes (id, system_id, starts_at, ends_at, reason) VALUES ($1, $2, $3, $4, $5)`,
@@ -2687,8 +3837,15 @@ app.post('/api/system-downtimes', requireAuth, requireRole('admin', 'editor'), a
   }
 });
 
-app.patch('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.patch('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
+    if (req.user.role === 'system_owner') {
+      const { rows: currentRows } = await pool.query('SELECT system_id FROM system_downtimes WHERE id = $1', [req.params.id]);
+      if (currentRows.length === 0) return res.status(404).json({ error: 'Not found' });
+      if (!(await isResourceOwner('systems', currentRows[0].system_id, req.user.id))) {
+        return res.status(403).json({ error: 'You do not have permission to do this' });
+      }
+    }
     const { sets, values } = buildUpdate('system_downtimes', SYSTEM_DOWNTIME_COLUMNS, req.body);
     if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
     const { rows: beforeRows } = await pool.query('SELECT * FROM system_downtimes WHERE id = $1', [req.params.id]);
@@ -2706,9 +3863,13 @@ app.patch('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor
   }
 });
 
-app.delete('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor'), async (req, res) => {
+app.delete('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'editor', 'system_owner'), async (req, res) => {
   try {
     const { rows: beforeRows } = await pool.query('SELECT * FROM system_downtimes WHERE id = $1', [req.params.id]);
+    if (beforeRows.length === 0) return res.status(404).json({ error: 'Not found' });
+    if (req.user.role === 'system_owner' && !(await isResourceOwner('systems', beforeRows[0].system_id, req.user.id))) {
+      return res.status(403).json({ error: 'You do not have permission to do this' });
+    }
     await pool.query('DELETE FROM system_downtimes WHERE id = $1', [req.params.id]);
     await logAudit(req, { action: 'delete', resourceType: 'system_downtime', resourceId: req.params.id, resourceLabel: beforeRows[0]?.reason || req.params.id, before: beforeRows[0] || null });
     res.json({ success: true });
@@ -2724,7 +3885,7 @@ app.delete('/api/system-downtimes/:id', requireAuth, requireRole('admin', 'edito
 // every list fetch or background poll - see src/audit/logView.ts) and letting admins browse/export
 // everything that's been recorded, for handing to an auditor.
 // ---------------------------------------------------------------------------
-const AUDIT_ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout'];
+const AUDIT_ACTIONS = ['view', 'create', 'update', 'delete', 'login', 'login_failed', 'logout', 'export', 'import', 'approve', 'reject', 'withdraw'];
 
 app.post('/api/audit/log-view', requireAuth, async (req, res) => {
   try {

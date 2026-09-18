@@ -24,6 +24,10 @@ scripts/deploy.sh
 # copy scripts/sync-db.example.sh to scripts/sync-db.sh and fill in your own values.
 scripts/sync-db.sh
 
+# Machine-specific throwaway test-user helper (container/db names) -
+# copy scripts/test-user.example.sh to scripts/test-user.sh and adjust if needed.
+scripts/test-user.sh
+
 # Project-specific standing instructions for Claude Code - not part of the app itself
 CLAUDE.md
 

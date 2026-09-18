@@ -76,6 +76,35 @@ export function ProfileView() {
     }
   };
 
+  // --- Notification email preferences ---
+  // Every type notify() can send (see server/index.js) - in-app delivery is never opt-out-able,
+  // this only controls whether that same event also sends an email. A missing key or `true` means
+  // email stays on, matching the backend's own default.
+  const NOTIFICATION_TYPES = [
+    'change_request_needs_approval', 'change_request_approved', 'change_request_rejected',
+    'owner_added', 'owner_removed', 'owner_list_changed', 'single_owner_warning',
+  ] as const;
+  const [savingNotifType, setSavingNotifType] = useState<string | null>(null);
+  const [notifError, setNotifError] = useState('');
+
+  const toggleNotificationEmail = async (type: string, enabled: boolean) => {
+    setNotifError('');
+    setSavingNotifType(type);
+    try {
+      const res = await apiFetch('/auth/me', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notificationEmailPrefs: { [type]: enabled } }),
+      });
+      const updated = (await parseJsonOrError(res)) as ApiUser;
+      setUser(updated);
+    } catch (err) {
+      setNotifError(err instanceof Error ? err.message : 'Something went wrong.');
+    } finally {
+      setSavingNotifType(null);
+    }
+  };
+
   // --- Avatar ---
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [avatarBusy, setAvatarBusy] = useState(false);
@@ -375,6 +404,37 @@ export function ProfileView() {
 
         <LanguageSettings />
         <AppearanceSettings />
+
+        {/* Notifications: per-type email opt-out - in-app notifications always stay on */}
+        <section className={`${cardClass} p-5 flex flex-col gap-4`}>
+          <div>
+            <h3 className="font-bold text-base mb-1" style={{ color: 'var(--text-primary)' }}>{t('profile.notifications')}</h3>
+            <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{t('profile.notificationsBlurb')}</p>
+          </div>
+
+          {notifError && <span className="text-xs" style={{ color: 'var(--danger)' }}>{notifError}</span>}
+
+          <div className="flex flex-col gap-2">
+            {NOTIFICATION_TYPES.map(type => {
+              const enabled = user.notificationEmailPrefs?.[type] !== false;
+              return (
+                <label key={type} className="flex items-start gap-2.5 py-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={enabled}
+                    disabled={savingNotifType === type}
+                    onChange={e => toggleNotificationEmail(type, e.target.checked)}
+                  />
+                  <span className="flex flex-col">
+                    <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{t(`notifications.type.${type}`)}</span>
+                    <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>{t(`notifications.type.${type}.desc`)}</span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </section>
 
         {/* Security: password + 2FA */}
         <section className={`${cardClass} p-5 flex flex-col gap-4`}>

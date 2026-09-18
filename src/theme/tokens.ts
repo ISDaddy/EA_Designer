@@ -141,6 +141,11 @@ export type NeutralCanvasTokens = {
   junctionColor: string;
   edgeColor: string;
   edgeConflictColor: string;
+  // A dashed-stroke color for an edge (or an edit to one) that's awaiting approval - visible like
+  // any other edge, but visually distinct so it reads as "not active yet." Matches this theme's
+  // own --warning value in theme.css, kept as its own token (not reused from edgeConflictColor)
+  // since a pending edge can also be a conflict edge at the same time and the two need to compose.
+  edgePendingColor: string;
   canvasDotColor: string;
   criticalDotColor: string;
   labelBg: string;
@@ -151,6 +156,7 @@ const NEUTRAL_CANVAS_TOKENS: Record<ThemeId, NeutralCanvasTokens> = {
     junctionColor: '#94a3b8',
     edgeColor: '#94a3b8',
     edgeConflictColor: '#dc2626',
+    edgePendingColor: '#d97706',
     canvasDotColor: '#cbd5e1',
     criticalDotColor: '#ef4444',
     labelBg: '#ffffff',
@@ -159,6 +165,7 @@ const NEUTRAL_CANVAS_TOKENS: Record<ThemeId, NeutralCanvasTokens> = {
     junctionColor: '#64748b',
     edgeColor: '#64748b',
     edgeConflictColor: '#f87171',
+    edgePendingColor: '#f59e0b',
     canvasDotColor: '#334155',
     criticalDotColor: '#f87171',
     labelBg: '#1e293b',
@@ -167,6 +174,7 @@ const NEUTRAL_CANVAS_TOKENS: Record<ThemeId, NeutralCanvasTokens> = {
     junctionColor: '#79747e',
     edgeColor: '#79747e',
     edgeConflictColor: '#b3261e',
+    edgePendingColor: '#7a5900',
     canvasDotColor: '#e7e0ec',
     criticalDotColor: '#b3261e',
     labelBg: '#ffffff',
@@ -175,6 +183,7 @@ const NEUTRAL_CANVAS_TOKENS: Record<ThemeId, NeutralCanvasTokens> = {
     junctionColor: '#938f99',
     edgeColor: '#938f99',
     edgeConflictColor: '#f2b8b5',
+    edgePendingColor: '#ffcb6b',
     canvasDotColor: '#49454f',
     criticalDotColor: '#f2b8b5',
     labelBg: '#211f26',
