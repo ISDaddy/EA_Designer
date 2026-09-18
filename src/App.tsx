@@ -14,9 +14,12 @@ import {
 } from '@xyflow/react';
 import type { Connection, Edge, Node, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { AlertTriangle, Calendar, Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
+import { AlertTriangle, Calendar, ChevronDown, Component, Eye, LogOut, MousePointerClick, Plus, Search, Settings as SettingsIcon, Table, Trash2, Workflow, X } from 'lucide-react';
 import { useTheme } from './theme/useTheme';
 import { SettingsView } from './theme/SettingsView';
+import { ProfileView } from './auth/ProfileView';
+import { Avatar } from './auth/Avatar';
+import { SETTINGS_TABS, type SettingsTab } from './theme/settingsTabs';
 import { apiFetch } from './api';
 import { useAuth } from './auth/useAuth';
 import { useI18n } from './i18n/useI18n';
@@ -28,7 +31,7 @@ import { inputClass, buttonPrimaryClass, buttonDangerClass, buttonSecondaryClass
 import { LogoMark } from './LogoMark';
 import { computeNextOccurrences, describeSchedule, DAY_NAMES, type ScheduleDef } from './schedule';
 import { logAuditView } from './audit/logView';
-import { APP_VERSION } from './version';
+import { APP_VERSION_DISPLAY } from './version';
 
 // Renders as an ArchiMate-notation application component under the "Enterprise Architecture"
 // style, or as a rounded tonal card under "Material 3 Expressive" - the two styles differ in more
@@ -1810,6 +1813,7 @@ function ScheduleCalendar({ runs }: { runs: ScheduledRun[] }) {
 function ScheduleView({
   nodes, edges, dataObjects, edgeObjectDetails, systemDowntimes,
   getSystemLabel, getSystemTimeZone, canWrite, onAddDowntime, onDeleteDowntime,
+  subView, setSubView,
 }: {
   nodes: SystemNode[];
   edges: IntegrationEdge[];
@@ -1821,11 +1825,12 @@ function ScheduleView({
   canWrite: boolean;
   onAddDowntime: (systemId: string, startsAt: string, endsAt: string, reason: string) => void;
   onDeleteDowntime: (id: string) => void;
+  subView: ScheduleTab;
+  setSubView: (tab: ScheduleTab) => void;
 }) {
   const { t, locale } = useI18n();
   const { user } = useAuth();
   const userTimeZone = user?.timeZone || detectBrowserTimeZone();
-  const [subView, setSubView] = useState<'runs' | 'calendar'>('runs');
   const [dtSystemId, setDtSystemId] = useState('');
   const [dtStart, setDtStart] = useState('');
   const [dtEnd, setDtEnd] = useState('');
@@ -1936,8 +1941,9 @@ function ScheduleView({
   );
 }
 
-type AppView = 'canvas' | 'inventory' | 'schedule' | 'settings';
+type AppView = 'canvas' | 'inventory' | 'schedule' | 'settings' | 'profile';
 type InventoryTab = 'systems' | 'objects' | 'lists';
+type ScheduleTab = 'runs' | 'calendar';
 
 type AppRoute = {
   view: AppView;
@@ -1947,17 +1953,22 @@ type AppRoute = {
   inventoryTab: InventoryTab;
   inventorySystemId: string | null;
   inventoryObjectId: string | null;
+  scheduleTab: ScheduleTab;
+  settingsTab: SettingsTab;
 };
 
-// Reads which page - and, where relevant, which system/object/edge is open for editing - the URL
-// currently points at, so a refresh (or a link copied and sent to a teammate) lands back on the
-// same view instead of always resetting to the canvas.
+// Reads which page - and, where relevant, which system/object/edge is open for editing, or which
+// sub-tab of Schedule/Settings is active - the URL currently points at, so a refresh (or a link
+// copied and sent to a teammate) lands back on the same view instead of always resetting to the
+// canvas or a tab's first sub-tab.
 function parseRouteFromLocation(): AppRoute {
   const params = new URLSearchParams(window.location.search);
   const view = params.get('view');
-  const validView: AppView = view === 'inventory' || view === 'schedule' || view === 'settings' ? view : 'canvas';
+  const validView: AppView = view === 'inventory' || view === 'schedule' || view === 'settings' || view === 'profile' ? view : 'canvas';
   const tab = params.get('tab');
   const validTab: InventoryTab = tab === 'objects' || tab === 'lists' ? tab : 'systems';
+  const validScheduleTab: ScheduleTab = tab === 'calendar' ? 'calendar' : 'runs';
+  const validSettingsTab: SettingsTab = SETTINGS_TABS.includes(tab as SettingsTab) ? (tab as SettingsTab) : 'releaseNotes';
   const edgeIds = params.get('edge')?.split(',');
 
   return {
@@ -1968,6 +1979,8 @@ function parseRouteFromLocation(): AppRoute {
     inventoryTab: validTab,
     inventorySystemId: validView === 'inventory' && validTab === 'systems' ? params.get('system') : null,
     inventoryObjectId: validView === 'inventory' && validTab === 'objects' ? params.get('object') : null,
+    scheduleTab: validScheduleTab,
+    settingsTab: validSettingsTab,
   };
 }
 
@@ -1986,6 +1999,10 @@ function syncRouteToLocation(route: AppRoute) {
     if (route.inventoryTab !== 'systems') params.set('tab', route.inventoryTab);
     if (route.inventoryTab === 'systems' && route.inventorySystemId) params.set('system', route.inventorySystemId);
     if (route.inventoryTab === 'objects' && route.inventoryObjectId) params.set('object', route.inventoryObjectId);
+  } else if (route.view === 'schedule') {
+    if (route.scheduleTab !== 'runs') params.set('tab', route.scheduleTab);
+  } else if (route.view === 'settings') {
+    if (route.settingsTab !== 'releaseNotes') params.set('tab', route.settingsTab);
   }
 
   const query = params.toString();
@@ -2015,10 +2032,13 @@ function AppContent() {
   const [inventoryTab, setInventoryTab] = useState<InventoryTab>(initialRoute.inventoryTab);
   const [inventoryEditingSystemId, setInventoryEditingSystemId] = useState<string | null>(initialRoute.inventorySystemId);
   const [inventoryEditingObjectId, setInventoryEditingObjectId] = useState<string | null>(initialRoute.inventoryObjectId);
+  const [scheduleTab, setScheduleTab] = useState<ScheduleTab>(initialRoute.scheduleTab);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>(initialRoute.settingsTab);
 
   const [newSystemName, setNewSystemName] = useState('');
   const [newObjectName, setNewObjectName] = useState('');
   const [newObjectMaster, setNewObjectMaster] = useState('');
+  const [addMenuMode, setAddMenuMode] = useState<'menu' | 'system' | 'object'>('menu');
 
   // Load from DB on mount
   React.useEffect(() => {
@@ -2182,8 +2202,10 @@ function AppContent() {
       inventoryTab,
       inventorySystemId: inventoryEditingSystemId,
       inventoryObjectId: inventoryEditingObjectId,
+      scheduleTab,
+      settingsTab,
     });
-  }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId]);
+  }, [view, selectedNodeId, selectedObjectIdSidebar, selectedEdgePair, inventoryTab, inventoryEditingSystemId, inventoryEditingObjectId, scheduleTab, settingsTab]);
   const [pendingEdge, setPendingEdge] = useState<Connection | null>(null);
   const [pendingEdgeObjectId, setPendingEdgeObjectId] = useState<string>('');
   const [pendingObjectFilter, setPendingObjectFilter] = useState<string>('');
@@ -3260,7 +3282,7 @@ function AppContent() {
         className="absolute bottom-4 right-4 z-50 text-xs px-3 py-1.5 rounded-full backdrop-blur-sm pointer-events-none opacity-60"
         style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
       >
-        v{APP_VERSION} alpha
+        {APP_VERSION_DISPLAY}
       </div>
 
       {/* Subtle save banner */}
@@ -3420,10 +3442,13 @@ function AppContent() {
         className="px-5 py-3 flex items-center gap-4 shadow-[var(--shadow-md)] z-20 relative"
         style={{ background: 'var(--bg-header)', color: 'var(--text-on-header)' }}
       >
-        <div className="flex items-center gap-2 font-bold text-lg tracking-[var(--heading-tracking)]">
+        <button
+          className="flex items-center gap-2 font-bold text-lg tracking-[var(--heading-tracking)]"
+          onClick={() => setView('canvas')}
+        >
           <LogoMark />
           EA Designer
-        </div>
+        </button>
 
         <div
           className="flex gap-1 items-center p-1 rounded-[var(--radius-card)] ml-auto"
@@ -3461,7 +3486,15 @@ function AppContent() {
 
         {user && (
           <div className="flex items-center gap-2 pl-2 text-sm" style={{ color: 'var(--text-on-header)' }}>
-            <span className="hidden sm:inline opacity-90 truncate max-w-[140px]" title={user.email}>{user.name}</span>
+            <button
+              className="flex items-center gap-1.5 opacity-90 rounded-[var(--radius-button)] pl-1 pr-1.5 -mx-1 py-1 transition-colors hover:opacity-100"
+              style={view === 'profile' ? { background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' } : undefined}
+              title={t('nav.profile')}
+              onClick={() => setView('profile')}
+            >
+              <Avatar name={user.name} avatarUrl={user.avatarUrl} size={24} />
+              <span className="hidden sm:inline truncate max-w-[140px]">{user.name}</span>
+            </button>
             <button
               className="p-1.5 rounded-full transition-colors"
               style={{ background: 'color-mix(in srgb, var(--text-on-header) 12%, transparent)' }}
@@ -3485,55 +3518,77 @@ function AppContent() {
             <>
               <Popover
                 trigger={({ toggle }) => (
-                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />{t('canvas.addSystem')}</button>
+                  <button
+                    className={buttonSecondaryClass}
+                    onClick={() => { setAddMenuMode('menu'); toggle(); }}
+                  >
+                    <Plus size={14} />{t('canvas.add')}<ChevronDown size={14} />
+                  </button>
                 )}
               >
-                {(close) => (
-                  <div className="flex flex-col gap-3">
-                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newSystem')}</h3>
-                    <input
-                      autoFocus
-                      className={inputClass}
-                      placeholder={t('canvas.systemNamePlaceholder')}
-                      value={newSystemName}
-                      onChange={(e) => setNewSystemName(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter' && addSystem()) close(); }}
-                    />
-                    <button className={buttonPrimaryClass} onClick={() => { if (addSystem()) close(); }}>
-                      <Plus size={14} />{t('canvas.addSystem')}
-                    </button>
-                  </div>
-                )}
-              </Popover>
-
-              <Popover
-                trigger={({ toggle }) => (
-                  <button className={buttonSecondaryClass} onClick={toggle}><Plus size={14} />{t('canvas.addObject')}</button>
-                )}
-              >
-                {(close) => (
-                  <div className="flex flex-col gap-3">
-                    <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newObject')}</h3>
-                    <input
-                      autoFocus
-                      className={inputClass}
-                      placeholder={t('canvas.objectNamePlaceholder')}
-                      value={newObjectName}
-                      onChange={(e) => setNewObjectName(e.target.value)}
-                    />
-                    <select
-                      className={inputClass}
-                      value={newObjectMaster}
-                      onChange={(e) => setNewObjectMaster(e.target.value)}
-                    >
-                      <option value="" disabled>{t('canvas.masterSystemPlaceholder')}</option>
-                      {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
-                    </select>
-                    <button className={buttonPrimaryClass} onClick={() => { if (addObject()) close(); }}>
-                      <Plus size={14} />{t('canvas.addObject')}
-                    </button>
-                  </div>
-                )}
+                {(close) => {
+                  if (addMenuMode === 'menu') {
+                    return (
+                      <div className="flex flex-col gap-1">
+                        <button
+                          className="flex items-center gap-2 px-2 py-1.5 rounded-[var(--radius-button)] text-sm text-left transition-colors hover:opacity-80"
+                          style={{ color: 'var(--text-primary)' }}
+                          onClick={() => setAddMenuMode('system')}
+                        >
+                          <Workflow size={14} />{t('canvas.addSystem')}
+                        </button>
+                        <button
+                          className="flex items-center gap-2 px-2 py-1.5 rounded-[var(--radius-button)] text-sm text-left transition-colors hover:opacity-80"
+                          style={{ color: 'var(--text-primary)' }}
+                          onClick={() => setAddMenuMode('object')}
+                        >
+                          <Component size={14} />{t('canvas.addObject')}
+                        </button>
+                      </div>
+                    );
+                  }
+                  if (addMenuMode === 'system') {
+                    return (
+                      <div className="flex flex-col gap-3">
+                        <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newSystem')}</h3>
+                        <input
+                          autoFocus
+                          className={inputClass}
+                          placeholder={t('canvas.systemNamePlaceholder')}
+                          value={newSystemName}
+                          onChange={(e) => setNewSystemName(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter' && addSystem()) close(); }}
+                        />
+                        <button className={buttonPrimaryClass} onClick={() => { if (addSystem()) close(); }}>
+                          <Plus size={14} />{t('canvas.addSystem')}
+                        </button>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="flex flex-col gap-3">
+                      <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{t('canvas.newObject')}</h3>
+                      <input
+                        autoFocus
+                        className={inputClass}
+                        placeholder={t('canvas.objectNamePlaceholder')}
+                        value={newObjectName}
+                        onChange={(e) => setNewObjectName(e.target.value)}
+                      />
+                      <select
+                        className={inputClass}
+                        value={newObjectMaster}
+                        onChange={(e) => setNewObjectMaster(e.target.value)}
+                      >
+                        <option value="" disabled>{t('canvas.masterSystemPlaceholder')}</option>
+                        {nodes.filter(isEaSystemNode).map(n => <option key={n.id} value={n.data.label}>{n.data.label}</option>)}
+                      </select>
+                      <button className={buttonPrimaryClass} onClick={() => { if (addObject()) close(); }}>
+                        <Plus size={14} />{t('canvas.addObject')}
+                      </button>
+                    </div>
+                  );
+                }}
               </Popover>
 
               <div className="w-px h-5 mx-1" style={{ background: 'var(--border)' }} />
@@ -3627,9 +3682,13 @@ function AppContent() {
           canWrite={canWrite}
           onAddDowntime={addDowntime}
           onDeleteDowntime={deleteDowntime}
+          subView={scheduleTab}
+          setSubView={setScheduleTab}
         />
       ) : view === 'settings' ? (
-        <SettingsView />
+        <SettingsView tab={settingsTab} setTab={setSettingsTab} />
+      ) : view === 'profile' ? (
+        <ProfileView />
       ) : (
       <div className="flex flex-1 overflow-hidden">
         {/* Canvas */}

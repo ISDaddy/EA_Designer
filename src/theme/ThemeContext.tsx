@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import type { ThemeStyleId, ThemeModeId, PaletteId } from './tokens';
 import { DEFAULT_PALETTE, PALETTES_BY_STYLE, getCanvasTokens, getPaletteColors, isPaletteForStyle, isThemeId } from './tokens';
 import { ThemeContext } from './context';
+import { apiFetch, parseJsonOrError } from '../api';
+import type { ApiUser } from '../api';
+import { useAuth } from '../auth/useAuth';
 
 const STYLE_STORAGE_KEY = 'ea-designer.theme-style';
 const MODE_STORAGE_KEY = 'ea-designer.theme-mode';
@@ -50,12 +53,73 @@ function readStoredPalettes(): Record<ThemeStyleId, PaletteId> {
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [style, setStyle] = useState<ThemeStyleId>(readStoredStyle);
-  const [mode, setMode] = useState<ThemeModeId>(readStoredMode);
+  const { user, setUser } = useAuth();
+  const [style, setStyleState] = useState<ThemeStyleId>(readStoredStyle);
+  const [mode, setModeState] = useState<ThemeModeId>(readStoredMode);
   const [palettesByStyle, setPalettesByStyle] = useState<Record<ThemeStyleId, PaletteId>>(readStoredPalettes);
 
   const palette = palettesByStyle[style];
   const themeId = `${style}-${mode}` as const;
+
+  // Once we know who's logged in, their saved appearance preference (if any) wins over whatever
+  // this browser's localStorage had - the same "derived state during render" pattern I18nProvider
+  // uses for language, so a person's theme follows them to a new device instead of staying stuck
+  // to whichever machine last set it. A brand-new account with no saved preference yet just keeps
+  // whatever this browser already had (its own previous default or a prior device's choice).
+  const [syncedUserId, setSyncedUserId] = useState<string | null>(null);
+  if (user && user.id !== syncedUserId) {
+    setSyncedUserId(user.id);
+    const prefs = user.themePrefs;
+    if (prefs) {
+      if (prefs.style === 'ea' || prefs.style === 'm3') setStyleState(prefs.style);
+      if (prefs.mode === 'light' || prefs.mode === 'dark') setModeState(prefs.mode);
+      if (prefs.palettes) {
+        const savedPalettes = prefs.palettes;
+        setPalettesByStyle(prev => {
+          const next = { ...prev };
+          (Object.keys(next) as ThemeStyleId[]).forEach(s => {
+            const value = savedPalettes[s];
+            if (value && isPaletteForStyle(s, value)) next[s] = value;
+          });
+          return next;
+        });
+      }
+    }
+  }
+
+  // Persists to the signed-in account (in addition to localStorage below) so the choice follows
+  // this person to another device, not just this browser. Best-effort: a failed save leaves the
+  // local switch in place, just unsaved until the next successful one.
+  const persistThemePrefs = (next: { style: ThemeStyleId; mode: ThemeModeId; palettesByStyle: Record<ThemeStyleId, PaletteId> }) => {
+    if (!user) return;
+    apiFetch('/auth/me', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ themePrefs: { style: next.style, mode: next.mode, palettes: next.palettesByStyle } }),
+    })
+      .then(res => parseJsonOrError(res))
+      .then(updated => setUser(updated as ApiUser))
+      .catch(() => { /* best-effort - see above */ });
+  };
+
+  const setStyle = (s: ThemeStyleId) => {
+    setStyleState(s);
+    persistThemePrefs({ style: s, mode, palettesByStyle });
+  };
+  const setMode = (m: ThemeModeId) => {
+    setModeState(m);
+    persistThemePrefs({ style, mode: m, palettesByStyle });
+  };
+  const setPalette = (p: PaletteId) => {
+    const next = { ...palettesByStyle, [style]: p };
+    setPalettesByStyle(next);
+    persistThemePrefs({ style, mode, palettesByStyle: next });
+  };
+  const toggleMode = () => {
+    const next = mode === 'light' ? 'dark' : 'light';
+    setModeState(next);
+    persistThemePrefs({ style, mode: next, palettesByStyle });
+  };
 
   useEffect(() => {
     const candidate = `${style}-${mode}`;
@@ -111,9 +175,10 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     palettesForStyle: PALETTES_BY_STYLE[style],
     setStyle,
     setMode,
-    setPalette: (p: PaletteId) => setPalettesByStyle(prev => ({ ...prev, [style]: p })),
-    toggleMode: () => setMode(m => (m === 'light' ? 'dark' : 'light')),
-  }), [style, mode, palette, themeId]);
+    setPalette,
+    toggleMode,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [style, mode, palette, themeId, palettesByStyle, user]);
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

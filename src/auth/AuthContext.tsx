@@ -32,6 +32,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password }),
     });
+    const data = (await parseJsonOrError(res)) as ApiUser | { requiresTotp: true; challengeToken: string };
+    if ('requiresTotp' in data && data.requiresTotp) return { requiresTotp: true as const, challengeToken: data.challengeToken };
+    setUser(data as ApiUser);
+    return { requiresTotp: false as const };
+  }, []);
+
+  const loginWithGoogle = useCallback(async (credential: string) => {
+    const res = await apiFetch('/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential }),
+    });
+    const data = (await parseJsonOrError(res)) as ApiUser | { requiresTotp: true; challengeToken: string };
+    if ('requiresTotp' in data && data.requiresTotp) return { requiresTotp: true as const, challengeToken: data.challengeToken };
+    setUser(data as ApiUser);
+    return { requiresTotp: false as const };
+  }, []);
+
+  const verifyTotp = useCallback(async (challengeToken: string, code: string) => {
+    const res = await apiFetch('/auth/login/verify-totp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeToken, code }),
+    });
     const data = await parseJsonOrError(res);
     setUser(data as ApiUser);
   }, []);
@@ -42,7 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refresh, setUser }}>
+    <AuthContext.Provider value={{ user, loading, login, loginWithGoogle, verifyTotp, logout, refresh, setUser }}>
       {children}
     </AuthContext.Provider>
   );

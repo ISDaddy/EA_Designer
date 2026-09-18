@@ -20,6 +20,15 @@ export type EaPaletteId = 'blue' | 'slate' | 'forest' | 'burgundy' | 'teal' | 'a
 export type M3PaletteId = 'violet' | 'blue' | 'green' | 'peach' | 'rose' | 'teal';
 export type PaletteId = EaPaletteId | M3PaletteId;
 
+// The shape persisted to the signed-in user's account (see ApiUser.themePrefs in src/api.ts) so
+// their appearance choice follows them across devices instead of staying stuck to whichever
+// browser's localStorage last set it.
+export type ThemePrefs = {
+  style: ThemeStyleId;
+  mode: ThemeModeId;
+  palettes: Partial<Record<ThemeStyleId, PaletteId>>;
+};
+
 export type PaletteDef = { id: PaletteId; label: string; swatch: string };
 
 export const PALETTES_BY_STYLE: Record<ThemeStyleId, PaletteDef[]> = {

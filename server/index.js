@@ -5,6 +5,9 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
+const { OAuth2Client } = require('google-auth-library');
 const { Pool } = require('pg');
 const translationsSeed = require('./translations-seed');
 const nda = require('./nda');
@@ -14,7 +17,10 @@ const app = express();
 // session cookie to survive cross-origin requests - the frontend and backend are served from the
 // same host but different ports, which browsers treat as different origins.
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+// Raised from Express's 100kb default so a Profile page avatar image (stored as a base64 data URI
+// - see PATCH /api/auth/me) fits comfortably; everything else this API accepts is tiny by
+// comparison.
+app.use(express.json({ limit: '3mb' }));
 app.use(cookieParser());
 
 const pool = new Pool({
@@ -149,9 +155,47 @@ async function initDB() {
       used_at TIMESTAMPTZ
     );
 
-    -- Singleton row (id is always 1) holding the SMTP sender credentials admins configure from
-    -- Settings, so they're editable at runtime instead of being fixed at container start via env
-    -- vars. The env vars (see secrets.env) remain the fallback for a fresh install.
+    -- Bridges the two-step 2FA login flow: POST /api/auth/login returns one of these tokens
+    -- instead of a session when the account has TOTP enabled, and POST /api/auth/login/verify-totp
+    -- trades it (plus a valid code) for the real session. Short-lived and single-use by nature -
+    -- deleted as soon as it's redeemed, same as a password reset token.
+    CREATE TABLE IF NOT EXISTS totp_challenges (
+      token VARCHAR(255) PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+
+    -- Superadmin recovery: when no superadmin can log in but an admin can, that admin can request
+    -- that some admin (themselves or another) be promoted to superadmin. It only takes effect once
+    -- every OTHER admin approves via a one-time emailed link (superadmin_request_approvals, one
+    -- row per required approver) - a single rejection kills the request, same as a single missing
+    -- approval just leaves it pending until it expires. See POST /api/superadmin-requests.
+    CREATE TABLE IF NOT EXISTS superadmin_requests (
+      id VARCHAR(255) PRIMARY KEY,
+      target_user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      requested_by VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      resolved_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS superadmin_request_approvals (
+      id VARCHAR(255) PRIMARY KEY,
+      request_id VARCHAR(255) NOT NULL REFERENCES superadmin_requests(id) ON DELETE CASCADE,
+      approver_user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token VARCHAR(255) UNIQUE NOT NULL,
+      decision VARCHAR(20),
+      decided_at TIMESTAMPTZ
+    );
+
+    -- Singleton row (id is always 1) holding server-wide settings a superadmin configures from
+    -- Settings > Server Settings, so they're editable at runtime instead of being fixed at
+    -- container start via env vars (which remain the fallback for a fresh install - see
+    -- secrets.env). Named smtp_settings for historical reasons (it started out SMTP-only); holds
+    -- the Google Sign-In Client ID too now rather than adding a second singleton table for one
+    -- more column.
     CREATE TABLE IF NOT EXISTS smtp_settings (
       id INTEGER PRIMARY KEY DEFAULT 1,
       smtp_user VARCHAR(255),
@@ -218,7 +262,16 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);
     CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_totp_challenges_user ON totp_challenges(user_id);
+    CREATE INDEX IF NOT EXISTS idx_superadmin_requests_status ON superadmin_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_superadmin_request_approvals_request ON superadmin_request_approvals(request_id);
   `);
+
+  // 'password_reset_requested' (24 chars) has always overflowed the original 20-char limit here,
+  // so every one of those audit entries has been silently failing to write (logAudit only
+  // console.errors on failure, never throws) - widened while adding further action values of our
+  // own. Safe to re-run: widening a varchar that's already >= 50 is a no-op, not an error.
+  await pool.query(`ALTER TABLE audit_log ALTER COLUMN action TYPE VARCHAR(50);`);
 
   // Additive migrations for columns introduced after the initial release. Each is wrapped so
   // re-running on a database that already has the column is a no-op rather than an error.
@@ -257,6 +310,31 @@ async function initDB() {
   await addColumnIfMissing('users', "time_zone VARCHAR(100)");
   await addColumnIfMissing('users', "nda_accepted_version VARCHAR(20)");
   await addColumnIfMissing('users', "nda_accepted_at TIMESTAMPTZ");
+  // Visual style/palette/light-dark-mode preference, previously kept only in the browser's
+  // localStorage (so it didn't follow a person between devices) - see the Profile page's
+  // Appearance section.
+  await addColumnIfMissing('users', "theme_prefs JSONB");
+  // Profile picture, stored as a data URI (see PATCH /api/auth/me) rather than a file on disk -
+  // this app has no other file storage or static-file serving to build on, and an avatar is small
+  // enough (capped well under the raised JSON body limit above) that a DB column is simpler than
+  // standing up a file store for one feature.
+  await addColumnIfMissing('users', 'avatar_url TEXT');
+  // TOTP-based two-factor auth. totp_secret is written as soon as setup starts (POST
+  // /api/auth/2fa/setup) but totp_enabled only flips to true once the person proves they can
+  // generate a matching code (POST /api/auth/2fa/enable) - so an abandoned setup never gates login.
+  // totp_backup_codes is a JSONB array of { hash, usedAt } - bcrypt-hashed like the password, each
+  // usable once, for when the authenticator device itself is unavailable.
+  await addColumnIfMissing('users', 'totp_secret VARCHAR(64)');
+  await addColumnIfMissing('users', 'totp_enabled BOOLEAN NOT NULL DEFAULT false');
+  await addColumnIfMissing('users', 'totp_backup_codes JSONB');
+
+  // Enough to show a person a human-readable list of their own active sessions (Profile >
+  // Sessions) - which browser/device and roughly where from - without storing anything more
+  // identifying than the request already carried.
+  await addColumnIfMissing('sessions', 'user_agent TEXT');
+  await addColumnIfMissing('sessions', 'ip_address VARCHAR(64)');
+
+  await addColumnIfMissing('smtp_settings', 'google_client_id TEXT');
 
   await addColumnIfMissing('data_objects', "system_object_names JSONB DEFAULT '{}'");
   await addColumnIfMissing('data_objects', "description TEXT DEFAULT ''");
@@ -405,16 +483,35 @@ async function initDB() {
       values
     );
   }
+
+  // One-time migration: 'superadmin' is a new role, introduced after 'admin' already existed -
+  // an install that predates it has no superadmin yet, which would leave Server Settings (email +
+  // Google Sign-In) and granting further superadmins unreachable by anyone. Promote whichever
+  // admin account is oldest, the same way the very first account normally becomes superadmin via
+  // POST /api/auth/setup. A no-op once a superadmin exists, on this or any later restart.
+  const superadminCountResult = await pool.query(`SELECT COUNT(*) FROM users WHERE role = 'superadmin'`);
+  if (parseInt(superadminCountResult.rows[0].count, 10) === 0) {
+    const oldestAdminResult = await pool.query(`SELECT id, name, email FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1`);
+    const oldestAdmin = oldestAdminResult.rows[0];
+    if (oldestAdmin) {
+      await pool.query(`UPDATE users SET role = 'superadmin' WHERE id = $1`, [oldestAdmin.id]);
+      console.log(`No super admin existed yet - promoted ${oldestAdmin.name || oldestAdmin.email} (${oldestAdmin.id}) automatically.`);
+    }
+  }
 }
 
-initDB().then(loadSmtpConfig).catch(console.error);
+initDB().then(loadServerSettings).catch(console.error);
 
 // ---------------------------------------------------------------------------
 // Auth - opaque session tokens stored server-side (not JWTs), so a session can be revoked just by
-// deleting its row. Three roles: 'admin' (manage the landscape and the team), 'editor' (manage the
-// landscape), 'viewer' (read-only).
-// ---------------------------------------------------------------------------
+// deleting its row. Four roles: 'superadmin' (everything an admin can, plus Server Settings -
+// email + Google sign-in - and granting/revoking super admin itself), 'admin' (manage the
+// landscape and the team), 'editor' (manage the landscape), 'viewer' (read-only). ROLES is what
+// normal team management (invites, the Members table's role picker) can assign - superadmin is
+// deliberately excluded from it; it's only ever granted via PATCH /api/users/:id by an existing
+// superadmin, or through the superadmin-recovery process below when none can log in.
 const ROLES = ['admin', 'editor', 'viewer'];
+const ALL_ROLES = ['superadmin', ...ROLES];
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // The locales currently offered, per the admin-managed `languages` table - looked up fresh rather
@@ -425,6 +522,24 @@ async function getLanguageCodes() {
 }
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour - short-lived since, unlike an invite, this grants access to an existing account
+const TOTP_CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes - just long enough to type a 6-digit code
+const SUPERADMIN_REQUEST_TTL_MS = 48 * 60 * 60 * 1000; // 48 hours - a recovery process, not something anyone should be racing a clock on
+
+// "Sign in with Google" - configurable at runtime from Settings > Server Settings (superadmin
+// only) rather than fixed at container start, same as the SMTP sender below - `googleClientId`/
+// `googleClient` are mutable module state, seeded from the env var (see secrets.env) as a
+// working-out-of-the-box default and then overridden by whatever's stored in the database once a
+// superadmin saves one via the API (see `loadServerSettings` and `setGoogleClientId`). Unset by
+// default, in which case GET /api/auth/google-config tells the frontend to hide the button
+// entirely rather than show a broken one. No client secret is needed: the frontend gets an ID
+// token directly from Google's own JS (Google Identity Services), and this just verifies that
+// token's signature and audience server-side - it never talks to Google itself.
+let googleClientId = process.env.GOOGLE_CLIENT_ID || '';
+let googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
+function setGoogleClientId(clientId) {
+  googleClientId = clientId || '';
+  googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
+}
 
 const COOKIE_OPTS = {
   httpOnly: true,
@@ -445,7 +560,18 @@ function toApiUser(row) {
     id: row.id, email: row.email, name: row.name, role: row.role,
     language: row.language || 'en', timeZone: row.time_zone || null,
     ndaAcceptedVersion: row.nda_accepted_version || null,
+    themePrefs: row.theme_prefs || null,
+    avatarUrl: row.avatar_url || null,
+    totpEnabled: row.totp_enabled || false,
   };
+}
+
+// A stable, non-secret identifier for a session row, safe to hand to the frontend (see GET/DELETE
+// /api/auth/sessions) - the real `token` is the session cookie's value and must never leave the
+// server. Truncated since it only needs to be unique within one person's small handful of
+// sessions, not globally.
+function sessionFingerprint(token) {
+  return crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
 }
 
 // Quotes a CSV field only when it needs it (contains a comma, quote, or newline), doubling any
@@ -495,7 +621,8 @@ async function getSessionUser(req) {
   const token = req.cookies?.sid;
   if (!token) return null;
   const result = await pool.query(
-    `SELECT u.id, u.email, u.name, u.role, u.language, u.time_zone, u.nda_accepted_version
+    `SELECT u.id, u.email, u.name, u.role, u.language, u.time_zone, u.nda_accepted_version, u.theme_prefs,
+            u.avatar_url, u.totp_enabled
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1 AND s.expires_at > now()`,
     [token]
@@ -514,34 +641,53 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// superadmin implicitly satisfies every requireRole(...) check, not just requireRole('superadmin')
+// - it's a strict superset of every other role's capabilities, so every existing
+// requireRole('admin')/requireRole('admin', 'editor') gate already means what it should without
+// having to enumerate 'superadmin' at each call site (and a route actually meant to be
+// superadmin-exclusive, like Server Settings, just writes requireRole('superadmin') and gets
+// that exclusivity for free - superadmin still passes, no one else does).
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
+    if (!req.user || (req.user.role !== 'superadmin' && !roles.includes(req.user.role))) {
       return res.status(403).json({ error: 'You do not have permission to do this' });
     }
     next();
   };
 }
 
-async function createSession(res, userId) {
+async function createSession(req, res, userId) {
   const token = newToken();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await pool.query('INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)', [token, userId, expiresAt]);
+  await pool.query(
+    'INSERT INTO sessions (token, user_id, expires_at, user_agent, ip_address) VALUES ($1, $2, $3, $4, $5)',
+    [token, userId, expiresAt, req.get ? (req.get('user-agent') || null) : null, req.ip || null]
+  );
   res.cookie('sid', token, COOKIE_OPTS);
 }
 
-// Admins can demote/remove other admins freely, but never the last one - otherwise the team could
-// be locked out of user management entirely.
+// Admins can demote/remove other admins freely, but never the very last person who can manage the
+// team (admin or superadmin) - otherwise the team could be locked out of user management
+// entirely, with no recovery path even through the superadmin-recovery process below (that
+// process still needs at least one admin to kick it off).
 async function countOtherAdmins(excludeUserId) {
-  const result = await pool.query(`SELECT COUNT(*) FROM users WHERE role = 'admin' AND id != $1`, [excludeUserId]);
+  const result = await pool.query(`SELECT COUNT(*) FROM users WHERE role IN ('admin', 'superadmin') AND id != $1`, [excludeUserId]);
+  return parseInt(result.rows[0].count, 10);
+}
+
+// Separately, never demote/remove the very last superadmin through normal team management - that
+// specific recovery (when the/a superadmin can't log in) is what the superadmin-recovery flow
+// below exists for instead of a casual role-picker click.
+async function countOtherSuperadmins(excludeUserId) {
+  const result = await pool.query(`SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND id != $1`, [excludeUserId]);
   return parseInt(result.rows[0].count, 10);
 }
 
 // The SMTP sender is admin-configurable at runtime (Settings > Email) rather than fixed at
 // container start, so `smtpConfig`/`mailTransporter` are mutable module state instead of
 // constants. They start from the env vars (see secrets.env) as a working-out-of-the-box default,
-// then get overridden by whatever's stored in `smtp_settings` once an admin saves one via the API
-// - see `loadSmtpConfig`, called once `initDB` has created that table.
+// then get overridden by whatever's stored in `smtp_settings` once a superadmin saves one via the
+// API - see `loadServerSettings`, called once `initDB` has created that table.
 let smtpConfig = { user: process.env.SMTP_USER || null, pass: process.env.SMTP_PASS || null };
 let mailTransporter = null;
 
@@ -550,18 +696,19 @@ function buildTransporter(config) {
   return nodemailer.createTransport({ service: 'gmail', auth: { user: config.user, pass: config.pass } });
 }
 
-async function loadSmtpConfig() {
+async function loadServerSettings() {
   try {
-    const result = await pool.query('SELECT smtp_user, smtp_pass FROM smtp_settings WHERE id = 1');
+    const result = await pool.query('SELECT smtp_user, smtp_pass, google_client_id FROM smtp_settings WHERE id = 1');
     if (result.rows[0]) {
       smtpConfig = { user: result.rows[0].smtp_user, pass: result.rows[0].smtp_pass };
+      if (result.rows[0].google_client_id) setGoogleClientId(result.rows[0].google_client_id);
     }
   } catch (err) {
-    console.error('Failed to load SMTP settings from the database:', err.message);
+    console.error('Failed to load server settings from the database:', err.message);
   }
   mailTransporter = buildTransporter(smtpConfig);
   if (!mailTransporter) {
-    console.warn('Email is not configured - invite emails will not be sent (the invite link can still be copied and shared manually). Configure one in Settings > Email.');
+    console.warn('Email is not configured - invite emails will not be sent (the invite link can still be copied and shared manually). Configure one in Settings > Server Settings.');
   }
 }
 
@@ -603,6 +750,28 @@ async function sendPasswordResetEmail({ to, link }) {
     return { sent: true };
   } catch (err) {
     console.error('Failed to send password reset email:', err.message);
+    return { sent: false, reason: err.message };
+  }
+}
+
+async function sendSuperadminApprovalEmail({ to, targetName, requestedByName, link }) {
+  if (!mailTransporter) return { sent: false, reason: 'Email is not configured on the server.' };
+  try {
+    await mailTransporter.sendMail({
+      from: `"EA Designer" <${smtpConfig.user}>`,
+      to,
+      subject: 'Approval needed: Super Admin recovery on EA Designer',
+      html: `
+        <p><strong>${requestedByName}</strong> has requested that <strong>${targetName}</strong> be made a Super Admin on <strong>EA Designer</strong>, as part of the recovery process for when no Super Admin can log in.</p>
+        <p>This only takes effect once every other admin approves - if you didn't expect this, reject it instead.</p>
+        <p><a href="${link}">Review this request</a></p>
+        <p>Or copy and paste this link into your browser:<br>${link}</p>
+        <p style="color:#666;font-size:13px">This link expires in 48 hours.</p>
+      `,
+    });
+    return { sent: true };
+  } catch (err) {
+    console.error('Failed to send super admin approval email:', err.message);
     return { sent: false, reason: err.message };
   }
 }
@@ -816,14 +985,17 @@ app.post('/api/auth/setup', async (req, res) => {
     }
     const passwordHash = await bcrypt.hash(password, 10);
     const id = `user-${Date.now()}`;
-    await pool.query(
-      `INSERT INTO users (id, email, password_hash, name, role) VALUES ($1, $2, $3, $4, 'admin')`,
+    // The very first account becomes superadmin, not just admin - someone has to be able to
+    // configure Server Settings and grant further superadmins, and there's no one else yet to
+    // have granted it to them.
+    const result = await pool.query(
+      `INSERT INTO users (id, email, password_hash, name, role) VALUES ($1, $2, $3, $4, 'superadmin') RETURNING *`,
       [id, email.toLowerCase().trim(), passwordHash, name.trim()]
     );
-    const newAdmin = { id, email: email.toLowerCase().trim(), name: name.trim(), role: 'admin' };
-    await logAudit(req, { actor: newAdmin, action: 'create', resourceType: 'user', resourceId: id, resourceLabel: newAdmin.name, after: newAdmin, metadata: { via: 'initial-setup' } });
-    await createSession(res, id);
-    res.status(201).json({ id, email: email.toLowerCase().trim(), name: name.trim(), role: 'admin', language: 'en', timeZone: null, ndaAcceptedVersion: null });
+    const newSuperadmin = toApiUser(result.rows[0]);
+    await logAudit(req, { actor: newSuperadmin, action: 'create', resourceType: 'user', resourceId: id, resourceLabel: newSuperadmin.name, after: newSuperadmin, metadata: { via: 'initial-setup' } });
+    await createSession(req, res, id);
+    res.status(201).json(newSuperadmin);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists.' });
     res.status(500).json({ error: err.message });
@@ -843,9 +1015,146 @@ app.post('/api/auth/login', async (req, res) => {
       await logAudit(req, { actor: null, action: 'login_failed', resourceType: 'session', resourceLabel: email.toLowerCase().trim() });
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
+    // Password alone isn't enough for an account with 2FA on - hand back a short-lived challenge
+    // token instead of a session, and wait for POST /api/auth/login/verify-totp to actually log
+    // them in. last_login_at/the session/the audit "login" entry all wait for that second step, so
+    // a password-only attempt on a 2FA account never looks like a completed login.
+    if (user.totp_enabled) {
+      const token = newToken();
+      const expiresAt = new Date(Date.now() + TOTP_CHALLENGE_TTL_MS);
+      await pool.query('INSERT INTO totp_challenges (token, user_id, expires_at) VALUES ($1, $2, $3)', [token, user.id, expiresAt]);
+      return res.json({ requiresTotp: true, challengeToken: token });
+    }
     await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
-    await createSession(res, user.id);
+    await createSession(req, res, user.id);
     await logAudit(req, { actor: toApiUser(user), action: 'login', resourceType: 'session', resourceId: user.id, resourceLabel: user.name || user.email });
+    res.json(toApiUser(user));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Completes the login flow above for a 2FA-enabled account: trades a still-valid challenge token
+// plus either a current authenticator code or an unused backup code for the real session.
+app.post('/api/auth/login/verify-totp', async (req, res) => {
+  try {
+    const { challengeToken, code } = req.body;
+    if (!challengeToken || !code) return res.status(400).json({ error: 'A verification code is required.' });
+
+    const challengeResult = await pool.query('SELECT user_id, expires_at FROM totp_challenges WHERE token = $1', [challengeToken]);
+    const challenge = challengeResult.rows[0];
+    if (!challenge || new Date(challenge.expires_at) < new Date()) {
+      if (challenge) await pool.query('DELETE FROM totp_challenges WHERE token = $1', [challengeToken]);
+      return res.status(410).json({ error: 'This login attempt has expired - please log in again.' });
+    }
+
+    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [challenge.user_id]);
+    const user = userResult.rows[0];
+    if (!user || !user.totp_enabled) {
+      return res.status(400).json({ error: 'Two-factor authentication is not enabled on this account.' });
+    }
+
+    const normalizedCode = String(code).trim();
+    let verified = authenticator.check(normalizedCode, user.totp_secret);
+    let usedBackupCodeHash = null;
+    if (!verified && Array.isArray(user.totp_backup_codes)) {
+      for (const entry of user.totp_backup_codes) {
+        if (!entry.usedAt && (await bcrypt.compare(normalizedCode, entry.hash))) {
+          verified = true;
+          usedBackupCodeHash = entry.hash;
+          break;
+        }
+      }
+    }
+
+    if (!verified) {
+      await logAudit(req, { actor: null, action: 'login_failed', resourceType: 'session', resourceLabel: user.email, metadata: { via: 'totp' } });
+      return res.status(401).json({ error: 'Invalid verification code.' });
+    }
+
+    if (usedBackupCodeHash) {
+      const updatedCodes = user.totp_backup_codes.map(entry =>
+        entry.hash === usedBackupCodeHash ? { ...entry, usedAt: new Date().toISOString() } : entry
+      );
+      await pool.query('UPDATE users SET totp_backup_codes = $1 WHERE id = $2', [JSON.stringify(updatedCodes), user.id]);
+    }
+
+    // Only consumed on success - a mistyped code shouldn't force a full restart (re-entering the
+    // password) when the person can just try again within the challenge's 5-minute window.
+    await pool.query('DELETE FROM totp_challenges WHERE token = $1', [challengeToken]);
+    await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
+    await createSession(req, res, user.id);
+    await logAudit(req, {
+      actor: toApiUser(user), action: 'login', resourceType: 'session', resourceId: user.id, resourceLabel: user.name || user.email,
+      metadata: { via: usedBackupCodeHash ? 'totp_backup_code' : 'totp' },
+    });
+    res.json(toApiUser(user));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public, unauthenticated - the login screen needs to know whether to show the Google button (and
+// what Client ID to initialize Google's own JS with) before anyone is signed in.
+app.get('/api/auth/google-config', (req, res) => {
+  res.json({ enabled: !!googleClient, clientId: googleClientId || null });
+});
+
+// Trades a Google ID token (from Google Identity Services on the frontend) for a session, the
+// same way POST /api/auth/login trades a password for one. Deliberately sign-in-only, never
+// sign-up: an email Google vouches for still has to already belong to an account here (created by
+// /api/auth/setup or an accepted invite) - otherwise this would let anyone with a Google account
+// create themselves an account, bypassing the invite system entirely.
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    if (!googleClient) return res.status(400).json({ error: 'Google Sign-In is not configured.' });
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Missing Google credential.' });
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: googleClientId });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ error: 'Could not verify that Google sign-in.' });
+    }
+    if (!payload?.email || !payload.email_verified) {
+      return res.status(401).json({ error: "Your Google account's email address is not verified." });
+    }
+
+    const normalizedEmail = payload.email.toLowerCase().trim();
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [normalizedEmail]);
+    const user = result.rows[0];
+    if (!user) {
+      await logAudit(req, { actor: null, action: 'login_failed', resourceType: 'session', resourceLabel: normalizedEmail, metadata: { via: 'google', reason: 'no_account' } });
+      return res.status(404).json({ error: 'No account found for this email - ask an admin to invite you.' });
+    }
+
+    // A first Google sign-in for an account with no avatar yet gets Google's own profile picture
+    // for free - never overwrites a picture the person already chose themselves on the Profile
+    // page, and this URL bypasses PATCH /api/auth/me's data:-URI-only validation deliberately,
+    // since it comes from the verified token payload rather than user input.
+    if (!user.avatar_url && payload.picture) {
+      await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [payload.picture, user.id]);
+      user.avatar_url = payload.picture;
+    }
+
+    // Google having verified this person's identity is step one, same as a correct password -
+    // an account with 2FA on still needs step two, via the same challenge/verify-totp flow the
+    // password path uses.
+    if (user.totp_enabled) {
+      const token = newToken();
+      const expiresAt = new Date(Date.now() + TOTP_CHALLENGE_TTL_MS);
+      await pool.query('INSERT INTO totp_challenges (token, user_id, expires_at) VALUES ($1, $2, $3)', [token, user.id, expiresAt]);
+      return res.json({ requiresTotp: true, challengeToken: token });
+    }
+
+    await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
+    await createSession(req, res, user.id);
+    await logAudit(req, {
+      actor: toApiUser(user), action: 'login', resourceType: 'session', resourceId: user.id, resourceLabel: user.name || user.email,
+      metadata: { via: 'google' },
+    });
     res.json(toApiUser(user));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -948,7 +1257,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
       actor: { id: reset.user_id, email: reset.email, name: reset.name, role: reset.role },
       action: 'password_reset', resourceType: 'user', resourceId: reset.user_id, resourceLabel: reset.name || reset.email,
     });
-    await createSession(res, reset.user_id);
+    await createSession(req, res, reset.user_id);
     res.json(toApiUser(updateResult.rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -959,29 +1268,241 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json(req.user);
 });
 
-// Self-service update of the caller's own display language / time zone - any authenticated user
-// (not just admins) can set these for themselves, unlike role/name which stay admin-managed via
-// PATCH /api/users/:id.
+// Self-service update of the caller's own profile fields - any authenticated user (not just
+// admins) can set these for themselves, unlike role which stays admin-managed via PATCH
+// /api/users/:id. name/email used to be admin-only too, but a person renaming or re-emailing
+// themselves doesn't need an admin's involvement any more than picking their own language does.
 app.patch('/api/auth/me', requireAuth, async (req, res) => {
   try {
-    const { language, timeZone } = req.body;
+    const { language, timeZone, name, email, themePrefs, avatarUrl } = req.body;
     if (language !== undefined && !(await getLanguageCodes()).includes(language)) {
       return res.status(400).json({ error: 'Unsupported language.' });
+    }
+    if (name !== undefined && !name.trim()) {
+      return res.status(400).json({ error: 'Name cannot be empty.' });
+    }
+    if (email !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ error: 'A valid email address is required.' });
+    }
+    // avatarUrl is a data: URI (see src/auth/ProfileView.tsx, which downscales the picked image
+    // before sending it) - capped well under the 3mb JSON body limit set above so one oversized
+    // upload can't bloat every future response that includes this user.
+    if (avatarUrl !== undefined && avatarUrl !== null) {
+      if (typeof avatarUrl !== 'string' || !avatarUrl.startsWith('data:image/') || avatarUrl.length > 1_500_000) {
+        return res.status(400).json({ error: 'Invalid avatar image.' });
+      }
     }
     const sets = [];
     const values = [];
     let i = 1;
     if (language !== undefined) { sets.push(`language = $${i++}`); values.push(language); }
     if (timeZone !== undefined) { sets.push(`time_zone = $${i++}`); values.push(timeZone || null); }
+    if (name !== undefined) { sets.push(`name = $${i++}`); values.push(name.trim()); }
+    if (email !== undefined) { sets.push(`email = $${i++}`); values.push(email.toLowerCase().trim()); }
+    if (themePrefs !== undefined) { sets.push(`theme_prefs = $${i++}`); values.push(themePrefs ? JSON.stringify(themePrefs) : null); }
+    if (avatarUrl !== undefined) { sets.push(`avatar_url = $${i++}`); values.push(avatarUrl); }
     if (sets.length === 0) return res.status(400).json({ error: 'No updatable fields provided' });
     values.push(req.user.id);
     const result = await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
+    // themePrefs is deliberately left out of the audit trail - it's not the kind of change anyone
+    // reviewing the log needs to see, and its JSON blob would just be noise next to it.
+    if (language !== undefined || timeZone !== undefined || name !== undefined || email !== undefined) {
+      await logAudit(req, {
+        action: 'update', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
+        before: { language: req.user.language, timeZone: req.user.timeZone, name: req.user.name, email: req.user.email },
+        after: { language: result.rows[0].language, timeZone: result.rows[0].time_zone, name: result.rows[0].name, email: result.rows[0].email },
+      });
+    }
+    res.json(toApiUser(result.rows[0]));
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists.' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Self-service password change while already signed in - proves identity via the current
+// password (unlike forgot-password, which proves it via an emailed link instead). Like a reset,
+// it invalidates every other session on the account, in case the change was prompted by a
+// suspected compromise, but keeps the session making this request alive.
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'Current password and a new password of at least 8 characters are required.' });
+    }
+    const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    const row = result.rows[0];
+    if (!row || !(await bcrypt.compare(currentPassword, row.password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, req.user.id]);
+    const currentToken = req.cookies?.sid;
+    await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [req.user.id, currentToken || '']);
     await logAudit(req, {
       action: 'update', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
-      before: { language: req.user.language, timeZone: req.user.timeZone },
-      after: { language: result.rows[0].language, timeZone: result.rows[0].time_zone },
+      metadata: { field: 'password' },
     });
-    res.json(toApiUser(result.rows[0]));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Two-factor authentication (TOTP) - self-service, Profile > Security. Setup writes totp_secret
+// immediately but leaves totp_enabled false until /2fa/enable proves the person can actually
+// generate a matching code, so an abandoned setup never locks anyone out or silently changes how
+// their own login works.
+// ---------------------------------------------------------------------------
+app.post('/api/auth/2fa/setup', requireAuth, async (req, res) => {
+  try {
+    const secret = authenticator.generateSecret();
+    await pool.query('UPDATE users SET totp_secret = $1, totp_enabled = false, totp_backup_codes = NULL WHERE id = $2', [secret, req.user.id]);
+    const otpauthUrl = authenticator.keyuri(req.user.email, 'EA Designer', secret);
+    const qrCodeDataUrl = await QRCode.toDataURL(otpauthUrl);
+    res.json({ secret, otpauthUrl, qrCodeDataUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function generateBackupCodes(count = 8) {
+  return Array.from({ length: count }, () => crypto.randomBytes(5).toString('hex'));
+}
+
+app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const result = await pool.query('SELECT totp_secret FROM users WHERE id = $1', [req.user.id]);
+    const secret = result.rows[0]?.totp_secret;
+    if (!secret) return res.status(400).json({ error: 'Start setup first.' });
+    if (!code || !authenticator.check(String(code).trim(), secret)) {
+      return res.status(400).json({ error: 'Invalid verification code.' });
+    }
+    const backupCodes = generateBackupCodes();
+    const hashed = await Promise.all(backupCodes.map(async c => ({ hash: await bcrypt.hash(c, 10), usedAt: null })));
+    await pool.query('UPDATE users SET totp_enabled = true, totp_backup_codes = $1 WHERE id = $2', [JSON.stringify(hashed), req.user.id]);
+    await logAudit(req, {
+      action: 'update', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
+      metadata: { field: 'totp_enabled' },
+    });
+    // Only time the plaintext codes exist outside this function - shown once, the person is
+    // expected to save them themselves (same convention as an invite link or a reset link).
+    res.json({ backupCodes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!password || !(await bcrypt.compare(password, result.rows[0]?.password_hash || ''))) {
+      return res.status(401).json({ error: 'Password is incorrect.' });
+    }
+    await pool.query('UPDATE users SET totp_enabled = false, totp_secret = NULL, totp_backup_codes = NULL WHERE id = $1', [req.user.id]);
+    await logAudit(req, {
+      action: 'update', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
+      metadata: { field: 'totp_disabled' },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Sessions (Profile > Sessions) - list and revoke this person's own active sessions on other
+// devices/browsers. Deliberately self-only (no admin view of anyone else's sessions) - this is a
+// personal security tool, not a team-management one.
+// ---------------------------------------------------------------------------
+app.get('/api/auth/sessions', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT token, created_at, expires_at, user_agent, ip_address FROM sessions WHERE user_id = $1 AND expires_at > now() ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    const currentToken = req.cookies?.sid;
+    res.json({
+      sessions: result.rows.map(row => ({
+        id: sessionFingerprint(row.token),
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        userAgent: row.user_agent,
+        ipAddress: row.ip_address,
+        isCurrent: row.token === currentToken,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/auth/sessions/:id', requireAuth, async (req, res) => {
+  try {
+    const currentToken = req.cookies?.sid;
+    const result = await pool.query('SELECT token FROM sessions WHERE user_id = $1', [req.user.id]);
+    const match = result.rows.find(row => sessionFingerprint(row.token) === req.params.id);
+    if (!match) return res.status(404).json({ error: 'Session not found.' });
+    if (match.token === currentToken) {
+      return res.status(400).json({ error: 'Use "Log out" to end this session instead.' });
+    }
+    await pool.query('DELETE FROM sessions WHERE token = $1', [match.token]);
+    await logAudit(req, {
+      action: 'update', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
+      metadata: { field: 'session_revoked' },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Export my data / delete my account (Profile > Danger Zone) - self-service equivalents of
+// "download your data" and account deletion, scoped to exactly what this person themselves owns.
+// ---------------------------------------------------------------------------
+app.get('/api/auth/me/export', requireAuth, async (req, res) => {
+  try {
+    const ownerMatch = JSON.stringify([req.user.id]);
+    const [systemsResult, edgesResult] = await Promise.all([
+      pool.query(`SELECT id, label, status, criticality, business_capability, description, owner_ids FROM systems WHERE owner_ids @> $1::jsonb`, [ownerMatch]),
+      pool.query(`SELECT id, source, target, owner_ids FROM edges WHERE owner_ids @> $1::jsonb`, [ownerMatch]),
+    ]);
+    res.setHeader('Content-Disposition', 'attachment; filename="ea-designer-my-data.json"');
+    res.json({
+      exportedAt: new Date().toISOString(),
+      profile: req.user,
+      systemsYouOwn: systemsResult.rows,
+      integrationsYouOwn: edgesResult.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!password || !(await bcrypt.compare(password, result.rows[0]?.password_hash || ''))) {
+      return res.status(401).json({ error: 'Password is incorrect.' });
+    }
+    if ((req.user.role === 'admin' || req.user.role === 'superadmin') && (await countOtherAdmins(req.user.id)) === 0) {
+      return res.status(400).json({ error: 'You are the last remaining admin - promote someone else first.' });
+    }
+    if (req.user.role === 'superadmin' && (await countOtherSuperadmins(req.user.id)) === 0) {
+      return res.status(400).json({ error: 'You are the last remaining super admin - grant someone else super admin first.' });
+    }
+    await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+    await logAudit(req, {
+      action: 'delete', resourceType: 'user', resourceId: req.user.id, resourceLabel: req.user.name || req.user.email,
+      metadata: { via: 'self_service' },
+    });
+    res.clearCookie('sid', COOKIE_OPTS);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1040,15 +1561,15 @@ app.post('/api/auth/accept-invite', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const id = `user-${Date.now()}`;
-    await pool.query(
-      `INSERT INTO users (id, email, password_hash, name, role) VALUES ($1, $2, $3, $4, $5)`,
+    const result = await pool.query(
+      `INSERT INTO users (id, email, password_hash, name, role) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [id, invite.email, passwordHash, name.trim(), invite.role]
     );
     await pool.query(`UPDATE invites SET status = 'accepted', accepted_at = now() WHERE id = $1`, [invite.id]);
-    const newUser = { id, email: invite.email, name: name.trim(), role: invite.role };
+    const newUser = toApiUser(result.rows[0]);
     await logAudit(req, { actor: newUser, action: 'create', resourceType: 'user', resourceId: id, resourceLabel: newUser.name, after: newUser, metadata: { via: 'invite', inviteId: invite.id } });
-    await createSession(res, id);
-    res.status(201).json({ id, email: invite.email, name: name.trim(), role: invite.role, language: 'en', timeZone: null, ndaAcceptedVersion: null });
+    await createSession(req, res, id);
+    res.status(201).json(newUser);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'An account with this email already exists.' });
     res.status(500).json({ error: err.message });
@@ -1084,12 +1605,27 @@ app.get('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
 app.patch('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const { role, name } = req.body;
-    if (role && !ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+    if (role && !ALL_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role.' });
 
     const target = await pool.query('SELECT role, name FROM users WHERE id = $1', [req.params.id]);
-    if (role && role !== 'admin') {
-      if (target.rows[0]?.role === 'admin' && (await countOtherAdmins(req.params.id)) === 0) {
+    const targetCurrentRole = target.rows[0]?.role;
+
+    // Granting or revoking superadmin is a deliberate, superadmin-only action - not something a
+    // regular admin can do via the same role picker they use for admin/editor/viewer. (An
+    // ordinary admin who genuinely needs this, because no superadmin can log in, has the
+    // superadmin-recovery process below instead of this endpoint.)
+    if ((role === 'superadmin' || targetCurrentRole === 'superadmin') && req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Only a super admin can change super admin status.' });
+    }
+
+    if (role && role !== 'admin' && role !== 'superadmin') {
+      if ((targetCurrentRole === 'admin' || targetCurrentRole === 'superadmin') && (await countOtherAdmins(req.params.id)) === 0) {
         return res.status(400).json({ error: 'Cannot demote the last remaining admin.' });
+      }
+    }
+    if (role && role !== 'superadmin' && targetCurrentRole === 'superadmin') {
+      if ((await countOtherSuperadmins(req.params.id)) === 0) {
+        return res.status(400).json({ error: 'Cannot demote the last remaining super admin - use the super admin recovery process instead.' });
       }
     }
 
@@ -1115,8 +1651,15 @@ app.patch('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) 
 app.delete('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const target = await pool.query('SELECT email, name, role FROM users WHERE id = $1', [req.params.id]);
-    if (target.rows[0]?.role === 'admin' && (await countOtherAdmins(req.params.id)) === 0) {
+    const targetRole = target.rows[0]?.role;
+    if (targetRole === 'superadmin' && req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Only a super admin can remove a super admin.' });
+    }
+    if ((targetRole === 'admin' || targetRole === 'superadmin') && (await countOtherAdmins(req.params.id)) === 0) {
       return res.status(400).json({ error: 'Cannot remove the last remaining admin.' });
+    }
+    if (targetRole === 'superadmin' && (await countOtherSuperadmins(req.params.id)) === 0) {
+      return res.status(400).json({ error: 'Cannot remove the last remaining super admin - use the super admin recovery process instead.' });
     }
     await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
     await logAudit(req, {
@@ -1186,15 +1729,215 @@ app.delete('/api/invites/:id', requireAuth, requireRole('admin'), async (req, re
 });
 
 // ---------------------------------------------------------------------------
-// Email settings (admin only) - the Gmail SMTP sender used for invite emails, editable at
-// runtime from Settings instead of being fixed at container start. The password is write-only:
-// it's never returned once saved, only whether one is configured and which address it's for.
+// Super Admin recovery - lets an ordinary admin (not a superadmin) request that some admin
+// (themselves or another) be promoted to superadmin, for when no superadmin can log in. The
+// approval group is deliberately every OTHER user with role = 'admin' only - never superadmins,
+// since the whole scenario this exists for is "no superadmin is reachable". A single admin's
+// rejection kills the request; if the requester is the only admin, it's approved immediately with
+// no emails needed. See sendSuperadminApprovalEmail above for the emailed link's shape.
 // ---------------------------------------------------------------------------
-app.get('/api/settings/email', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/superadmin-requests', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { targetUserId, appUrl } = req.body;
+    if (!targetUserId) return res.status(400).json({ error: 'A target user is required.' });
+
+    const targetResult = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [targetUserId]);
+    const target = targetResult.rows[0];
+    if (!target) return res.status(404).json({ error: 'User not found.' });
+    if (target.role !== 'admin') return res.status(400).json({ error: 'Only an existing admin can be promoted through this process.' });
+
+    const otherAdminsResult = await pool.query(`SELECT id, name, email FROM users WHERE role = 'admin' AND id != $1`, [req.user.id]);
+    const otherAdmins = otherAdminsResult.rows;
+
+    const requestId = `sar-${Date.now()}`;
+    const expiresAt = new Date(Date.now() + SUPERADMIN_REQUEST_TTL_MS);
+
+    if (otherAdmins.length === 0) {
+      // The requester is the only admin - there's no one left to ask, so their own request is
+      // all the approval this can ever get.
+      await pool.query(
+        `INSERT INTO superadmin_requests (id, target_user_id, requested_by, status, expires_at, resolved_at) VALUES ($1, $2, $3, 'approved', $4, now())`,
+        [requestId, target.id, req.user.id, expiresAt]
+      );
+      await pool.query(`UPDATE users SET role = 'superadmin' WHERE id = $1`, [target.id]);
+      await logAudit(req, {
+        action: 'update', resourceType: 'user', resourceId: target.id, resourceLabel: target.name || target.email,
+        before: { role: 'admin' }, after: { role: 'superadmin' }, metadata: { via: 'superadmin_recovery', requestId, autoApproved: true },
+      });
+      return res.status(201).json({ requestId, status: 'approved', totalApprovers: 0, autoApproved: true });
+    }
+
+    await pool.query(
+      `INSERT INTO superadmin_requests (id, target_user_id, requested_by, status, expires_at) VALUES ($1, $2, $3, 'pending', $4)`,
+      [requestId, target.id, req.user.id, expiresAt]
+    );
+
+    let emailsSent = 0;
+    for (const approver of otherAdmins) {
+      const token = newToken();
+      await pool.query(
+        `INSERT INTO superadmin_request_approvals (id, request_id, approver_user_id, token) VALUES ($1, $2, $3, $4)`,
+        [`sara-${Date.now()}-${approver.id}`, requestId, approver.id, token]
+      );
+      const base = typeof appUrl === 'string' && appUrl ? appUrl.replace(/\/$/, '') : '';
+      const link = `${base}/?superadmin-approve=${token}`;
+      const result = await sendSuperadminApprovalEmail({ to: approver.email, targetName: target.name || target.email, requestedByName: req.user.name || req.user.email, link });
+      if (result.sent) emailsSent++;
+    }
+
+    await logAudit(req, {
+      action: 'create', resourceType: 'superadmin_request', resourceId: requestId, resourceLabel: target.name || target.email,
+      metadata: { targetUserId: target.id, totalApprovers: otherAdmins.length },
+    });
+    res.status(201).json({ requestId, status: 'pending', totalApprovers: otherAdmins.length, emailsSent });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/superadmin-requests', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const requestsResult = await pool.query(`
+      SELECT r.id, r.status, r.created_at, r.expires_at, r.resolved_at,
+             t.id AS target_id, t.name AS target_name, t.email AS target_email,
+             b.id AS requested_by_id, b.name AS requested_by_name, b.email AS requested_by_email
+      FROM superadmin_requests r
+      JOIN users t ON t.id = r.target_user_id
+      JOIN users b ON b.id = r.requested_by
+      ORDER BY r.created_at DESC LIMIT 20
+    `);
+    const approvalsResult = await pool.query(`
+      SELECT a.request_id, a.decision, a.decided_at, u.name AS approver_name, u.email AS approver_email
+      FROM superadmin_request_approvals a
+      JOIN users u ON u.id = a.approver_user_id
+      WHERE a.request_id = ANY($1::text[])
+    `, [requestsResult.rows.map(r => r.id)]);
+
+    const requests = requestsResult.rows.map(r => ({
+      id: r.id,
+      status: r.status,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at,
+      resolvedAt: r.resolved_at,
+      target: { id: r.target_id, name: r.target_name, email: r.target_email },
+      requestedBy: { id: r.requested_by_id, name: r.requested_by_name, email: r.requested_by_email },
+      approvals: approvalsResult.rows
+        .filter(a => a.request_id === r.id)
+        .map(a => ({ approverName: a.approver_name, approverEmail: a.approver_email, decision: a.decision, decidedAt: a.decided_at })),
+    }));
+    res.json({ requests });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/superadmin-requests/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const result = await pool.query(`UPDATE superadmin_requests SET status = 'cancelled', resolved_at = now() WHERE id = $1 AND status = 'pending' RETURNING id`, [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Request not found or already resolved.' });
+    await logAudit(req, { action: 'update', resourceType: 'superadmin_request', resourceId: req.params.id, resourceLabel: req.params.id, metadata: { field: 'cancelled' } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public (token-only, like an invite/reset link) - the approval landing page reached from the
+// emailed link, before deciding.
+app.get('/api/superadmin-requests/approvals/:token', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT a.decision, r.status, r.expires_at, t.name AS target_name, t.email AS target_email,
+             b.name AS requested_by_name, b.email AS requested_by_email
+      FROM superadmin_request_approvals a
+      JOIN superadmin_requests r ON r.id = a.request_id
+      JOIN users t ON t.id = r.target_user_id
+      JOIN users b ON b.id = r.requested_by
+      WHERE a.token = $1
+    `, [req.params.token]);
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ error: 'This approval link is invalid.' });
+    res.json({
+      targetName: row.target_name, targetEmail: row.target_email,
+      requestedByName: row.requested_by_name, requestedByEmail: row.requested_by_email,
+      requestStatus: row.status, expiresAt: row.expires_at, alreadyDecided: row.decision !== null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/superadmin-requests/approvals/:token/decide', async (req, res) => {
+  try {
+    const { decision } = req.body;
+    if (decision !== 'approve' && decision !== 'reject') return res.status(400).json({ error: 'Invalid decision.' });
+
+    const approvalResult = await pool.query(
+      `SELECT a.id, a.decision AS existing_decision, a.request_id, r.status AS request_status, r.expires_at, r.target_user_id,
+              u.id AS approver_id, u.name AS approver_name, u.email AS approver_email, u.role AS approver_role
+       FROM superadmin_request_approvals a
+       JOIN superadmin_requests r ON r.id = a.request_id
+       JOIN users u ON u.id = a.approver_user_id
+       WHERE a.token = $1`,
+      [req.params.token]
+    );
+    const approval = approvalResult.rows[0];
+    if (!approval) return res.status(404).json({ error: 'This approval link is invalid.' });
+    if (approval.request_status !== 'pending') return res.status(410).json({ error: 'This request has already been resolved.' });
+    if (new Date(approval.expires_at) < new Date()) {
+      await pool.query(`UPDATE superadmin_requests SET status = 'expired', resolved_at = now() WHERE id = $1`, [approval.request_id]);
+      return res.status(410).json({ error: 'This request has expired.' });
+    }
+    if (approval.existing_decision) return res.status(400).json({ error: 'You have already responded to this request.' });
+
+    const approver = { id: approval.approver_id, name: approval.approver_name, email: approval.approver_email, role: approval.approver_role };
+    // Stored past-tense ('approved'/'rejected') to match superadmin_requests.status, since the
+    // completion check just below compares against 'approved' - the request body's 'decision'
+    // field itself stays present-tense ('approve'/'reject'), matching the verb on the button.
+    const storedDecision = decision === 'approve' ? 'approved' : 'rejected';
+    await pool.query(`UPDATE superadmin_request_approvals SET decision = $1, decided_at = now() WHERE id = $2`, [storedDecision, approval.id]);
+
+    if (decision === 'reject') {
+      await pool.query(`UPDATE superadmin_requests SET status = 'rejected', resolved_at = now() WHERE id = $1`, [approval.request_id]);
+      await logAudit(req, { actor: approver, action: 'update', resourceType: 'superadmin_request', resourceId: approval.request_id, resourceLabel: approval.request_id, metadata: { field: 'rejected' } });
+      return res.json({ status: 'rejected' });
+    }
+
+    const remainingResult = await pool.query(
+      `SELECT COUNT(*) FROM superadmin_request_approvals WHERE request_id = $1 AND (decision IS NULL OR decision != 'approved')`,
+      [approval.request_id]
+    );
+    const allApproved = parseInt(remainingResult.rows[0].count, 10) === 0;
+
+    if (!allApproved) {
+      await logAudit(req, { actor: approver, action: 'update', resourceType: 'superadmin_request', resourceId: approval.request_id, resourceLabel: approval.request_id, metadata: { field: 'approved_partial' } });
+      return res.json({ status: 'pending' });
+    }
+
+    const targetResult = await pool.query(`UPDATE users SET role = 'superadmin' WHERE id = $1 RETURNING id, name, email`, [approval.target_user_id]);
+    await pool.query(`UPDATE superadmin_requests SET status = 'approved', resolved_at = now() WHERE id = $1`, [approval.request_id]);
+    await logAudit(req, {
+      actor: approver, action: 'update', resourceType: 'user', resourceId: approval.target_user_id, resourceLabel: targetResult.rows[0]?.name || targetResult.rows[0]?.email,
+      before: { role: 'admin' }, after: { role: 'superadmin' }, metadata: { via: 'superadmin_recovery', requestId: approval.request_id },
+    });
+    res.json({ status: 'approved' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Server Settings (superadmin only) - the Gmail SMTP sender used for invite/reset/recovery
+// emails, editable at runtime from Settings instead of being fixed at container start. The
+// password is write-only: it's never returned once saved, only whether one is configured and
+// which address it's for. Google Sign-In's Client ID lives right below, same permission tier -
+// both are server-wide config an ordinary admin shouldn't be able to change.
+// ---------------------------------------------------------------------------
+app.get('/api/settings/email', requireAuth, requireRole('superadmin'), (req, res) => {
   res.json({ configured: !!mailTransporter, smtpUser: smtpConfig.user || null });
 });
 
-app.put('/api/settings/email', requireAuth, requireRole('admin'), async (req, res) => {
+app.put('/api/settings/email', requireAuth, requireRole('superadmin'), async (req, res) => {
   try {
     const smtpUser = typeof req.body.smtpUser === 'string' ? req.body.smtpUser.trim() : '';
     const smtpPassInput = typeof req.body.smtpPass === 'string' ? req.body.smtpPass.trim() : '';
@@ -1229,14 +1972,40 @@ app.put('/api/settings/email', requireAuth, requireRole('admin'), async (req, re
   }
 });
 
-app.delete('/api/settings/email', requireAuth, requireRole('admin'), async (req, res) => {
+app.delete('/api/settings/email', requireAuth, requireRole('superadmin'), async (req, res) => {
   try {
     const previousSmtpUser = smtpConfig.user;
-    await pool.query('DELETE FROM smtp_settings WHERE id = 1');
+    // Clears only the SMTP columns, not the whole singleton row - it also holds the Google Client
+    // ID now, which this action has nothing to do with.
+    await pool.query('UPDATE smtp_settings SET smtp_user = NULL, smtp_pass = NULL WHERE id = 1');
     smtpConfig = { user: null, pass: null };
     mailTransporter = null;
     await logAudit(req, { action: 'delete', resourceType: 'settings_email', resourceId: 'smtp', resourceLabel: 'SMTP sender', before: { smtpUser: previousSmtpUser } });
     res.json({ configured: false, smtpUser: null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/settings/google', requireAuth, requireRole('superadmin'), (req, res) => {
+  res.json({ configured: !!googleClient, clientId: googleClientId || null });
+});
+
+app.put('/api/settings/google', requireAuth, requireRole('superadmin'), async (req, res) => {
+  try {
+    const clientId = typeof req.body.clientId === 'string' ? req.body.clientId.trim() : '';
+    await pool.query(
+      `INSERT INTO smtp_settings (id, google_client_id, updated_at, updated_by) VALUES (1, $1, now(), $2)
+       ON CONFLICT (id) DO UPDATE SET google_client_id = $1, updated_at = now(), updated_by = $2`,
+      [clientId || null, req.user.id]
+    );
+    const previousClientId = googleClientId;
+    setGoogleClientId(clientId);
+    await logAudit(req, {
+      action: 'update', resourceType: 'settings_google', resourceId: 'google', resourceLabel: 'Google Sign-In',
+      before: { clientId: previousClientId || null }, after: { clientId: googleClientId || null },
+    });
+    res.json({ configured: !!googleClient, clientId: googleClientId || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

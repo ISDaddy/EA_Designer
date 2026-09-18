@@ -10,9 +10,9 @@
 #   1. Stacks -> Add stack -> paste this file's contents (or point Portainer at this repo/file
 #      if you're using a Git-backed stack).
 #   2. Set the environment variables below in Portainer's "Environment variables" section
-#      (Advanced mode / .env): FRONTEND_IMAGE, BACKEND_IMAGE, SMTP_USER, SMTP_PASS, and any
-#      port overrides you need. Do NOT paste secrets.env into this file - Portainer's env
-#      var UI is the equivalent of secrets.env for the NAS.
+#      (Advanced mode / .env): FRONTEND_IMAGE, BACKEND_IMAGE, SMTP_USER, SMTP_PASS,
+#      GOOGLE_CLIENT_ID, and any port overrides you need. Do NOT paste secrets.env into this
+#      file - Portainer's env var UI is the equivalent of secrets.env for the NAS.
 #   3. Deploy the stack, then open it and enable "Webhook" - copy the generated URL into
 #      scripts/deploy.sh (PORTAINER_WEBHOOK_URL) so the deploy script can trigger a redeploy
 #      after pushing new images.
@@ -41,6 +41,7 @@ services:
       PORT: ${APP_BACKEND_PORT:-4001}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
     depends_on:
       - db
 

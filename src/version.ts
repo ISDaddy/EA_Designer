@@ -1,6 +1,15 @@
-// Bump this, and add an entry to RELEASE_NOTES, with every change that ships to users - see
-// CLAUDE.md. Starting deliberately low since this app is a very early alpha.
-export const APP_VERSION = '0.7.0';
+// Bump these, and add an entry to RELEASE_NOTES, with every change that ships to users - see
+// CLAUDE.md. There's a lot of work still planned, so instead of semver we use a date-based scheme
+// that increments per release within a day: `{year}.{month}.{day}.{n}`, where `n` is the count of
+// releases shipped that day (starting at 1). APP_PHASE tracks where the project is in its
+// lifecycle (alpha -> beta -> ga, ...) and is prefixed onto the displayed version, e.g.
+// "alpha_2026.9.18.3" for the 3rd release on 2026-09-18 during the alpha phase. Versions before
+// this scheme (originally 0.1.0 - 0.7.2) have been renumbered into it retroactively so every
+// entry in RELEASE_NOTES sorts and filters consistently.
+export type AppPhase = 'alpha' | 'beta' | 'ga';
+export const APP_PHASE: AppPhase = 'alpha';
+export const APP_VERSION = '2026.9.18.9';
+export const APP_VERSION_DISPLAY = `${APP_PHASE}_${APP_VERSION}`;
 
 export type ReleaseNote = {
   version: string;
@@ -9,11 +18,95 @@ export type ReleaseNote = {
   notes: string[];
 };
 
-// Newest first. Entries up through 0.6.4 are backfilled from git history (see `git log`) rather
-// than written at release time, so their wording is reconstructed from commit messages.
+// Newest first. Entries up through "Create Object wizard for flows" are backfilled from git
+// history (see `git log`) rather than written at release time, so their wording is reconstructed
+// from commit messages.
 export const RELEASE_NOTES: ReleaseNote[] = [
   {
-    version: '0.7.0',
+    version: 'alpha_2026.9.18.9',
+    date: '2026-09-18',
+    title: 'Super Admin role and Server Settings',
+    notes: [
+      'Added a Super Admin role, one notch above Admin - the first account to ever run setup becomes one automatically, and only a Super Admin can grant or revoke Super Admin status on anyone else.',
+      'Added a superadmin-only "Server Settings" tab in Settings, replacing the old Email tab, now also holding the Google Sign-In Client ID (configurable from the UI, no more editing secrets.env by hand).',
+      'Added Super Admin recovery under Settings > Team: if no Super Admin can log in, any admin can request that one be promoted - it takes effect once every other admin approves by email, or immediately if there\'s only one admin.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.8',
+    date: '2026-09-18',
+    title: 'Sign in with Google',
+    notes: [
+      'Added "Sign in with Google" as an alternate way to log into an existing account (matched by email) - it does not create new accounts, so people still need to be invited via Settings > Team first.',
+      'Hidden until an admin sets up a Google OAuth Client ID - see the README for the Google Cloud Console walkthrough.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.7',
+    date: '2026-09-18',
+    title: 'Profile picture, two-factor authentication, sessions, and account data',
+    notes: [
+      'Added a profile picture - upload a photo (shown in the header and Profile page) or get an auto-generated initials avatar if you don\'t set one.',
+      'Added two-factor authentication (TOTP, via an authenticator app) under Profile > Security, with one-time backup codes for when you don\'t have your phone.',
+      'Added a Sessions list under Profile - see every device/browser currently signed in to your account and revoke any that aren\'t this one.',
+      'Added a Danger Zone under Profile: export a copy of your own data (profile plus anything you own) as a JSON file, or permanently delete your own account.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.6',
+    date: '2026-09-18',
+    title: 'Personal Profile page',
+    notes: [
+      'Added a Profile page - click your name in the header to open it - for account settings that are yours alone: your name and email, a password change, and the Language & Region and Appearance preferences moved here from the shared Settings page.',
+      'Appearance (visual style, color palette, light/dark mode) is now saved to your account instead of just this browser, so it follows you to any device you sign in on, the same way Language & Region already did.',
+      'Settings (Team, Email, Translations, Audit Log, Release Notes) is now purely shared/admin configuration, since the personal preferences moved to Profile.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.5',
+    date: '2026-09-18',
+    title: 'Shareable Schedule and Settings tab URLs',
+    notes: [
+      'The Schedule page (Upcoming Runs / Calendar) and Settings page (Appearance, Language & Region, etc.) now each write their active sub-tab into the URL, so refreshing or sharing the link reopens the same sub-tab instead of always resetting to the first one.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.4',
+    date: '2026-09-18',
+    title: 'Renumbered old releases into the new version scheme',
+    notes: [
+      'Every past release note (previously 0.1.0 - 0.7.2) was renumbered into the date-based alpha_{year}.{month}.{day}.{n} scheme, so version history sorts and filters consistently end to end.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.3',
+    date: '2026-09-18',
+    title: 'Date-based versioning and Release Notes search',
+    notes: [
+      'Switched from semantic versioning to a date-based scheme prefixed with the project phase (e.g. "alpha_2026.9.18.3"), since there\'s a lot of work still planned and semver numbers were incrementing too slowly to be useful.',
+      'The Release Notes page now has a search box (matches title and note text) and filters by date and by version.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.2',
+    date: '2026-09-18',
+    title: 'Fixed missing translations in the Add menu',
+    notes: [
+      'The "Add System" and "Add Object" forms were showing raw translation keys (e.g. "canvas.newSystem") instead of translated text; fixed for all four supported languages.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.18.1',
+    date: '2026-09-18',
+    title: 'Toolbar and navigation tweaks',
+    notes: [
+      'Merged the canvas toolbar\'s separate "Add System" and "Add Object" buttons into a single "Add" button with a menu.',
+      'Clicking the "EA Designer" logo now takes you to the Canvas view.',
+      'Moved the Release Notes tab to the end of the Settings menu.',
+    ],
+  },
+  {
+    version: 'alpha_2026.9.17.3',
     date: '2026-09-17',
     title: 'Version number and release notes',
     notes: [
@@ -22,7 +115,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.6.4',
+    version: 'alpha_2026.9.17.2',
     date: '2026-09-17',
     title: 'Create Object wizard for flows',
     notes: [
@@ -31,7 +124,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.6.3',
+    version: 'alpha_2026.9.17.1',
     date: '2026-09-17',
     title: 'Fixed a missing translation',
     notes: [
@@ -39,7 +132,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.6.2',
+    version: 'alpha_2026.9.16.2',
     date: '2026-09-16',
     title: 'Single-origin deploys and NAS hosting',
     notes: [
@@ -48,7 +141,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.6.1',
+    version: 'alpha_2026.9.16.1',
     date: '2026-09-16',
     title: 'Self-service password reset',
     notes: [
@@ -56,7 +149,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.6.0',
+    version: 'alpha_2026.9.15.1',
     date: '2026-09-15',
     title: 'System object names, translations, ownership, and audit log',
     notes: [
@@ -72,7 +165,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.5.0',
+    version: 'alpha_2026.9.13.1',
     date: '2026-09-13',
     title: 'Per-object integration mechanics and the Schedule page',
     notes: [
@@ -83,7 +176,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.4.0',
+    version: 'alpha_2026.9.12.2',
     date: '2026-09-12',
     title: 'User accounts, roles, and invites',
     notes: [
@@ -94,7 +187,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.3.0',
+    version: 'alpha_2026.9.12.1',
     date: '2026-09-12',
     title: 'Theming system and Settings page',
     notes: [
@@ -103,7 +196,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.2.0',
+    version: 'alpha_2026.9.11.2',
     date: '2026-09-11',
     title: 'Enterprise metadata, a real API, and the Inventory view',
     notes: [
@@ -113,7 +206,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.1.1',
+    version: 'alpha_2026.9.11.1',
     date: '2026-09-11',
     title: 'Stability fixes',
     notes: [
@@ -123,7 +216,7 @@ export const RELEASE_NOTES: ReleaseNote[] = [
     ],
   },
   {
-    version: '0.1.0',
+    version: 'alpha_2026.5.6.1',
     date: '2026-05-06',
     title: 'Initial prototype',
     notes: [

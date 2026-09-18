@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertCircle, Check, Copy, LogOut, Send, ShieldCheck, ShieldAlert, Trash2 } from 'lucide-react';
+import { AlertCircle, Check, Copy, LogOut, Send, ShieldCheck, ShieldAlert, Trash2, Crown } from 'lucide-react';
 import { apiFetch, parseJsonOrError } from '../api';
 import { inputClass, buttonPrimaryClass, buttonSecondaryClass, labelClass } from '../ui';
 import { useAuth } from './useAuth';
-import { ROLES, ROLE_LABELS, ROLE_DESCRIPTIONS } from './roles';
+import { ROLES, ROLE_LABELS, ROLE_DESCRIPTIONS, isSuperAdmin } from './roles';
 import type { Role } from './roles';
+import { SuperAdminRecovery } from './SuperAdminRecovery';
 
 type TeamUser = {
   id: string;
@@ -42,6 +43,7 @@ export function TeamSettings() {
   const [inviting, setInviting] = useState(false);
   const [inviteMessage, setInviteMessage] = useState<{ ok: boolean; text: string; link?: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [roleActionError, setRoleActionError] = useState('');
 
   const loadAll = useCallback(async () => {
     try {
@@ -119,6 +121,18 @@ export function TeamSettings() {
       loadAll();
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to update role.');
+    }
+  };
+
+  const handleSuperAdminChange = async (id: string, role: 'superadmin' | 'admin') => {
+    setRoleActionError('');
+    try {
+      await parseJsonOrError(await apiFetch(`/users/${id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }),
+      }));
+      loadAll();
+    } catch (err) {
+      setRoleActionError(err instanceof Error ? err.message : 'Failed to update super admin status.');
     }
   };
 
@@ -246,6 +260,12 @@ export function TeamSettings() {
       {/* Members */}
       <div>
         <span className="block text-xs font-bold mb-2 uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>Members</span>
+        {roleActionError && (
+          <div className="flex items-start gap-1.5 text-sm mb-2" style={{ color: 'var(--danger)' }}>
+            <AlertCircle size={15} className="mt-0.5 shrink-0" />
+            <span>{roleActionError}</span>
+          </div>
+        )}
         <div className={`overflow-x-auto rounded-[var(--radius-card)] border`} style={{ borderColor: 'var(--border-subtle)' }}>
           <table className="w-full text-sm">
             <thead className="text-left text-xs uppercase" style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-muted)' }}>
@@ -265,13 +285,46 @@ export function TeamSettings() {
                   </td>
                   <td className="px-3 py-2" style={{ color: 'var(--text-secondary)' }}>{u.email}</td>
                   <td className="px-3 py-2">
-                    <select
-                      className={`${inputClass} w-auto py-1`}
-                      value={u.role}
-                      onChange={e => handleRoleChange(u.id, e.target.value as Role)}
-                    >
-                      {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
-                    </select>
+                    {u.role === 'superadmin' ? (
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold"
+                          style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}
+                        >
+                          <Crown size={12} />Super Admin
+                        </span>
+                        {isSuperAdmin(user?.role) && (
+                          <button
+                            type="button"
+                            className="text-xs px-2 py-0.5 rounded-[var(--radius-input)] transition-colors"
+                            style={{ background: 'var(--bg-surface-alt)', color: 'var(--text-secondary)' }}
+                            onClick={() => handleSuperAdminChange(u.id, 'admin')}
+                          >
+                            Revoke
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <select
+                          className={`${inputClass} w-auto py-1`}
+                          value={u.role}
+                          onChange={e => handleRoleChange(u.id, e.target.value as Role)}
+                        >
+                          {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+                        </select>
+                        {isSuperAdmin(user?.role) && u.role === 'admin' && (
+                          <button
+                            type="button"
+                            className="text-xs px-2 py-0.5 rounded-[var(--radius-input)] transition-colors whitespace-nowrap"
+                            style={{ background: 'var(--primary-container)', color: 'var(--on-primary-container)' }}
+                            onClick={() => handleSuperAdminChange(u.id, 'superadmin')}
+                          >
+                            <Crown size={12} className="inline -mt-0.5 mr-0.5" />Make Super Admin
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     {u.nda_accepted_version && u.nda_accepted_version === ndaVersion ? (
@@ -308,6 +361,8 @@ export function TeamSettings() {
           </table>
         </div>
       </div>
+
+      <SuperAdminRecovery admins={users.filter(u => u.role === 'admin')} />
     </section>
   );
 }

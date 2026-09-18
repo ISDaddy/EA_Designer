@@ -38,6 +38,43 @@ APP_FRONTEND_PORT=8080 APP_BACKEND_PORT=5000 docker compose up -d
 
 The app stores state in the Postgres volume (`pgdata`), so data survives `docker compose down` / `up` cycles; use `docker compose down -v` to also wipe the database.
 
+## Google Sign-In (optional)
+
+Lets someone log in with their Google account instead of a password - **only for an email that
+already has an account here** (invited via Settings > Team, or the original setup account); it's
+an alternate way to log into an existing account, not a way to self-register one. Hidden on the
+login screen until configured. Configurable from **Settings > Server Settings** (Super Admin
+only) once the app is running, or via `GOOGLE_CLIENT_ID` before it's ever started - either way
+ends up in the same place (the database), and the UI always wins if both are set.
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com), create or select a project.
+2. **APIs & Services > OAuth consent screen** - fill in an app name and support email (External
+   user type is fine unless this is a Google Workspace-only deployment). The default scopes
+   (openid, email, profile) are all this needs - don't add any others.
+3. **APIs & Services > Credentials > Create Credentials > OAuth client ID** - Application type
+   **Web application**. Under **Authorized JavaScript origins**, add every origin the app is
+   actually opened from, e.g. `http://localhost` and `https://ea-designer.isdaddy.com` (add more
+   later the same way if you open it from somewhere else, like a LAN IP). Leave **Authorized
+   redirect URIs** empty - this integration only needs the origin, not a redirect.
+4. Copy the generated **Client ID** (ends in `.apps.googleusercontent.com` - no client secret is
+   needed for this flow) and paste it into **Settings > Server Settings** in the running app (as a
+   Super Admin), or into `secrets.env` as `GOOGLE_CLIENT_ID=...` before first start (on the NAS,
+   `GOOGLE_CLIENT_ID` in Portainer's stack environment variables instead - see
+   `docker-compose.stack.yml`).
+
+## Super Admin
+
+One role above Admin, added for exactly one reason: someone has to be trusted with Server
+Settings (the SMTP sender and Google Sign-In's Client ID above) and with granting/revoking Super
+Admin itself - an ordinary Admin can't touch either. The very first account (via initial setup, or
+promoted automatically on an existing install that predates this role) becomes a Super Admin;
+after that, only an existing Super Admin can make another one, from Settings > Team.
+
+If no Super Admin can log in, any Admin can start a recovery request from Settings > Team (Super
+Admin Recovery) asking that some Admin - themselves or someone else - be promoted. It takes effect
+once every *other* Admin approves via a one-time emailed link (a single rejection kills it), or
+immediately if the requester is the only Admin.
+
 ## Deploying to a NAS (Portainer stack)
 
 `docker-compose.stack.yml` is the compose file to paste into Portainer as a Stack - unlike

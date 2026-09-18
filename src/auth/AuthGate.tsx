@@ -4,15 +4,18 @@ import { useAuth } from './useAuth';
 import { LoginView } from './LoginView';
 import { AcceptInviteView } from './AcceptInviteView';
 import { ResetPasswordView } from './ResetPasswordView';
+import { SuperAdminApprovalView } from './SuperAdminApprovalView';
 import { FullScreenLoader } from './AuthShell';
 
-// Decides which of the top-level screens to render: an invite acceptance or password-reset flow
-// (present regardless of current login state, so a link works even if some other account is
-// mid-session on this browser), the login/first-run-setup screen, or the real app.
+// Decides which of the top-level screens to render: an invite acceptance, password-reset, or
+// super-admin-approval flow (present regardless of current login state, so a link works even if
+// some other account is mid-session on this browser), the login/first-run-setup screen, or the
+// real app.
 export function AuthGate({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
   const [inviteToken, setInviteToken] = useState(() => new URLSearchParams(window.location.search).get('invite'));
   const [resetToken, setResetToken] = useState(() => new URLSearchParams(window.location.search).get('reset'));
+  const [superadminApproveToken, setSuperadminApproveToken] = useState(() => new URLSearchParams(window.location.search).get('superadmin-approve'));
 
   const clearParam = (name: string, clear: () => void) => {
     const url = new URL(window.location.href);
@@ -22,6 +25,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   };
   const clearInviteParam = () => clearParam('invite', () => setInviteToken(null));
   const clearResetParam = () => clearParam('reset', () => setResetToken(null));
+  const clearSuperadminApproveParam = () => clearParam('superadmin-approve', () => setSuperadminApproveToken(null));
 
   if (inviteToken) {
     return <AcceptInviteView token={inviteToken} onDone={clearInviteParam} />;
@@ -29,6 +33,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   if (resetToken) {
     return <ResetPasswordView token={resetToken} onDone={clearResetParam} />;
+  }
+
+  if (superadminApproveToken) {
+    return <SuperAdminApprovalView token={superadminApproveToken} onDone={clearSuperadminApproveParam} />;
   }
 
   if (loading) return <FullScreenLoader />;

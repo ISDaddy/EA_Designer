@@ -1,20 +1,24 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { apiFetch, parseJsonOrError } from '../api';
 import { inputClass, buttonPrimaryClass, labelClass } from '../ui';
 import { useAuth } from './useAuth';
 import { AuthShell, FullScreenLoader } from './AuthShell';
 import { useI18n } from '../i18n/useI18n';
+import { GoogleSignInButton } from './GoogleSignInButton';
 
 export function LoginView() {
-  const { login, refresh } = useAuth();
+  const { login, loginWithGoogle, verifyTotp, refresh } = useAuth();
   const { t } = useI18n();
-  const [mode, setMode] = useState<'checking' | 'setup' | 'login' | 'forgot' | 'forgot-sent'>('checking');
+  const [mode, setMode] = useState<'checking' | 'setup' | 'login' | 'forgot' | 'forgot-sent' | 'totp'>('checking');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [totpChallengeToken, setTotpChallengeToken] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [googleConfig, setGoogleConfig] = useState<{ enabled: boolean; clientId: string | null } | null>(null);
 
   useEffect(() => {
     apiFetch('/auth/bootstrap-status')
@@ -22,6 +26,30 @@ export function LoginView() {
       .then(data => setMode((data as { needsSetup: boolean }).needsSetup ? 'setup' : 'login'))
       .catch(() => setMode('login'));
   }, []);
+
+  useEffect(() => {
+    apiFetch('/auth/google-config')
+      .then(res => parseJsonOrError(res))
+      .then(data => setGoogleConfig(data as { enabled: boolean; clientId: string | null }))
+      .catch(() => setGoogleConfig({ enabled: false, clientId: null }));
+  }, []);
+
+  const handleGoogleCredential = useCallback(async (credential: string) => {
+    setError('');
+    setSubmitting(true);
+    try {
+      const result = await loginWithGoogle(credential);
+      if (result.requiresTotp) {
+        setTotpChallengeToken(result.challengeToken);
+        setTotpCode('');
+        setMode('totp');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong.');
+    } finally {
+      setSubmitting(false);
+    }
+  }, [loginWithGoogle]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,8 +72,15 @@ export function LoginView() {
         });
         await parseJsonOrError(res);
         setMode('forgot-sent');
+      } else if (mode === 'totp') {
+        await verifyTotp(totpChallengeToken, totpCode);
       } else {
-        await login(email, password);
+        const result = await login(email, password);
+        if (result.requiresTotp) {
+          setTotpChallengeToken(result.challengeToken);
+          setTotpCode('');
+          setMode('totp');
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong.');
@@ -69,8 +104,8 @@ export function LoginView() {
 
   return (
     <AuthShell
-      title={mode === 'setup' ? t('auth.setup.title') : mode === 'forgot' ? t('auth.forgotPassword.title') : t('auth.login.title')}
-      subtitle={mode === 'setup' ? 'No one has set up this workspace yet - the first account becomes an admin.' : undefined}
+      title={mode === 'setup' ? t('auth.setup.title') : mode === 'forgot' ? t('auth.forgotPassword.title') : mode === 'totp' ? t('auth.totp.title') : t('auth.login.title')}
+      subtitle={mode === 'setup' ? 'No one has set up this workspace yet - the first account becomes an admin.' : mode === 'totp' ? t('auth.totp.subtitle') : undefined}
     >
       <form className="flex flex-col gap-3" onSubmit={handleSubmit}>
         {mode === 'setup' && (
@@ -79,18 +114,35 @@ export function LoginView() {
             <input autoFocus className={inputClass} value={name} onChange={e => setName(e.target.value)} required />
           </div>
         )}
-        <div>
-          <label className={labelClass}>{t('auth.login.email')}</label>
-          <input
-            type="email"
-            autoFocus={mode === 'login' || mode === 'forgot'}
-            className={inputClass}
-            value={email}
-            onChange={e => setEmail(e.target.value)}
-            required
-          />
-        </div>
-        {mode !== 'forgot' && (
+        {mode === 'totp' && (
+          <div>
+            <label className={labelClass}>{t('auth.totp.code')}</label>
+            <input
+              autoFocus
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              className={inputClass}
+              value={totpCode}
+              onChange={e => setTotpCode(e.target.value)}
+              placeholder={t('auth.totp.codePlaceholder')}
+              required
+            />
+          </div>
+        )}
+        {mode !== 'totp' && (
+          <div>
+            <label className={labelClass}>{t('auth.login.email')}</label>
+            <input
+              type="email"
+              autoFocus={mode === 'login' || mode === 'forgot'}
+              className={inputClass}
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              required
+            />
+          </div>
+        )}
+        {mode !== 'forgot' && mode !== 'totp' && (
           <div>
             <label className={labelClass}>{t('auth.login.password')}</label>
             <input
@@ -127,6 +179,7 @@ export function LoginView() {
             ? 'Please wait...'
             : mode === 'setup' ? t('auth.setup.submit')
             : mode === 'forgot' ? t('auth.forgotPassword.submit')
+            : mode === 'totp' ? t('auth.totp.submit')
             : t('auth.login.submit')}
         </button>
         {mode === 'forgot' && (
@@ -134,7 +187,22 @@ export function LoginView() {
             {t('auth.forgotPassword.backToLogin')}
           </button>
         )}
+        {mode === 'totp' && (
+          <button type="button" className="text-xs text-center hover:underline" style={{ color: 'var(--text-secondary)' }} onClick={() => { setError(''); setPassword(''); setMode('login'); }}>
+            {t('auth.forgotPassword.backToLogin')}
+          </button>
+        )}
       </form>
+      {mode === 'login' && googleConfig?.enabled && googleConfig.clientId && (
+        <div className="flex flex-col items-center gap-3 mt-3">
+          <div className="w-full flex items-center gap-2">
+            <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
+            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('auth.login.or')}</span>
+            <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
+          </div>
+          <GoogleSignInButton clientId={googleConfig.clientId} onCredential={handleGoogleCredential} />
+        </div>
+      )}
     </AuthShell>
   );
 }
